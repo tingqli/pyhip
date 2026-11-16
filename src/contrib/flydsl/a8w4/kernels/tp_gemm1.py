@@ -23,7 +23,7 @@ import os
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl._mlir.dialects import arith, llvm
+from flydsl._mlir.dialects import arith
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
@@ -34,23 +34,15 @@ from .._vendor.act import gate_up_act, silu_mul_batch, situ_params
 from .._vendor.a8w4_ops import _pack_activation, _pointer, channel_exponents
 from .._vendor.moe_utils import _buffer_i32_scalar_read, _global_i32_at, _udiv, _umod
 from .._vendor.mxfp4_gemm_common import (
-    _gep1,
-    _global_base_ptr1,
     _global_i32_buffer_tiles,
     _global_i32_buffer_view,
     _lds_ptr3,
-    global_typed_ptr,
+    global_typed_ptr,  # noqa: F401  (used by tp_fmoe as G1.global_typed_ptr)
     lds_typed_ptr,
     lds_vec_load,
 )
 from .._vendor.tensor_shim import _run_compiled
 from .._vendor.tensor_shim import _to_raw as _raw
-
-
-# "hot" routing: 1/32 of the experts get this score bias, so they land in most
-# tokens' top-k (a few experts own a large share of the routed rows).
-# SiTUv2 test params: kimi-k3 production betas; the clamp bound sits inside the
-# gate/up range of the random data (std ~64) so clamped and free values both occur.
 
 
 # =============================================================================
@@ -203,9 +195,6 @@ def compile_a8w4_gemm1(
     pipeline=None,
     dyn_m=False,
     epilog="bf16",
-    TOPK=None,
-    NPES=1,
-    w_layout="std",
     fast_dec=False,
     act="silu",
 ):
@@ -229,46 +218,26 @@ def compile_a8w4_gemm1(
     [tokens], ``w`` mxfp4 [E, 2*inter, K/2] (standard preshuffle), ``w_scale`` e8m0
     (shuffled), ``w_exp`` int32 [E, 2*inter] (``channel_exponents``),
     ``sorted_expert_ids``, ``num_valid_ids``, ``sorted_ids``, ``out`` bf16
-    [sorted_size, inter], then ``tokens``, ``tbl``, ``rank``, ``epoch``, ``rows``,
-    the five SiTUv2 scalars (``situ_args``), ``grid`` and the stream.
+    [sorted_size, inter], then ``tokens``, three unused scalars (``tbl``, ``rank``,
+    ``epoch``), ``rows``, the five SiTUv2 scalars (``situ_args``), ``grid`` and the
+    stream. The unused scalars (and the kernel's ``i32_tiles``) only keep the
+    kernarg layout, and so the ISA, of the tuned build; they go with the host-launch
+    rewrite.
 
     Nothing batch-size dependent is baked in: ``rows`` (rows of the q8 output
-    plane, below) and the flag-table stride (= ``grid``, one flag per tile) are
-    launch args, so one binary serves every token count.
+    plane, below) is a launch arg, so one binary serves every token count.
 
-    ``epilog`` (experiment for the N-split + all-gather TP idea, moe-new-tp.md):
+    ``epilog``:
       * ``"bf16"`` (default): bf16 ``[sorted_size, inter]`` by sorted position.
-      * ``"q8"``: SiLU output staged as bf16 in LDS, quantized to fp8 FNUZ with one
-        f32 scale per (row, TILE_N columns), written UNSORTED (row = token*TOPK +
-        slot, ``rows`` = tokens*TOPK) into ``out``: ``[rows, inter]`` fp8 then
-        ``[rows, inter/TILE_N]`` f32 scales.
-      * ``"q8push"``: same tile, pushed (sc0|sc1) into plane ``rank`` of every TP
-        peer's symmetric buffer (``tbl``: peer bases), double-buffered by epoch
-        parity; then flag ``[rank][tile] = epoch`` on every peer. Slot layout:
-        ``[NPES][rows][inter]`` fp8, ``[NPES][rows][inter/TILE_N]`` f32 (slot =
-        that rounded up to 256 B); flags ``[NPES][grid]`` i32 after the two slots.
-        The layout is a contract with the peers: keep ``rows`` fixed per buffer.
-      * ``"q8pushs"``: as q8push but rows by SORTED position (``rows`` =
-        sorted_size; the layout gemm2 already reads A in; padding rows not sent)
-        and scales ``[NPES][inter/TILE_N][rows]`` f32, staged in LDS and pushed
-        as one contiguous BM*4 B run per tile instead of 4 B scattered stores.
-      * ``"q8s"``: as q8 (local) but rows by SORTED position (``rows`` =
+      * ``"q8s"``: SiLU output staged as bf16 in LDS, quantized to fp8 FNUZ with one
+        f32 scale per (row, TILE_N columns), rows by SORTED position (``rows`` =
         sorted_size): ``out`` = ``[sorted_size, inter]`` fp8 then
         ``[sorted_size, inter/TILE_N]`` f32, i.e. gemm2's A + per-128-K-group scale
         (``a8w4_gemm2(..., a_group=128)``); replaces the separate row-quant kernel.
-
-    ``w_layout``: ``"std"`` = standard preshuffle; ``"tile"`` = W / scales retiled
-    by ``retile_w1`` so each (expert, n-block, K tile) is one contiguous run
-    (TILE_N*TILE_K bytes of W + TILE_N*TILE_K/16 bytes of scales).
     """
-    assert epilog in ("bf16", "q8", "q8s", "q8push", "q8pushs"), epilog
+    assert epilog in ("bf16", "q8s"), epilog
     assert act in ("silu", "situv2"), act
-    assert w_layout in ("std", "tile"), w_layout
     assert flush_tiny or not fast_dec, "fast_dec needs flush_tiny"
-    TILE_W = w_layout == "tile"
-    PUSH = epilog in ("q8push", "q8pushs")
-    SORTED = epilog in ("q8s", "q8pushs")  # rows by sorted position
-    SCALE_RUN = epilog == "q8pushs"  # scales via LDS as [NB][rows] runs
     K = D_HIDDEN
     INTER = D_INTER
     N_OUT = 2 * INTER  # gate | up
@@ -297,15 +266,11 @@ def compile_a8w4_gemm1(
 
     LDS_BYTES = max(r * TILE_K * (2 if _pipe(r) else 1) for r in ROW_VARIANTS)
     if epilog != "bf16":
-        LDS_BYTES = max(LDS_BYTES, BM * TILE_N * 2 + BM * 4)  # bf16 tile + scales
-        assert TOPK, "q8 epilogues need TOPK"
+        # bf16 tile; the BM*4 B tail is unused but keeps the tuned LDS size
+        LDS_BYTES = max(LDS_BYTES, BM * TILE_N * 2 + BM * 4)
     Q_TPR = TILE_N // 16  # threads per row in the quant pass (16 cols each)
     Q_RPP = 256 // Q_TPR  # rows per pass
     assert all(r % Q_RPP == 0 for r in ROW_VARIANTS) or epilog == "bf16"
-    # ablation knob (experiment only): comma list of noscale, nopub, cm0, cm16,
-    # one, selfonly. A tuple, not a set: FlyDSL keys its JIT cache on scalar/tuple
-    # closure values only, a set would silently reuse another variant's binary.
-    PUSH_VAR = ()  # frozen (was env-tunable in the experiment copy)
 
     # W (mxfp4) N-major preshuffle in bytes: (N/16, K/128, klane=4, nlane=16, kpack=16).
     W_K0 = K // 128
@@ -315,12 +280,6 @@ def compile_a8w4_gemm1(
     SCALE_K_PAD = ((K + 255) // 256) * 256
     SC_STRIDE_N0 = (SCALE_K_PAD // 256) * 64
     WS_BYTES = NE * N_OUT * (SCALE_K_PAD // 32)
-    # "tile" layout (retile_w1): W 1 KB chunks as [E][NB][K/TILE_K][gu][TILE_N/16]
-    # [TILE_K/128]; scale 256 B chunks as [E][NB][Kpad/256][gu][TILE_N/32].
-    W_TILE_U16 = 2 * (TILE_N // 16) * K_GROUPS * 64  # one K tile, 16 B units
-    SC_KB_DW = 2 * (TILE_N // 32) * 64  # one 256-K scale block, dwords
-    if TILE_W:
-        assert K % 256 == 0 and TILE_N % 32 == 0
 
     ftz_tag = "_ftz" if flush_tiny else ""
     wpe_tag = f"_w{waves_per_eu}" if waves_per_eu else ""
@@ -329,11 +288,9 @@ def compile_a8w4_gemm1(
     kname = (
         f"a8w4_gemm1_h{K}_i{INTER}_ne{NE}_bm{BM}_tn{TILE_N}_tk{TILE_K}"
         f"_bcm{b_cache_mod}_xcd{xcd_swizzle}{wpe_tag}{ftz_tag}{dyn_tag}_{pipe_tag}"
-        + ("_wt" if TILE_W else "")
         + (f"_fd{int(fast_dec)}" if fast_dec else "")
         + ("" if act == "silu" else f"_{act}")
-        + ("" if epilog == "bf16" else f"_{epilog}_k{TOPK}_w{NPES}")
-        + "".join(f"_{v}" for v in sorted(PUSH_VAR))
+        + ("" if epilog == "bf16" else f"_{epilog}")
     )
 
     def _body(
@@ -348,11 +305,7 @@ def compile_a8w4_gemm1(
         arg_mind,
         arg_out,
         i32_ntok,
-        arg_tbl,
-        i32_rank,
-        i32_epoch,
         i32_rows,
-        i32_tiles,
         situ,
         tile,
         lane,
@@ -413,31 +366,18 @@ def compile_a8w4_gemm1(
         n_wave_base = wave * fx.Int32(TILE_N // NUM_WAVES)
         out_cols = []
         w_base, sc_base, sc_key, sc_npack = {}, {}, {}, {}
-        tile_id = e * fx.Int32(NUM_N_BLOCKS) + n_block  # "tile" layout run index
         for ni in range_constexpr(N_REPEAT):
             n_local = by_n + n_wave_base + fx.Int32(ni * 16)
             out_cols.append(n_local + lane_mod_16)
-            j16 = (n_wave_base + fx.Int32(ni * 16)) // fx.Int32(16)  # n16 in tile
             for gu in range_constexpr(2):
                 n0 = expert_off + n_local + (inter_i32 if gu else fx.Int32(0))
-                if const_expr(TILE_W):
-                    w_chunk = tile_id * fx.Int32(K_TILES * W_TILE_U16) + (
-                        fx.Int32(gu * (TILE_N // 16)) + j16
-                    ) * fx.Int32(K_GROUPS * 64)
-                else:
-                    w_chunk = (n0 // fx.Int32(16)) * fx.Int32(W_K0 * 64)
+                w_chunk = (n0 // fx.Int32(16)) * fx.Int32(W_K0 * 64)
                 w_base[gu, ni] = w_chunk + lane_div_16 * fx.Int32(16) + lane_mod_16
                 key = (gu, ni // 2) if share_scale else (gu, ni)
                 sc_key[gu, ni] = key
                 sc_npack[gu, ni] = (n0 // fx.Int32(16)) % fx.Int32(2)
                 if key not in sc_base:
-                    if const_expr(TILE_W):
-                        j32 = (n_wave_base + fx.Int32(ni * 16)) // fx.Int32(32)
-                        s_chunk = tile_id * fx.Int32(
-                            (SCALE_K_PAD // 256) * SC_KB_DW
-                        ) + (fx.Int32(gu * (TILE_N // 32)) + j32) * fx.Int32(64)
-                    else:
-                        s_chunk = (n0 // fx.Int32(32)) * fx.Int32(SC_STRIDE_N0)
+                    s_chunk = (n0 // fx.Int32(32)) * fx.Int32(SC_STRIDE_N0)
                     sc_base[key] = s_chunk + lane_div_16 * fx.Int32(16) + lane_mod_16
 
         # Register staging of one W tile (raw fp4 dwordx4 + packed e8m0 dwords); the
@@ -456,15 +396,11 @@ def compile_a8w4_gemm1(
 
         def load_w_global(base_k):
             # e8m0 dword of 128-K group g sits in K-block (base_k + g*128) // 256.
-            SKB = SC_KB_DW if TILE_W else 64  # dwords per 256-K scale block step
-            s_off = (base_k // fx.Int32(256)) * fx.Int32(SKB)
+            s_off = (base_k // fx.Int32(256)) * fx.Int32(64)
             for (key, g), r in s_regs.items():
-                idx = sc_base[key] + s_off + fx.Int32((g // 2) * SKB)
+                idx = sc_base[key] + s_off + fx.Int32((g // 2) * 64)
                 fx.copy(ws_atom, fx.slice(ws_tiles, (None, idx)), r)
-            if const_expr(TILE_W):
-                w_off = (base_k // fx.Int32(TILE_K)) * fx.Int32(W_TILE_U16)
-            else:
-                w_off = (base_k // fx.Int32(128)) * fx.Int32(64)
+            w_off = (base_k // fx.Int32(128)) * fx.Int32(64)
             for (gu, ni, g), r in w_regs.items():
                 idx = w_base[gu, ni] + w_off + fx.Int32(g * 64)
                 fx.copy(w_atom, fx.slice(w_tiles, (None, idx)), r)
@@ -696,7 +632,7 @@ def compile_a8w4_gemm1(
 
         def _q8_epilogue(rows, M_REPEAT, acc_gate, acc_up, f_gate, f_up):
             """SiLU -> bf16 LDS tile -> per-(row, TILE_N) fp8 quant -> 16 B stores of
-            unsorted rows to the local buffer (q8) or to every TP peer (q8push)."""
+            the rows by sorted position (+ one f32 scale per row and n-block)."""
             lds_i32 = fx.Int32(fx.ptrtoint(lds_ptr))
             lds_bf16 = lds_typed_ptr(lds_i32, T.bf16)
             gpu.barrier()  # every wave finished reading the A tile from LDS
@@ -721,55 +657,14 @@ def compile_a8w4_gemm1(
                         lds_bf16[row_in_tile * fx.Int32(TILE_N) + col] = y.to(fx.BFloat16)
             gpu.barrier()
 
-            # q8 plane layout from the runtime row count (i32 dword indices as
-            # before; byte extents in i64): data [NPES][rows][INTER] fp8, then the
-            # f32 scales; a push slot is that rounded up to 256 B, two slots
-            # (epoch parity), then the flags.
+            # q8 plane layout from the runtime row count: data [rows][INTER] fp8,
+            # then [rows][NUM_N_BLOCKS] f32 scales (dword index ``s_base``).
             rows_i64 = fx.Int64(i32_rows)
-            data_b = rows_i64 * fx.Int64(NPES * INTER)
-            slot_b = (
-                data_b + rows_i64 * fx.Int64(NPES * NUM_N_BLOCKS * 4) + fx.Int64(255)
-            ) & fx.Int64(-256)
-            s_base = i32_rows * fx.Int32(NPES * INTER // 4)  # dword index of scales
-            if const_expr(PUSH):
-                tbl = global_typed_ptr(arg_tbl, T.i64, align=8)
-                parity = fx.Int64(i32_epoch & fx.Int32(1)) * slot_b
-                # store i of this WG goes to rank (rank + tile + i): spread over links
-                dsts = [
-                    buffer_ops.create_buffer_resource_from_addr(
-                        _raw(
-                            fx.Int64(
-                                tbl[
-                                    i32_rank
-                                    if const_expr("selfonly" in PUSH_VAR)
-                                    else (i32_rank + tile + fx.Int32(i)) % fx.Int32(NPES)
-                                ]
-                            )
-                            + parity
-                        ),
-                        # bounded: masked lanes use offset 0x7FFFFFFF and must be
-                        # dropped by the range check, not written at base + 2 GB
-                        num_records_bytes=_raw(slot_b),
-                    )
-                    for i in range(1 if "one" in PUSH_VAR else NPES)
-                ]
-                plane = i32_rank * i32_rows
-                cm = 17  # sc0|sc1 write-through (system coherent), as two-shot light
-                if const_expr("cm0" in PUSH_VAR):
-                    cm = 0
-                if const_expr("cm16" in PUSH_VAR):
-                    cm = 16
-            else:
-                dsts = [
-                    buffer_ops.create_buffer_resource_from_addr(
-                        _raw(fx.Int64(arg_out)),
-                        num_records_bytes=_raw(
-                            rows_i64 * fx.Int64(INTER + NUM_N_BLOCKS * 4)
-                        ),
-                    )
-                ]
-                plane = fx.Int32(0)
-                cm = 0
+            s_base = i32_rows * fx.Int32(INTER // 4)
+            dst = buffer_ops.create_buffer_resource_from_addr(
+                _raw(fx.Int64(arg_out)),
+                num_records_bytes=_raw(rows_i64 * fx.Int64(INTER + NUM_N_BLOCKS * 4)),
+            )
 
             r_in = tx // fx.Int32(Q_TPR)
             sub = tx % fx.Int32(Q_TPR)
@@ -778,10 +673,7 @@ def compile_a8w4_gemm1(
                 fused = fx.Int32(_global_i32_at(arg_mind, bx_m + row_in_tile))
                 token = fused & fx.Int32(0x00FFFFFF)
                 valid = token < i32_ntok
-                if const_expr(SORTED):
-                    dest_row = plane + bx_m + row_in_tile
-                else:
-                    dest_row = plane + token * fx.Int32(TOPK) + fused.shrui(fx.Int32(24))
+                dest_row = bx_m + row_in_tile
                 byte0 = (row_in_tile * fx.Int32(TILE_N) + sub * fx.Int32(16)) * fx.Int32(2)
                 vals = []
                 for h in range_constexpr(2):
@@ -812,49 +704,8 @@ def compile_a8w4_gemm1(
                 d_off = (dest_row * fx.Int32(INTER) + by_n + sub * fx.Int32(16)) // fx.Int32(4)
                 s_off = s_base + (dest_row * fx.Int32(NUM_N_BLOCKS) + n_block)
                 s_valid = (sub == fx.Int32(0)).select(token, i32_ntok) < i32_ntok
-                if const_expr(SCALE_RUN):
-                    # all TPR lanes of the row hold the same s: identical LDS writes
-                    lds_typed_ptr(lds_i32, T.f32)[
-                        fx.Int32(BM * TILE_N * 2 // 4) + row_in_tile
-                    ] = s
-                for d in dsts:
-                    buffer_ops.buffer_store(packed, d, d_off, mask=valid, cache_modifier=cm)
-                    if const_expr("noscale" not in PUSH_VAR and not SCALE_RUN):
-                        buffer_ops.buffer_store(s, d, s_off, mask=s_valid, cache_modifier=cm)
-
-            if const_expr(SCALE_RUN):
-                # scales of this tile's rows: [rank][n_block][bx_m : bx_m+rows] f32,
-                # one contiguous rows*4 B run per peer (padding rows: s = 1, unused)
-                gpu.barrier()
-                sv = lds_vec_load(
-                    lds_i32,
-                    fx.Int32(BM * TILE_N * 2) + (tx % fx.Int32(BM // 4)) * fx.Int32(16),
-                    Vec.make_type(4, fx.Float32),
-                    fx.Float32,
-                    align=16,
-                )
-                s_run = s_base + (
-                    (i32_rank * fx.Int32(NUM_N_BLOCKS) + n_block) * i32_rows
-                    + bx_m
-                    + tx * fx.Int32(4)
-                )
-                for d in dsts:
-                    buffer_ops.buffer_store(
-                        sv, d, s_run, mask=tx < fx.Int32(rows // 4), cache_modifier=cm
-                    )
-
-            if const_expr(PUSH and "nopub" not in PUSH_VAR):
-                rocdl.s_waitcnt(vmcnt=0)
-                gpu.barrier()
-                _publish(
-                    arg_tbl,
-                    i32_rank,
-                    i32_epoch,
-                    tx,
-                    m_block * fx.Int32(NUM_N_BLOCKS) + n_block,
-                    slot_b * fx.Int64(2),
-                    i32_tiles,
-                )
+                buffer_ops.buffer_store(packed, dst, d_off, mask=valid)
+                buffer_ops.buffer_store(s, dst, s_off, mask=s_valid)
 
         # ---- row-variant dispatch ------------------------------------------------
         if const_expr(dyn_m):
@@ -875,23 +726,6 @@ def compile_a8w4_gemm1(
             _dispatch()
         else:
             run_rows(BM)
-
-    @flyc.jit
-    def _publish(arg_tbl, i32_rank, i32_epoch, tx, flag_idx, flag_off, i32_tiles):
-        """Lane t < NPES sets flag[rank][tile] = epoch on rank (rank + t)."""
-        if tx < fx.Int32(NPES):
-            tbl = global_typed_ptr(arg_tbl, T.i64, align=8)
-            peer = (i32_rank + tx) % fx.Int32(NPES)
-            llvm.AtomicRMWOp(
-                llvm.AtomicBinOp.xchg,
-                _gep1(
-                    _global_base_ptr1(fx.Int64(tbl[peer]) + fx.Int64(flag_off)),
-                    (i32_rank * i32_tiles + flag_idx) * fx.Int32(4),
-                ),
-                _raw(i32_epoch),
-                llvm.AtomicOrdering.monotonic,
-                alignment=4,
-            )
 
     @fx.struct
     class SharedStorage:
@@ -971,11 +805,7 @@ def compile_a8w4_gemm1(
                 arg_mind,
                 arg_out,
                 i32_ntok,
-                arg_tbl,
-                i32_rank,
-                i32_epoch,
                 i32_rows,
-                i32_tiles,
                 situ,
                 tile,
                 lane,
@@ -994,11 +824,11 @@ def compile_a8w4_gemm1(
         arg_mind: fx.Int64,
         arg_out: fx.Int64,
         i32_ntok: fx.Int32,
-        arg_tbl: fx.Int64,
-        i32_rank: fx.Int32,
-        i32_epoch: fx.Int32,
+        arg_tbl: fx.Int64,  # unused (kernarg layout of the tuned build)
+        i32_rank: fx.Int32,  # unused
+        i32_epoch: fx.Int32,  # unused
         i32_rows: fx.Int32,
-        i32_tiles: fx.Int32,
+        i32_tiles: fx.Int32,  # unused
         f32_situ_beta: fx.Float32,
         f32_situ_beta_rcp: fx.Float32,
         f32_situ_linbeta: fx.Float32,
@@ -1067,7 +897,7 @@ def compile_a8w4_gemm1(
             i32_rank,
             i32_epoch,
             i32_rows,
-            i32_grid,  # flag-table stride: one flag per launched tile
+            i32_grid,  # i32_tiles (unused)
             f32_situ_beta,
             f32_situ_beta_rcp,
             f32_situ_linbeta,
@@ -1104,12 +934,6 @@ def a8w4_gemm1(
     dyn_m=False,
     epilog="bf16",
     inter_dim=None,
-    topk=None,
-    npes=1,
-    tbl=None,
-    rank=0,
-    epoch=0,
-    w_layout="std",
     fast_dec=False,
     act="silu",
     situ_beta=1.0,
@@ -1117,12 +941,10 @@ def a8w4_gemm1(
     swiglu_limit=float("inf"),
 ):
     """Host launcher. ``out`` is bf16 ``[sorted_expert_ids.numel()*tile_m, inter]``
-    (``epilog="bf16"``), the local q8 buffer (``"q8"``), or ignored (``"q8push"``:
-    ``tbl`` = int64 peer-base table of the symmetric buffer)."""
+    (``epilog="bf16"``) or the q8 buffer (``"q8s"``, ``inter_dim`` required)."""
     tokens, model_dim = x_fp8.shape
     if epilog == "bf16":
         inter_dim = out.shape[1]
-    q8 = epilog != "bf16"
     launch = compile_a8w4_gemm1(
         D_HIDDEN=model_dim,
         D_INTER=inter_dim,
@@ -1137,22 +959,13 @@ def a8w4_gemm1(
         waves_per_eu=waves_per_eu,
         dyn_m=dyn_m,
         epilog=epilog,
-        TOPK=topk if q8 else None,
-        NPES=npes,
-        w_layout=w_layout,
         fast_dec=fast_dec,
         act=act,
     )
     grid = sorted_expert_ids.numel() * (inter_dim // tile_n)
-    # q8 epilogues: rows of the [rows, inter] fp8 plane (its scales follow it). A
-    # launch arg, not a compile constant: it changes with every batch size.
-    rows = 0
-    if q8:
-        rows = (
-            sorted_expert_ids.numel() * tile_m
-            if epilog in ("q8s", "q8pushs")
-            else tokens * topk
-        )
+    # rows of the q8 plane (its scales follow it). A launch arg, not a compile
+    # constant: it changes with every batch size.
+    rows = sorted_expert_ids.numel() * tile_m if epilog == "q8s" else 0
     _run_compiled(
         launch,
         x_fp8.data_ptr(),
@@ -1163,11 +976,11 @@ def a8w4_gemm1(
         sorted_expert_ids.data_ptr(),
         num_valid_ids.data_ptr(),
         sorted_ids.data_ptr(),
-        out.data_ptr() if out is not None else 0,
+        out.data_ptr(),
         int(tokens),
-        tbl.data_ptr() if tbl is not None else 0,
-        int(rank),
-        int(epoch),
+        0,  # tbl, rank, epoch: unused kernel args
+        0,
+        0,
         int(rows),
         *situ_args(situ_beta, situ_linear_beta, swiglu_limit),
         int(grid),
@@ -1186,7 +999,7 @@ def situ_args(situ_beta=1.0, situ_linear_beta=1.0, swiglu_limit=float("inf")):
 
 
 def prep_w1_fast_decode(w_u8):
-    """W bytes (any of the layouts above) -> the ``fast_dec`` form, per dword:
+    """Preshuffled W bytes -> the ``fast_dec`` form, per dword:
     nibble order k0..k7 -> byte j = (k_j | k_{j+4} << 4), and -0 (0x8) -> +0."""
     b = w_u8.reshape(-1, 4)
     nib = torch.stack([b & 0xF, b >> 4], dim=-1).reshape(-1, 8)  # k0..k7
@@ -1196,7 +1009,7 @@ def prep_w1_fast_decode(w_u8):
 
 def prep_w1_predelta(w1_u8, w1_scale_u8, w1_exp):
     """``fast_dec=2`` prep on the STANDARD-preshuffled W1 bytes / e8m0 scale bytes
-    (before ``retile_w1`` / ``prep_w1_fast_decode``): scale byte ->
+    (before ``prep_w1_fast_decode``): scale byte ->
     min(max_code - code, 11) * 8, and W of flushed groups (max_code - code > 11,
     which the kernel decodes to 0) set to 0. ``w1_exp``: ``channel_exponents``.
 
@@ -1222,16 +1035,10 @@ def prep_w1_predelta(w1_u8, w1_scale_u8, w1_exp):
 
 
 def prep_w1_fast(w1_u8, w1_scale_u8, w1_exp, fast_dec):
-    """Standard-preshuffled W1 / scale bytes -> the ``fast_dec`` (1 or 2) form for
-    the std ``w_layout``. ``w1_exp`` must come from the ORIGINAL scales."""
+    """Standard-preshuffled W1 / scale bytes -> the ``fast_dec`` (1 or 2) form.
+    ``w1_exp`` must come from the ORIGINAL scales."""
     assert fast_dec in (1, 2), fast_dec
     if fast_dec == 2:
         w1_u8, w1_scale_u8 = prep_w1_predelta(w1_u8, w1_scale_u8, w1_exp)
     return prep_w1_fast_decode(w1_u8).view(w1_u8.shape), w1_scale_u8
-
-
-# =============================================================================
-# Reference + test
-# =============================================================================
-
 

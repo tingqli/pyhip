@@ -167,7 +167,7 @@ def _run_tp2k(cfg, x, W, tw, ti, shape, e0, akw):
     sorted_size = seids.numel() * bm
     buf = torch.empty(sorted_size * (I + groups * 4), dtype=torch.uint8, device=x.device)
     G1.a8w4_gemm1(x8, xs, W["w1"], W["w1_scale"], W["w1_exp"], sids, seids, nv, buf,
-                  num_experts=E, tile_m=bm, epilog="q8s", inter_dim=I, topk=topk,
+                  num_experts=E, tile_m=bm, epilog="q8s", inter_dim=I,
                   tile_n=128, b_cache_mod=cfg["g1_bcm"], xcd_swizzle=1, dyn_m=bm > 32,
                   fast_dec=2, **akw)
     nd = sorted_size * I
