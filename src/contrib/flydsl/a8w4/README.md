@@ -2,7 +2,7 @@
 
 fp8 激活（FNUZ）× mxfp4 权重的 MoE，面向 MI300X / MI325X（gfx942）。TP 和 EP 共用一个入口 `a8w4_moe`：每次调用按（shape，token 数）查调优表，从 5 类 kernel 里选出当前上下文（激活函数、是否在 CUDA graph capture 中、token 数）允许的最快配置。EP 的 all-to-all 接收缓冲区（例如 MORI dispatch：按容量分配，有效行数只在 device 上）用 `a8w4_moe_dyn`，不做 host 同步，可以放进 CUDA graph（2.4 节）。调优表覆盖 XiaomiMiMo/MiMo-V2.6-Flash(-RL) 的 TP8、EP8 每卡 shape（另有 TP4），1–32768 tokens，SiLU 与 SiTUv2 各一组（TP4 只有 SiLU）。
 
-本目录是一个独立的 Python 包。kernel 只依赖 torch 和 FlyDSL 0.3.2，aiter 的 FlyDSL helper 已复制到 `_vendor/`。aiter 只在三处用到：TP 族 kernel 跑专家切片（EP 形状）时的路由排序（`moe_sorting`）、权重 preshuffle 辅助函数，以及测试和调优。
+本目录是 pyhip 的一部分（`pyhip.contrib.flydsl.a8w4`），也可以在 `src/contrib/flydsl` 下作为顶层包 `a8w4` 运行（下文的命令都是这样用的）。kernel 依赖 torch 和 FlyDSL 0.3.2，aiter 的 FlyDSL helper 已复制到 `_vendor/`；新代码可以直接用 pyhip 的模块，要写成绝对导入（`from pyhip.contrib.flydsl... import ...`）。aiter 只在三处用到：TP 族 kernel 跑专家切片（EP 形状）时的路由排序（`moe_sorting`）、权重 preshuffle 辅助函数，以及测试和调优。
 
 ## 目录
 
@@ -24,7 +24,7 @@ fp8 激活（FNUZ）× mxfp4 权重的 MoE，面向 MI300X / MI325X（gfx942）�
 ## 1. 快速开始
 
 ```python
-# 在 pyhip 里：from pyhip.contrib.flydsl.a8w4 import ...；单独复制出去时：
+# 也可以 from pyhip.contrib.flydsl.a8w4 import ...；作为顶层包 a8w4 使用时：
 import sys
 sys.path.insert(0, "/path/to/dir_that_contains_a8w4")
 from a8w4 import a8w4_moe, a8w4_moe_dyn, prepare_weights, shuffle_mxfp4
@@ -787,7 +787,7 @@ python a8w4/tests/test_a8w4_mori_tp8.py --allreduce aiter --act silu situv2 \
 
 ### 9.3 加一个新 kernel 或新配置
 
-1. 在 `kernels/` 加 device 代码，在 `moe.py` 加 runner，并注册到 `RUNNERS`。
+1. 在 `kernels/` 加 device 代码，在 `moe.py` 加 runner，并注册到 `RUNNERS`。host 封装用 `pyhip.contrib.flydsl.host_launch` 的 `@flydsl_kernel`，不再手写 `functools.cache` + `_run_compiled`，写法见 skill `flydsl-host-launch`。
 2. 更新 `config_name` / `parse_config`（名字要能解析回 dict，CSV 里存的是名字）。
 3. 在 `supported()` 里写清结构限制，包括 act、capture、tokens。
 4. 在 `tune.candidates()` 里加入候选。

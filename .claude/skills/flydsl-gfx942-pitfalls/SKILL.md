@@ -30,7 +30,8 @@ part of its key. Key = toolchain hash + source of the `@flyc.jit` function + sou
 Rules:
 - Compile-time switches: int / tuple arguments of the (usually `functools.cache`d) compile
   function, also folded into the kernel name (then dumps and profiles tell variants apart).
-  Never a list / dict / set / callable / config object in the closure.
+  Never a list / dict / set / callable / config object in the closure. New host wrappers use
+  `@flydsl_kernel` (skill `flydsl-host-launch`), which rejects such keys.
 - After editing `_vendor/` helpers, or whenever a change "does nothing": run with a fresh cache,
   `FLYDSL_RUNTIME_CACHE_DIR=$(mktemp -d) python ...`. An ablation that reuses a stale binary
   reports "no effect" (this produced a wrong a8w4 gemm2 epilogue conclusion).

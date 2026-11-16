@@ -6,8 +6,9 @@ description: Workflow for performance experiments on the pyhip a8w4 MoE kernels 
 # a8w4 performance experiments
 
 All commands run from `src/contrib/flydsl` (the directory holding `a8w4/`). Every tool
-prints `-h`. Before editing kernels also read the `flydsl-gfx942-pitfalls` skill; for the
-timing rules behind the tools, `gpu-timing-protocol`.
+prints `-h`. Before editing kernels also read the `flydsl-gfx942-pitfalls` skill; host
+wrappers of new kernels follow `flydsl-host-launch`; for the timing rules behind the tools,
+`gpu-timing-protocol`.
 
 ## The expensive mistakes of earlier sessions (and what now prevents them)
 
