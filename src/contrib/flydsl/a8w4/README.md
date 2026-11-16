@@ -806,13 +806,12 @@ python a8w4/tests/test_a8w4_mori_tp8.py --allreduce aiter --act silu situv2 \
 
 ### 9.5 kernel 文件里保留的实验选项
 
-TP kernel（`tp_gemm1`、`tp_gemm2`、`tp_fmoe`、`tp_fmoe_q`）里走不到的实验选项、冻结常量，以及调用方不用的模式取值（`fast_dec=0/1`、`flush_tiny`、gemm1 的 bf16 epilogue 和 `pipeline` 覆盖、gemm2 的 `a_group`/`dyn_rows`/`epilog`/`row_vgpr`、fmoe 的 `dyn_rows`/`xcd`）都已删掉（见 [agile_refactor.md](agile_refactor.md) 的 I1、I1b），剩下的 ISA 与删之前逐位相同；kernel 名字里这些选项的标签照旧保留。还留着的有：
+TP kernel（`tp_gemm1`、`tp_gemm2`、`tp_fmoe`、`tp_fmoe_q`）里走不到的实验选项、冻结常量，以及调用方不用的模式取值（`fast_dec=0/1`、`flush_tiny`、gemm1 的 bf16 epilogue 和 `pipeline` 覆盖、gemm2 的 `a_group`/`dyn_rows`/`epilog`/`row_vgpr`、fmoe 的 `dyn_rows`/`xcd`）都已删掉（见 [agile_refactor.md](agile_refactor.md) 的 I1、I1b）；EP kernel 的调试开关（`ep_gemm` 的 `TL` 时间线、`ep_small` 的 `DBG`）和 a16w4 路径（`adt="bf16"`）也已删掉（I2）。剩下的 ISA 与删之前逐位相同；kernel 名字里这些选项的标签照旧保留。还留着的有：
 
 - **数值型调优参数**：tile 尺寸、`BM`、`b_cache_mod`、`xcd_swizzle`、`waves_per_eu`、`dyn_m`、`n_tiles`、`ksplit`、`n_ctas` 等，即使调用方只用一个值，调优时也可以用。
 - **没用的 kernel 参数**：`tp_gemm1` 的 `tbl`、`rank`、`epoch`、`tiles`，`tp_gemm2` 的 `dbg`、`tbl`、`rank`、`epoch`，`tp_fmoe` 的 `dbg`。代码里标了 `# unused`，host 端传 0。删掉会改变 kernarg 偏移从而改变 ISA，所以留到 host 封装重写时一起删。
-- **EP kernel 的冻结常量**：`ep_gemm` 的 `TL`（per-tile 时间线）。
 
-要用 `TL` 做实验，改源文件里的常量即可：kernel 代码按名字读到的模块级常量按值进入缓存 key，FlyDSL 会重新编译（缓存 key 的完整规则见 10 节第 1 条）。
+要恢复已删的选项做实验，从删除前的 commit（见 agile_refactor.md 的日志）取回源文件。
 
 ### 9.6 集成到推理框架
 
