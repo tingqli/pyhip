@@ -7,7 +7,8 @@ This is what aiter.fused_moe runs in place of the 1-stage asm kernel fmoe_fp8_bl
 AITER_FMOE_FP8_BLOCKSCALE_FLYDSL=1 (see docs/moe_a8w8_blockscale_gfx942.md). Inputs use the asm kernel's layouts:
 a1 [tokens, H] FP8 with a1_scale_t [H/128, tokens] FP32, w1 / w2 aiter shuffle_weight(16,16) of [E, 2I, H] /
 [E, H, I] FP8 with FP32 scales [E, 2I/128, H/128] / [E, H/128, I/128], and the routes as from aiter
-moe_sorting(block_size=256) with an empty moe_buf, so out is not zeroed by the sort.
+moe_sorting(block_size=256) with an empty moe_buf, so out is not zeroed by the sort. The activation is SiLU, or
+SiTUv2 with act="situv2" (moe_gateup_a8w8_blockscale_gfx942_lds.activation_args).
 """
 
 import torch
@@ -20,6 +21,7 @@ from .moe_down_a8w8_blockscale_gfx942_lds import (
 from .moe_down_a8w8_blockscale_gfx942_lds import validate_parameters as validate_down
 from .moe_gateup_a8w8_blockscale_gfx942_lds import (
     SORT_BLOCK_M,
+    activation_args,
     moe_gateup_a8w8_blockscale_gfx942_lds,
 )
 from .moe_gateup_a8w8_blockscale_gfx942_lds import (
@@ -51,13 +53,16 @@ def unsupported_reason(tokens, hidden_dim, inter_dim, topk, local_experts):
 
 def fused_moe_a8w8_blockscale_gfx942(
     a1, a1_scale_t, w1, w1_scale, w2, w2_scale, sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, out, topk,
-    num_rows=None, single_store=True,
+    num_rows=None, single_store=True, act="silu", situ=None,
 ):
-    """out [tokens, H] BF16 = sum over each token's local routes of routing weight * Down(SiLU(gate) * up).
+    """out [tokens, H] BF16 = sum over each token's local routes of routing weight * Down(act(gate, up)).
 
     num_rows: optional device int32 tensor with the valid token count (EP all-to-all receive buffers); rows of out
     at or past it are left untouched. single_store=False adds every route with BF16 atomics into a zeroed out.
+    act="silu" (default): SiLU(gate) * up. act="situv2": SiTUv2 with situ=dict(situ_beta, situ_linear_beta,
+    swiglu_limit), as a8w4_moe; invalid act or situ raise ValueError before out is touched.
     """
+    activation_args(act, situ)
     tokens = a1.shape[0]
     inter_dim = w2.shape[2]
     # Older aiter moe_sorting does not round sorted_ids up to whole blocks; the valid blocks always fit below it.
@@ -75,7 +80,7 @@ def fused_moe_a8w8_blockscale_gfx942(
         out.zero_()
     moe_gateup_a8w8_blockscale_gfx942_lds(
         a1, w1, a1_scale_t, w1_scale, sorted_ids, expert_ids, num_valid_ids, a2, layout=GATEUP_LAYOUT,
-        out_scale_t=a2_scale_t, topk=topk,
+        out_scale_t=a2_scale_t, topk=topk, act=act, situ=situ,
     )
     moe_down_a8w8_blockscale_gfx942_lds(
         a2, w2, a2_scale_t, w2_scale, sorted_ids, sorted_weights, expert_ids, num_valid_ids, out, layout=DOWN_LAYOUT,
