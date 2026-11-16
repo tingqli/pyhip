@@ -19,7 +19,7 @@
   - 迭代 0，安全网：`64ce77c`、`d17f502`（ISA 基线在这个提交上生成）、`4e256d9`。
   - 设计文档：`1383e41`、`0c50a56`、`ab05750`、`6e2c2ac`（本文件）。
   - I1：`0b0e3c9`、`725209f`、`51817b1`、`f9d75f3`、`cb2e8f0`（收尾：文档和实验脚本）。
-  - I1b：`aa91396`、`2b2efaa`、`4f478b4`，加一个文档收尾提交。
+  - I1b：`aa91396`、`2b2efaa`、`4f478b4`、`8399c9d`（文档）。
 - **用户的文件**：未跟踪的 `refactory2.md` 属于用户，不要改，也不要提交。
 
 ### 0.2 工作方式
@@ -108,7 +108,7 @@
 - **验收结果**：
   - 每个提交都是 ISA IDENTICAL（558 次编译，177 份 ISA）；kernel 名字逐字不变；
   - API 测试 23 passed；
-  - 单卡 pytest：见第 4 节。
+  - 单卡 pytest：94 passed、1 skipped，与基线一致。
 
 **经验**：
 
@@ -151,6 +151,7 @@ host 端（`moe._run_tp2k`，G1/G2 唯一的调用方）只用到 gemm1 的 `epi
 |---|---|---|---|
 | 2026-11-15 | 0 安全网 | `prof isa-snapshot` / `isa-diff` / `isa-cover`；API 契约测试和 CSV 往返测试；ISA 和 pytest 基线 | `64ce77c` `d17f502` `4e256d9` |
 | 2026-11-16 | I1 删除 TP kernel 的死代码 | 4 个文件净减约 830 行；ISA IDENTICAL；API 测试 23 passed；单卡 pytest 94 passed、1 skipped | `0b0e3c9` `725209f` `51817b1` `f9d75f3` |
+| 2026-11-16 | I1b 删除 TP kernel 里不用的模式取值 | `tp_gemm1` 1044→915 行，`tp_gemm2` 1225→1034 行，`tp_fmoe` 去掉两个开关；kernel 名字不变；ISA IDENTICAL；API 测试 23 passed；单卡 pytest 94 passed、1 skipped | `aa91396` `2b2efaa` `4f478b4` `8399c9d` |
 
 ## 5. 草图摘要：第 5–7 轮讨论（远期目标的素材，不是承诺）
 
