@@ -45,7 +45,7 @@ from ._cvt import (
     _perm_u32,
     _rnu_hi,
 )
-from ._hw import DPP_QUAD_SWAP
+from ._hw import DPP_QUAD_SWAP, NUM_XCD
 from ._launch import _run_compiled
 from ._mem import (
     _global_i32_at,
@@ -537,11 +537,11 @@ def compile_a8w4_fmoe_bm64(*, D_HIDDEN, D_INTER, NE, TOPK=8, b_cache_mod=2,
         wave = rocdl.readfirstlane(T.i32, tx // fx.Int32(64))
         total_m = _global_i32_at(arg_cumsum, fx.Int32(0)) // fx.Int32(BM)
         if bx < total_m * fx.Int32(ksplit):
-            # WGs go round-robin over the 8 XCDs: give XCD x a contiguous range of
+            # WGs go round-robin over the XCDs: give XCD x a contiguous range of
             # (m-block, split) work items so same-expert blocks share its L2.
             tot = total_m * fx.Int32(ksplit)
-            xc = _umod(bx, 8)
-            lid = (xc * _udiv(tot, 8) + fx.min(xc, _umod(tot, 8)) + _udiv(bx, 8))
+            xc = _umod(bx, NUM_XCD)
+            lid = (xc * _udiv(tot, NUM_XCD) + fx.min(xc, _umod(tot, NUM_XCD)) + _udiv(bx, NUM_XCD))
             m_block = lid // fx.Int32(ksplit)
             c0 = (lid % fx.Int32(ksplit)) * fx.Int32(CH)
             _body(lds_ptr, arg_x, arg_xs, arg_w1, arg_ws1, arg_exp1, arg_w2, arg_ws2,
