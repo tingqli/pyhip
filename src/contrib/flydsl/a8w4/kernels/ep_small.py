@@ -25,8 +25,6 @@ ramps (first W bytes arrive several us after launch) plus the prep kernel itself
 Every item issues its W prefetch before any wait. The last WG resets the counters.
 """
 
-import functools
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
@@ -35,12 +33,13 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
+from pyhip.contrib.flydsl.host_launch import flydsl_kernel
+
 from ._act import gate_up_act, situ_args, situ_params
 from ._atomic import _atomic_bf16x4, _gatomic_add, _gatomic_xchg, _gload_sys
 from ._cvt import _bf16x2_rne, _channel_factor, _fp8x4_pack
 from ._hw import CM_SYS, NUM_CU
 from ._kloop import _dispatch_rows, _make_core
-from ._launch import _run_compiled
 from ._mem import (
     _global_i32_at,
     _raw,
@@ -117,8 +116,13 @@ def _signal2(arg_ctr, top, sub0, bx, grid, tx):
             _gatomic_add(arg_ctr, top, 1)
 
 
-@functools.cache
-def compile_ep_small(*, H, I, EL, TOPK, BM, NW, C1, C2, PF, ROWV, MAXM, SCH=3,
+def _capacity(maxm, topk, el, bm):
+    """Sorted rows incl. padding (worst case) for ``maxm`` tokens."""
+    return maxm * topk + el * bm
+
+
+@flydsl_kernel
+def ep_small_kernel(*, H, I, EL, TOPK, BM, NW, C1, C2, PF, ROWV, MAXM, SCH=3,
                      ACT="silu"):
     assert ACT in ("silu", "situv2"), ACT
     assert EL <= 32 and TOPK == 8
@@ -129,7 +133,7 @@ def compile_ep_small(*, H, I, EL, TOPK, BM, NW, C1, C2, PF, ROWV, MAXM, SCH=3,
     NB2 = H // NO2
     ARB1 = 128
     ARB2 = 128
-    CAP = MAXM * TOPK + EL * BM  # sorted rows incl. padding (worst case)
+    CAP = _capacity(MAXM, TOPK, EL, BM)
     MW = -(-MAXM // 64)  # 64-token words
     assert ROWV[-1] == BM and all(r % 16 == 0 for r in ROWV)
     assert MAXM <= NUM_CU * NW  # setup x quant: <= 1 row per wave at >= 1 WG/CU
@@ -528,7 +532,7 @@ def compile_ep_small(*, H, I, EL, TOPK, BM, NW, C1, C2, PF, ROWV, MAXM, SCH=3,
                f32_lim).launch(grid=(fx.Int64(i32_grid), 1, 1), block=(NT, 1, 1),
                                stream=stream)
 
-    return launch, dict(CAP=CAP, NMBMAX=CAP // BM, LDS_BYTES=LDS_BYTES, NI1=NI1, NO2=NO2)
+    return launch
 
 
 _BUF = {}
@@ -560,17 +564,14 @@ def ep_moe_small(x, W, topk_weights, topk_ids, *, e0, maxm=512, cfg=None,
     I = W["w2"].shape[2] * 2
     K = topk_ids.shape[1]
     assert M <= maxm
-    launch, info = compile_ep_small(
-        H=H, I=I, EL=E, TOPK=K, BM=cfg["bm"], NW=cfg["nw"], C1=cfg["c1"],
-        C2=cfg["c2"], PF=cfg["pf"], ROWV=tuple(cfg["rowv"]), MAXM=maxm,
-        SCH=cfg.get("sch", 3), ACT=act)
-    s = _scratch(x.device, maxm, H, I, info["CAP"], info["NMBMAX"])
+    cap = _capacity(maxm, K, E, cfg["bm"])
+    s = _scratch(x.device, maxm, H, I, cap, cap // cfg["bm"])
     out = torch.empty((M, H), dtype=torch.bfloat16, device=x.device)
     grid = NUM_CU * cfg["wpc"]
-    _run_compiled(
-        launch, x.data_ptr(), s["x8"].data_ptr(), s["xs"].data_ptr(), topk_ids.data_ptr(),
-        topk_weights.data_ptr(), W["w1"].data_ptr(), W["w1_scale"].data_ptr(),
-        W["w1_exp"].data_ptr(), W["w2"].data_ptr(), W["w2_scale"].data_ptr(),
-        W["w2_exp"].data_ptr(), out.data_ptr(), s["inter"].data_ptr(), s["ctr"].data_ptr(),
-        int(M), int(e0), *situ_args(**situ), int(grid), torch.cuda.current_stream())
+    ep_small_kernel(
+        x, s["x8"], s["xs"], topk_ids, topk_weights, W["w1"], W["w1_scale"], W["w1_exp"],
+        W["w2"], W["w2_scale"], W["w2_exp"], out, s["inter"], s["ctr"], M, e0,
+        *situ_args(**situ), grid,
+        H=H, I=I, EL=E, TOPK=K, BM=cfg["bm"], NW=cfg["nw"], C1=cfg["c1"], C2=cfg["c2"],
+        PF=cfg["pf"], ROWV=tuple(cfg["rowv"]), MAXM=maxm, SCH=cfg.get("sch", 3), ACT=act)
     return out

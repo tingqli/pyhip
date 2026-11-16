@@ -33,8 +33,6 @@ MULTI-compiled kernel then picks the single-WG sort at run time when the valid
 entries fit one WG.
 """
 
-import functools
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
@@ -43,10 +41,11 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
+from pyhip.contrib.flydsl.host_launch import flydsl_kernel
+
 from ._atomic import _gatomic_add, _gatomic_xchg, _gload_sys, _latomic_add
 from ._cvt import _fp8x4_pack
 from ._hw import NUM_CU, NUM_XCD
-from ._launch import _run_compiled
 from ._mem import (
     _raw,
     buffer_load,
@@ -63,8 +62,8 @@ NT = 256
 SID_SINGLE = -(1 << 31)
 
 
-@functools.cache
-def compile_ep_prep(*, H, TOPK, EL, BM, EPT, QUANT, MULTI, MDYN=False):
+@flydsl_kernel
+def ep_prep_kernel(*, H, TOPK, EL, BM, EPT, QUANT, MULTI, MDYN=False):
     """Sort coverage: grid * 256 * EPT >= M * TOPK (MULTI) or 256 * EPT (single)."""
     assert H % 512 == 0
     assert EL <= 32, "padded-count scan runs over 32 lanes"
@@ -568,13 +567,9 @@ def ep_prep(topk_ids, topk_weights, x, *, e0, block_m, quant, num_local=32, m_va
     n_quant = min(4 * NUM_CU, -(-M // (NT // 64))) if quant else 0
     assert not quant or M <= n_quant * (NT // 64) * 64
     grid = n_sort + n_quant
-    launch = compile_ep_prep(H=H, TOPK=K, EL=num_local, BM=block_m, EPT=ept, QUANT=quant,
-                             MULTI=multi, MDYN=m_valid is not None)
     ws = _workspace(dev, num_local + 2)
-    _run_compiled(
-        launch, topk_ids.data_ptr(), topk_weights.data_ptr(), x.data_ptr(),
-        x8.data_ptr() if quant else 0, xs.data_ptr() if quant else 0, sids.data_ptr(),
-        sw.data_ptr(), seids.data_ptr(), nv.data_ptr(), ws.data_ptr(), int(M), int(e0),
-        m_valid.data_ptr() if m_valid is not None else 0,
-        int(grid), torch.cuda.current_stream())
+    ep_prep_kernel(
+        topk_ids, topk_weights, x, x8, xs, sids, sw, seids, nv, ws, M, e0, m_valid, grid,
+        H=H, TOPK=K, EL=num_local, BM=block_m, EPT=ept, QUANT=quant, MULTI=multi,
+        MDYN=m_valid is not None)
     return sids, sw, seids, nv, x8, xs, sched, rc

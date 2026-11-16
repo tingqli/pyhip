@@ -31,8 +31,6 @@ m-blocks, longest tiles first, in WG (= hardware dispatch) order. ``ep_moe``
 picks the config (``CFGS``) by token count (``AUTO``).
 """
 
-import functools
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
@@ -41,12 +39,13 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
+from pyhip.contrib.flydsl.host_launch import flydsl_kernel
+
 from ._act import gate_up_act, situ_args, situ_params
 from ._atomic import _atomic_bf16x4
 from ._cvt import _channel_factor, _fp8x4_pack
 from ._hw import LDS_BYTES_MAX, NUM_XCD, _opaque_tx
 from ._kloop import _dispatch_rows, _make_core
-from ._launch import _run_compiled
 from ._mem import (
     _buffer_i32_scalar_read,
     _global_base_ptr1,
@@ -184,8 +183,8 @@ def _row_pads(arg_sids, bx_m, rowv, i32_m):
 # =============================================================================
 
 
-@functools.cache
-def compile_ep_gemm1(*, H, I, NE, BM, NI, ROWV, PF=2, bcm=2, wpe=None, NW=4, ARB=256,
+@flydsl_kernel
+def ep_gemm1_kernel(*, H, I, NE, BM, NI, ROWV, PF=2, bcm=2, wpe=None, NW=4, ARB=256,
                      acm=2, SCH=1, ST=None, PRIO=0, TR=False, ORDER=False, ZRC=False,
                      XG=False, DYN=False, ACT="silu"):
     """Stage 1: ``h = act(A W1g^T) * (A W1u^T)`` for the sorted rows of one expert
@@ -629,22 +628,15 @@ def ep_gemm1(x, x_scale, W, sorted_ids, sorted_expert_ids, num_valid_ids, out, o
         zrc = -(-(M * H * 2 // 16) // grid) <= H * 2 // 16
     else:
         zrc = False
-    launch = compile_ep_gemm1(H=H, I=I, NE=NE, BM=block_m, NI=ni,
-                              ROWV=tuple(rowv or (block_m,)), PF=pf, bcm=bcm, wpe=wpe,
-                              NW=nw, ARB=arb, acm=acm, SCH=sch, ST=st, PRIO=prio, TR=tr,
-                              ORDER=sched is not None, ZRC=zrc, XG=x_group, DYN=dyn,
-                              ACT=act)
-    _run_compiled(
-        launch, x.data_ptr(), x_scale.data_ptr(),
-        W["w1"].data_ptr(), W["w1_scale"].data_ptr(), W["w1_exp"].data_ptr(),
-        sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), sorted_ids.data_ptr(),
-        out.data_ptr(), out_scale.data_ptr(),
-        int(M), zero.data_ptr() if zero is not None else 0,
-        int(zero.numel() * zero.element_size() // 16) if zero is not None else 0,
-        sched.data_ptr() if sched is not None else 0,
-        zero_rc.data_ptr() if (zrc or dyn) else 0,
-        *situ_args(situ_beta, situ_linear_beta, swiglu_limit),
-        int(grid), torch.cuda.current_stream())
+    ep_gemm1_kernel(
+        x, x_scale, W["w1"], W["w1_scale"], W["w1_exp"], sorted_expert_ids, num_valid_ids,
+        sorted_ids, out, out_scale, M, zero,
+        zero.numel() * zero.element_size() // 16 if zero is not None else 0,
+        sched, zero_rc if (zrc or dyn) else None,
+        *situ_args(situ_beta, situ_linear_beta, swiglu_limit), grid,
+        H=H, I=I, NE=NE, BM=block_m, NI=ni, ROWV=tuple(rowv or (block_m,)), PF=pf, bcm=bcm,
+        wpe=wpe, NW=nw, ARB=arb, acm=acm, SCH=sch, ST=st, PRIO=prio, TR=tr,
+        ORDER=sched is not None, ZRC=zrc, XG=x_group, DYN=dyn, ACT=act)
     return out
 
 
@@ -653,8 +645,8 @@ def ep_gemm1(x, x_scale, W, sorted_ids, sorted_expert_ids, num_valid_ids, out, o
 # =============================================================================
 
 
-@functools.cache
-def compile_ep_gemm2(*, H, I, NE, BM, NO, ROWV, PF=2, bcm=2, wpe=None, NW=4, ARB=256,
+@flydsl_kernel
+def ep_gemm2_kernel(*, H, I, NE, BM, NO, ROWV, PF=2, bcm=2, wpe=None, NW=4, ARB=256,
                      acm=2, SCH=1, ST=None, PRIO=0, TR=False, ORDER=False, SST=False,
                      DYN=False):
     """Stage 2: ``out[token] += w_route * (A W2^T)`` for the sorted rows of one
@@ -935,19 +927,15 @@ def ep_gemm2(a, a_scale, W, sorted_ids, sorted_weights, sorted_expert_ids, num_v
     M, H = out.shape
     NE = W["w2"].shape[0]
     sorted_rows, I = a.shape
-    launch = compile_ep_gemm2(H=H, I=I, NE=NE, BM=block_m, NO=no,
-                              ROWV=tuple(rowv or (block_m,)), PF=pf, bcm=bcm, wpe=wpe,
-                              NW=nw, ARB=arb, acm=acm, SCH=sch, ST=st, PRIO=prio, TR=tr,
-                              ORDER=sched is not None, SST=single_store, DYN=dyn)
     if grid is None:
         grid = _grid(sorted_expert_ids.numel() * (H // no), sched)
     assert not dyn or grid % 8 == 0
-    _run_compiled(
-        launch, a.data_ptr(), a_scale.data_ptr(),
-        W["w2"].data_ptr(), W["w2_scale"].data_ptr(), W["w2_exp"].data_ptr(),
-        sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), sorted_ids.data_ptr(),
-        sorted_weights.data_ptr(), out.data_ptr(), int(M), int(sorted_rows),
-        sched.data_ptr() if sched is not None else 0, int(grid), torch.cuda.current_stream())
+    ep_gemm2_kernel(
+        a, a_scale, W["w2"], W["w2_scale"], W["w2_exp"], sorted_expert_ids, num_valid_ids,
+        sorted_ids, sorted_weights, out, M, sorted_rows, sched, grid,
+        H=H, I=I, NE=NE, BM=block_m, NO=no, ROWV=tuple(rowv or (block_m,)), PF=pf, bcm=bcm,
+        wpe=wpe, NW=nw, ARB=arb, acm=acm, SCH=sch, ST=st, PRIO=prio, TR=tr,
+        ORDER=sched is not None, SST=single_store, DYN=dyn)
     return out
 
 
