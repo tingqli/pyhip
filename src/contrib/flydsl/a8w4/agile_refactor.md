@@ -22,7 +22,7 @@
   - I1b：`aa91396`、`2b2efaa`、`4f478b4`、`8399c9d`（文档）、`bb7f40e`。
   - I2：`892d7f8`（`TL`、`DBG`）、`87fd7c8`（a16w4）、`7dbb85e`（实验脚本），`aac9bcf`（文档）。
   - I3：`18f243f`（原地精简）、`cc44955`（迁到 `kernels/`，删除 `_vendor/`）、`bf95fe8`（文档）。
-  - I4：`47bde29`（计划）、`6c8434c`、`4b9eb2f`、`5e5d9e3`、`e565657`（合并 fp8x4 pack）、`f9d0ca1`（`tp_fmoe` 的 `NUM_XCD`）、`DOCS`（文档）。
+  - I4：`47bde29`（计划）、`6c8434c`、`4b9eb2f`、`5e5d9e3`、`e565657`（合并 fp8x4 pack）、`f9d0ca1`（`tp_fmoe` 的 `NUM_XCD`）、`f95a9e6`（文档）。
 - **用户的文件**：未跟踪的 `refactory2.md` 属于用户，不要改，也不要提交。
 
 ### 0.2 工作方式
