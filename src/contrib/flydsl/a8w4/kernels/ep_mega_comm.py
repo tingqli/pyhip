@@ -28,8 +28,19 @@ from flydsl.expr import gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
+from ._atomic import _latomic_add
 from ._cvt import _fp8x4_pack
-from ._mem import _global_base_ptr1, _raw, buffer_store, global_typed_ptr, lds_typed_ptr
+from ._hw import _u
+from ._mem import (
+    _global_base_ptr1,
+    _ld,
+    _raw,
+    _rsrc,
+    _store,
+    buffer_store,
+    global_typed_ptr,
+    lds_typed_ptr,
+)
 from .ep_mega import (
     ARRIVED,
     BLOCK_M,
@@ -40,12 +51,7 @@ from .ep_mega import (
     NPES,
     ROW_BITS,
     SCHED_EXPECTED,
-    _ld,
-    _rsrc,
-    _store,
-    _u,
 )
-from .ep_prep import _latomic_add
 
 # plan (int32): totals [E_GLOBAL], fewest routes from one source [E_GLOBAL], expert bases
 # [E_GLOBAL + NPES] ([E_GLOBAL + d] = rows of destination d), first block of each

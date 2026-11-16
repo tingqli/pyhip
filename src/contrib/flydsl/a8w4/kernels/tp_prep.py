@@ -38,7 +38,9 @@ from flydsl.expr import gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
+from ._atomic import _latomic_add
 from ._cvt import _pack_activation
+from ._hw import NUM_CU
 from ._launch import _run_compiled
 from ._mem import (
     _raw,
@@ -48,7 +50,6 @@ from ._mem import (
     global_typed_ptr,
     lds_typed_ptr,
 )
-from .ep_prep import NUM_CU, _latomic_add
 
 NT = 256
 NW = NT // 64

@@ -34,6 +34,7 @@ from ._cvt import (
     _pack_activation,
     _perm_u32,
 )
+from ._hw import NUM_XCD
 from ._launch import _run_compiled
 from ._mem import (
     _buffer_i32_scalar_read,
@@ -598,13 +599,12 @@ def compile_a8w4_gemm1(
 
         # Bijective XCD round-robin over valid tiles; xcd_swizzle>0 also groups
         # xcd_swizzle m-blocks per XCD for L2 locality.
-        NXCD = 8
-        xq = _udiv(bound, NXCD)
-        xr = _umod(bound, NXCD)
+        xq = _udiv(bound, NUM_XCD)
+        xr = _umod(bound, NUM_XCD)
 
         def _xcd(pid):
-            xc = _umod(pid, NXCD)
-            wgid = xc * xq + fx.min(xc, xr) + _udiv(pid, NXCD)
+            xc = _umod(pid, NUM_XCD)
+            wgid = xc * xq + fx.min(xc, xr) + _udiv(pid, NUM_XCD)
             ng = fx.Int32(xcd_swizzle * NUM_N_BLOCKS)
             first_m = (wgid // ng) * fx.Int32(xcd_swizzle)
             group_m = fx.min(total_m_blocks - first_m, fx.Int32(xcd_swizzle))

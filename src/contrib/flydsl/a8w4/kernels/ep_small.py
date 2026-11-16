@@ -26,7 +26,6 @@ Every item issues its W prefetch before any wait. The last WG resets the counter
 """
 
 import functools
-import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -37,7 +36,9 @@ from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
 from ._act import gate_up_act, situ_args, situ_params
+from ._atomic import _atomic_bf16x4, _gatomic_add, _gatomic_xchg, _gload_sys
 from ._cvt import _bf16x2_rne, _channel_factor, _pack_activation
+from ._hw import CM_SYS, NUM_CU
 from ._launch import _run_compiled
 from ._mem import (
     _global_i32_at,
@@ -49,14 +50,8 @@ from ._mem import (
     lds_typed_ptr,
 )
 from . import ep_gemm as EP  # noqa: E402
-from .ep_prep import _gatomic_add, _gatomic_xchg, _gload_sys  # noqa: E402
 
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-
-
-NUM_CU = 304
-CM_COH = 17  # sc0|sc1: device-coherent loads of data written by other WGs (other XCDs)
 # counter workspace (int32): phase-A done (top), exit (top), NSUB phase-A / exit
 # sub-counters (a single address hit by every WG serializes ~40 ns per atomic),
 # then one g1-done counter per m-block. 64 B apart to keep atomics on separate lines.
@@ -69,14 +64,10 @@ C_G1 = C_SUBX + NSUB * STRIDE
 
 
 def _fence_release():
-    """Release of data stored write-through (cache modifier CM_COH): wait for the
+    """Release of data stored write-through (cache modifier CM_SYS): wait for the
     store acks. (An agent-scope fence would emit buffer_wbl2 = write back the
     whole XCD L2: 7-14 us per call.)"""
     rocdl.s_waitcnt(vmcnt=0)
-
-
-def _rsrc(addr):
-    return create_buffer_resource_from_addr(_raw(fx.Int64(addr)))
 
 
 @flyc.jit
@@ -90,7 +81,7 @@ def _zero_slice_wt(arg_zero, i32_n16, bx, grid, tx, NT):
         for i in range((per + fx.Int32(NT - 1)) // fx.Int32(NT)):
             u = fx.Int32(i) * fx.Int32(NT) + tx
             off = (u < per).select(bx * per + u, i32_n16)
-            buffer_store(z, rs, off * fx.Int32(4), cache_modifier=CM_COH)
+            buffer_store(z, rs, off * fx.Int32(4), cache_modifier=CM_SYS)
 
 
 @flyc.jit
@@ -301,7 +292,7 @@ def compile_ep_small(*, H, I, EL, TOPK, BM, NW, C1, C2, PF, ROWV, MAXM, SCH=3,
             # masked buffer stores need a bounded resource (masked-off lanes go OOB)
             rs_xs = create_buffer_resource_from_addr(
                 _raw(fx.Int64(arg_xs)), num_records_bytes=_raw(fx.Int64(i32_m) * fx.Int64(4)))
-            buffer_store(s, rs_xs, t, mask=lane == fx.Int32(0), cache_modifier=CM_COH)
+            buffer_store(s, rs_xs, t, mask=lane == fx.Int32(0), cache_modifier=CM_SYS)
             for j in range_constexpr(CHL):
                 v = vals[j]
                 p0 = _pack_activation(v[0] * inv, v[1] * inv, v[2] * inv, v[3] * inv)
@@ -309,7 +300,7 @@ def compile_ep_small(*, H, I, EL, TOPK, BM, NW, C1, C2, PF, ROWV, MAXM, SCH=3,
                 buffer_store(
                     Vec.from_elements([p0, p1], fx.Int32), rs_x8,
                     t * fx.Int32(H // 4) + (fx.Int32(j * 64) + lane) * fx.Int32(2),
-                    cache_modifier=CM_COH)
+                    cache_modifier=CM_SYS)
 
     @flyc.jit
     def _setup(a, bx, lane, wave, tx):
@@ -351,7 +342,7 @@ def compile_ep_small(*, H, I, EL, TOPK, BM, NW, C1, C2, PF, ROWV, MAXM, SCH=3,
             LDS_BYTES=LDS_A, lane=lane, tx=tx, NT=NT, arg_w=a["w1"], arg_ws=a["w1s"],
             arg_a=a["x8"],
             a_num_bytes=fx.Int64(a["m"]) * fx.Int64(H), ARB=ARB1,
-            acm=CM_COH, SCH=SCH, TR=True)
+            acm=CM_SYS, SCH=SCH, TR=True)
 
         def row_base16(row):
             return _row_token(lds, e, k0 + row, cnt, a["m"]) * fx.Int32(H // 16)
@@ -387,7 +378,7 @@ def compile_ep_small(*, H, I, EL, TOPK, BM, NW, C1, C2, PF, ROWV, MAXM, SCH=3,
                     buffer_store(
                         w2, out_rsrc,
                         ((bx_m + rows[mi]) * fx.Int32(I) + ccol + fx.Int32(c * 16)) // fx.Int32(2),
-                        mask=rows[mi] < nv, cache_modifier=CM_COH)
+                        mask=rows[mi] < nv, cache_modifier=CM_SYS)
             _fence_release()
             _signal(a["ctr"], fx.Int32(C_G1) + mb * fx.Int32(STRIDE), tx)
 
@@ -411,7 +402,7 @@ def compile_ep_small(*, H, I, EL, TOPK, BM, NW, C1, C2, PF, ROWV, MAXM, SCH=3,
             K=I, W_ROWS=EL * H, BM=BM, PF=PF, bcm=2, cols=cols, lds_ptr=lds_ptr,
             LDS_BYTES=LDS_A, lane=lane, tx=tx, NT=NT, arg_w=a["w2"], arg_ws=a["w2s"],
             arg_a=a["inter"], a_num_bytes=fx.Int64(CAP) * fx.Int64(I * 2), ARB=ARB2,
-            acm=CM_COH, SCH=SCH, TR=True, AQ8=True)
+            acm=CM_SYS, SCH=SCH, TR=True, AQ8=True)
         RQ = 2 * BM * ARB2 // 4  # AQ8 ratio slots [2][BM], fin [BM]
 
         def row_base16(row):
@@ -449,7 +440,7 @@ def compile_ep_small(*, H, I, EL, TOPK, BM, NW, C1, C2, PF, ROWV, MAXM, SCH=3,
                     a4 = Vec(acc[0, c][mi].load())
                     v4 = [a4[v] * (wt * fac[c][v]) for v in range(4)]
                     base = tokc * fx.Int32(H) + col0 + fx.Int32(c * 16) + lane_div_16 * fx.Int32(4)
-                    EP._atomic_bf16x4(a["out"], base, v4, ok)
+                    _atomic_bf16x4(a["out"], base, v4, ok)
 
         _dispatch(nv, run_rows)
 

@@ -38,21 +38,20 @@ import functools
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl._mlir.dialects import arith, llvm
+from flydsl._mlir.dialects import arith
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
+from ._atomic import _gatomic_add, _gatomic_xchg, _gload_sys, _latomic_add
 from ._cvt import _pack_activation
+from ._hw import NUM_CU, NUM_XCD
 from ._launch import _run_compiled
 from ._mem import (
-    _global_base_ptr1,
-    _lds_ptr3,
     _raw,
     buffer_load,
     buffer_store,
     create_buffer_resource_from_addr,
-    get_element_ptr,
     global_typed_ptr,
     lds_typed_ptr,
 )
@@ -64,36 +63,6 @@ NT = 256
 SCHED_BORDER = 16
 # sorted id flag: the token has exactly one local route (see _scatter)
 SID_SINGLE = -(1 << 31)
-NUM_CU = 304
-
-
-def _gatomic_add(addr_i64, idx, val):
-    """old = atomic add, agent scope (device-coherent across the XCD L2s)."""
-    return fx.Int32(llvm.AtomicRMWOp(
-        llvm.AtomicBinOp.add, get_element_ptr(_global_base_ptr1(addr_i64), idx * fx.Int32(4)),
-        _raw(fx.Int32(val)), llvm.AtomicOrdering.monotonic, syncscope="agent",
-        alignment=4).result)
-
-
-def _gatomic_xchg(addr_i64, idx, val):
-    llvm.AtomicRMWOp(
-        llvm.AtomicBinOp.xchg, get_element_ptr(_global_base_ptr1(addr_i64), idx * fx.Int32(4)),
-        _raw(fx.Int32(val)), llvm.AtomicOrdering.monotonic, syncscope="agent", alignment=4)
-
-
-_CM_SYS = 17  # sc0|sc1: system-coherent load, bypasses the (non-coherent) XCD L2
-
-
-def _gload_sys(addr_i64, idx):
-    rs = create_buffer_resource_from_addr(_raw(fx.Int64(addr_i64)))
-    return fx.Int32(buffer_load(rs, idx, vec_width=1, dtype=T.i32,
-                                           cache_modifier=_CM_SYS))
-
-
-def _latomic_add(lds_i32, idx, val):
-    return fx.Int32(llvm.AtomicRMWOp(
-        llvm.AtomicBinOp.add, _lds_ptr3(lds_i32, idx * fx.Int32(4)), _raw(fx.Int32(val)),
-        llvm.AtomicOrdering.monotonic, syncscope="workgroup", alignment=4).result)
 
 
 @functools.cache
@@ -254,7 +223,7 @@ def compile_ep_prep(*, H, TOPK, EL, BM, EPT, QUANT, MULTI, MDYN=False):
     # full one (BM > CB only) go last (expert order otherwise): the CUs' dynamic
     # dispatch runs long tiles first.
     CB = 64
-    NX = 8
+    NX = NUM_XCD
     KF = max(CB, BM)  # cost of a full block
 
     def _pcost(pr):

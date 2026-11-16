@@ -45,15 +45,18 @@ from flydsl.expr.typing import Vector as Vec
 
 from ._act import gate_up_act, situ_params
 from ._cvt import _channel_factor, _fp8x4_pack
+from ._hw import CM_NT, CM_SC1, CM_SYS, LDS_BYTES_MAX, _opaque_tx, _u
 from ._mem import (
     _buffer_i32_scalar_read,
     _global_base_ptr1,
     _global_i32_at,
     _global_i32_buffer_tiles,
+    _ld,
+    _lds_f32_store_masked,
     _raw,
-    buffer_load,
+    _rsrc,
+    _store,
     buffer_store,
-    create_buffer_resource_from_addr,
     get_element_ptr,
     global_typed_ptr,
     lds_typed_ptr,
@@ -74,24 +77,9 @@ ROW_BITS = 18
 BLOCK_M = 128
 
 CHUNK = 8  # routes per producer wave between two signals
-P2P_AUX = 19  # sc0 sc1 nt: stores written through to the destination (vmcnt covers visibility)
-WT_AUX = 16  # sc1: a2 written through (read by gemm2 tasks on any XCD)
+P2P_AUX = CM_SYS | CM_NT  # stores written through to the destination (vmcnt covers visibility)
+WT_AUX = CM_SC1  # a2 written through (read by gemm2 tasks on any XCD)
 ARB = 128  # A bytes per row per K tile (one 128-K group)
-
-
-def _u(v):
-    """Wave-uniform copy (readfirstlane) of an i32."""
-    return fx.Int32(rocdl.readfirstlane(T.i32, _raw(fx.Int32(v))))
-
-
-def _rsrc(addr, nbytes):
-    return create_buffer_resource_from_addr(
-        _raw(fx.Int64(addr)), num_records_bytes=_raw(fx.Int64(nbytes)))
-
-
-def _ld(rsrc, idx, width=1, mask=None):
-    """i32 (width 1) / i32 x width at i32 element ``idx`` (masked: 0)."""
-    return buffer_load(rsrc, idx, vec_width=width, dtype=T.i32, mask=mask)
 
 
 def _atomic_add(addr, value, scope):
@@ -115,12 +103,6 @@ def _inv_l1():
     """Invalidate the CU's L1: data in local memory written through (or by peers into the
     uncached MORI heap) before the flag a task waited for; local L2 lines stay coherent."""
     llvm.inline_asm(None, [], "buffer_inv sc0", "", has_side_effects=True)
-
-
-def _store(ptr, idx, value):
-    """ptr[idx] = value (a call: inside a dynamic if, the AST rewriter would take a
-    subscript store to a closure variable for an assignment of it)."""
-    ptr[idx] = value
 
 
 @functools.cache
@@ -150,7 +132,7 @@ def compile_ep_mega(*, H, I, TOPK, token_shift, producers=16, lag=2, ROWV=(32, 6
     assert 1 << TOPK_SHIFT == TOPK and TOPK <= 8 and token_shift + 3 <= 24
     assert H % 1024 == 0 and I % NI == 0 and H % NO == 0 and NO % 64 == 0
     assert NI % 128 == 0 and 128 % NIW == 0 and NIW % 16 == 0 and NOW % 16 == 0
-    assert producers % QUEUES == 0 and ROWV[-1] == BM and LDS_BYTES <= 65536, LDS_BYTES
+    assert producers % QUEUES == 0 and ROWV[-1] == BM and LDS_BYTES <= LDS_BYTES_MAX, LDS_BYTES
     GPW = NI // 128  # gemm1 epilogue: quant groups per WG row, waves per group
     WPG = NW // GPW
     kname = (f"a8w4_megamoe_ep_h{H}_i{I}_k{TOPK}_t{token_shift}_p{producers}_l{lag}"
@@ -404,10 +386,10 @@ def compile_ep_mega(*, H, I, TOPK, token_shift, producers=16, lag=2, ROWV=(32, 6
                     cur = (cur == fx.Float32(0.0)).select(one, cur)
                     prv = (prv == fx.Float32(0.0)).select(one, prv)
                     ratio = (g == fx.Int32(0)).select(one, prv / cur)
-                    EP._lds_f32_store_masked(lds_f32, fx.Int32(RATIO // 4) + g * fx.Int32(BM) + rr,
-                                             ratio, ok)
-                    EP._lds_f32_store_masked(lds_f32, fx.Int32(RATIO // 4 + G1N * BM) + rr, cur,
-                                             ok & (g == fx.Int32(G1N - 1)))
+                    _lds_f32_store_masked(lds_f32, fx.Int32(RATIO // 4) + g * fx.Int32(BM) + rr,
+                                          ratio, ok)
+                    _lds_f32_store_masked(lds_f32, fx.Int32(RATIO // 4 + G1N * BM) + rr, cur,
+                                          ok & (g == fx.Int32(G1N - 1)))
 
             def hook(acc, kt, s):
                 kk = s * 32  # K offset of MFMA step s in the 128-K tile
@@ -529,10 +511,10 @@ def compile_ep_mega(*, H, I, TOPK, token_shift, producers=16, lag=2, ROWV=(32, 6
                     ).bitcast(fx.Float32)
                     cur_ok = (cur == fx.Float32(0.0)).select(fx.Float32(1.0), cur)
                     ratio = (g == fx.Int32(0)).select(fx.Float32(1.0), prv / cur_ok)
-                    EP._lds_f32_store_masked(lds_f32, fx.Int32(RATIO // 4) + g * fx.Int32(BM) + rr,
-                                             ratio, ok)
-                    EP._lds_f32_store_masked(lds_f32, fx.Int32(RATIO // 4 + G2N * BM) + rr, cur,
-                                             ok & (g == fx.Int32(G2N - 1)))
+                    _lds_f32_store_masked(lds_f32, fx.Int32(RATIO // 4) + g * fx.Int32(BM) + rr,
+                                          ratio, ok)
+                    _lds_f32_store_masked(lds_f32, fx.Int32(RATIO // 4 + G2N * BM) + rr, cur,
+                                          ok & (g == fx.Int32(G2N - 1)))
 
             def ratio4(base_f32, mi):
                 """this lane's 4 rows (L//16)*4 + v of 16-row block mi from an f32 [BM] row."""
@@ -620,7 +602,7 @@ def compile_ep_mega(*, H, I, TOPK, token_shift, producers=16, lag=2, ROWV=(32, 6
 
         # ------------------------------------------------------------------ tasks
         def run_task(a, queue, ticket):
-            tx, lane, wave = EP._opaque_tx(tx0)
+            tx, lane, wave = _opaque_tx(tx0)
             if ticket < fx.Int32(QPROD):
                 produce(a, queue * fx.Int32(QPROD) + ticket, lane, wave)
             else:

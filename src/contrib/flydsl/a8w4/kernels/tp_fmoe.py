@@ -31,12 +31,12 @@ import functools
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl._mlir.dialects import arith, llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
 from ._act import gate_up_act, situ_args, situ_params
+from ._atomic import _atomics_mi
 from ._cvt import (
     _channel_factor,
     _fp4x8_to_fp8x8_fast,
@@ -45,26 +45,20 @@ from ._cvt import (
     _perm_u32,
     _rnu_hi,
 )
+from ._hw import DPP_QUAD_SWAP
 from ._launch import _run_compiled
 from ._mem import (
-    _global_base_ptr1,
     _global_i32_at,
     _raw,
+    _rsrc,
     _udiv,
     _umod,
     buffer_load,
     create_buffer_resource_from_addr,
-    get_element_ptr,
     lds_typed_ptr,
     lds_vec_load,
 )
 from ._mma import _mma_fp8
-
-
-def _rsrc(addr_i64):
-    return create_buffer_resource_from_addr(_raw(fx.Int64(addr_i64)))
-
-DPP_QUAD_SWAP = 0xB1  # quad_perm [1, 0, 3, 2]: lane L <- lane L ^ 1
 
 
 BM = 64
@@ -78,45 +72,6 @@ K_GROUPS = 2  # 128-K groups per tile
 LDS_A = BM * TILE_K1  # 16 KB: A tile, then the bf16 SiLU staging (BM x 128 x 2)
 LDS_H = BM * 128  # 8 KB: one quantized fp8 half
 LDS_BYTES = LDS_A + LDS_H + BM * 2 * 4
-
-
-def _getreg(simm16):
-    return fx.Int32(llvm.call_intrinsic(T.i32, "llvm.amdgcn.s.getreg",
-                                        [_raw(fx.Int32(simm16))], [], []))
-
-
-def _atomics4_saddr(datas, offs, out_i64):
-    """bf16x2 atomic adds of ``datas[k]`` at ``out + offs[k]`` bytes (offs >= 0,
-    per-tile i32, so the zext stays next to the atomic -> SGPR-base form)."""
-    base = _global_base_ptr1(out_i64)
-    for k in range_constexpr(len(offs)):
-        off64 = arith.ExtUIOp(T.i64, offs[k]).result
-        pk = Vec.from_elements([fx.Int32(datas[k])], fx.Int32).bitcast(fx.BFloat16)
-        llvm.AtomicRMWOp(llvm.AtomicBinOp.fadd, get_element_ptr(base, byte_offset=off64),
-                         _raw(pk), llvm.AtomicOrdering.monotonic, syncscope="agent",
-                         alignment=4)
-
-
-@flyc.jit
-def _atomics_mi(datas, offs, col, out_i64, full, part):
-    """One 16-row block's atomics at ``out + offs[k] + col``. Valid rows are a prefix
-    of the expert block, so ``full`` (all 16 rows valid) and ``part`` (some valid)
-    are wave-uniform: full blocks need no per-atomic exec masking; padding rows have
-    offs < 0."""
-    if full:
-        _atomics4_saddr(datas, [_raw(fx.Int32(o) + col) for o in offs], out_i64)
-    else:
-        if part:
-            base = _global_base_ptr1(out_i64)
-            for k in range_constexpr(len(offs)):
-                off = fx.Int32(offs[k])
-                if off >= fx.Int32(0):
-                    off64 = arith.ExtUIOp(T.i64, _raw(off + col)).result
-                    pk = Vec.from_elements([fx.Int32(datas[k])], fx.Int32).bitcast(fx.BFloat16)
-                    llvm.AtomicRMWOp(llvm.AtomicBinOp.fadd,
-                                     get_element_ptr(base, byte_offset=off64), _raw(pk),
-                                     llvm.AtomicOrdering.monotonic, syncscope="agent",
-                                     alignment=4)
 
 
 @functools.cache

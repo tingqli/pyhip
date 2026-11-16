@@ -33,6 +33,7 @@ from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
 from ._act import gate_up_act, situ_args, situ_params
+from ._atomic import _atomics_mi
 from ._cvt import (
     _channel_factor,
     _fp4x8_to_fp8x8_fast,
@@ -41,11 +42,13 @@ from ._cvt import (
     _perm_u32,
     _rnu_hi,
 )
+from ._hw import CM_SC1, DPP_QUAD_SWAP, NUM_XCD
 from ._launch import _run_compiled
 from ._mem import (
     _global_base_ptr1,
     _global_i32_at,
     _raw,
+    _rsrc,
     _udiv,
     _umod,
     buffer_load,
@@ -56,7 +59,6 @@ from ._mem import (
     lds_vec_load,
 )
 from ._mma import _mma_fp8
-from . import tp_fmoe as F  # noqa: E402
 
 
 BM = 64
@@ -65,9 +67,12 @@ N_REPEAT, K_STEPS, K_GROUPS = 2, 8, 2
 LDS_A = BM * TILE_K1  # A tile, then bf16 SiLU staging (BM x 128 x 2)
 LDS_BYTES = LDS_A + 16  # + task id broadcast
 A2_BYTES = BM * 256  # fp8 [64, 256] per block
-NXCD = 8
 CTL_FLAGS = 64  # i32 index of the per-block flags in the control buffer
-CM_SC1 = 16  # gfx942 buffer cache policy sc1 (sc0=1, nt=2)
+
+
+def _getreg(simm16):
+    return fx.Int32(llvm.call_intrinsic(T.i32, "llvm.amdgcn.s.getreg",
+                                        [_raw(fx.Int32(simm16))], [], []))
 
 
 @functools.cache
@@ -78,8 +83,8 @@ def compile_a8w4_fmoe_bm64q(*, D_HIDDEN, D_INTER, NE, TOPK=8, b_cache_mod=1, n_c
     N1 = 2 * INTER
     K1_TILES = H // TILE_K1
     NT2 = H // TILE_N2
-    assert INTER == 256 and H % TILE_K1 == 0 and NT2 % 2 == 0 and n_ctas % NXCD == 0
-    CPX = n_ctas // NXCD  # CTAs per XCD = queue lag D
+    assert INTER == 256 and H % TILE_K1 == 0 and NT2 % 2 == 0 and n_ctas % NUM_XCD == 0
+    CPX = n_ctas // NUM_XCD  # CTAs per XCD = queue lag D
     W1_K0 = H // 128
     SC1_STRIDE = (H // 256) * 64
     W2_K0 = INTER // 128
@@ -105,12 +110,12 @@ def compile_a8w4_fmoe_bm64q(*, D_HIDDEN, D_INTER, NE, TOPK=8, b_cache_mod=1, n_c
             _raw(fx.Int64(arg_x)), num_records_bytes=_raw(fx.Int64(i32_M) * fx.Int64(H)))
         rs_xs = create_buffer_resource_from_addr(
             _raw(fx.Int64(arg_xs)), num_records_bytes=_raw(fx.Int64(i32_M) * fx.Int64(4)))
-        rs_w1, rs_ws1, rs_e1 = F._rsrc(arg_w1), F._rsrc(arg_ws1), F._rsrc(arg_exp1)
-        rs_w2, rs_ws2 = F._rsrc(arg_w2), F._rsrc(arg_ws2)
+        rs_w1, rs_ws1, rs_e1 = _rsrc(arg_w1), _rsrc(arg_ws1), _rsrc(arg_exp1)
+        rs_w2, rs_ws2 = _rsrc(arg_w2), _rsrc(arg_ws2)
         rs_e2 = create_buffer_resource_from_addr(
             _raw(fx.Int64(arg_ws2) + fx.Int64(WS2_BYTES)))
-        rs_sw, rs_id = F._rsrc(arg_sw), F._rsrc(arg_stids)
-        rs_a2, rs_sc, rs_ctl = F._rsrc(arg_a2), F._rsrc(arg_sc), F._rsrc(arg_ctl)
+        rs_sw, rs_id = _rsrc(arg_sw), _rsrc(arg_stids)
+        rs_a2, rs_sc, rs_ctl = _rsrc(arg_a2), _rsrc(arg_sc), _rsrc(arg_ctl)
 
         def ld(rs, off_i32, n=1, cm=0):
             v = buffer_load(rs, off_i32, vec_width=n, dtype=T.i32, cache_modifier=cm)
@@ -127,17 +132,17 @@ def compile_a8w4_fmoe_bm64q(*, D_HIDDEN, D_INTER, NE, TOPK=8, b_cache_mod=1, n_c
             return col_bytes ^ ((row & fx.Int32(TILE_K1 // 16 - 1)) * fx.Int32(16))
 
         # ---- this CTA's queue: the XCD it actually runs on ---------------------------
-        xc = rfl(F._getreg(0xF814) & fx.Int32(NXCD - 1))  # HW_REG_XCC_ID
+        xc = rfl(_getreg(0xF814) & fx.Int32(NUM_XCD - 1))  # HW_REG_XCC_ID
         # uniform (readfirstlane): the task loop contains barriers, its exit must
         # not look divergent to the structurizer
         total_m = rfl(_global_i32_at(arg_cumsum, fx.Int32(0)) // fx.Int32(BM))
-        bq, br = _udiv(total_m, NXCD), _umod(total_m, NXCD)
+        bq, br = _udiv(total_m, NUM_XCD), _umod(total_m, NUM_XCD)
         blk0 = xc * bq + fx.min(xc, br)
         nblk = bq + (xc < br).select(fx.Int32(1), fx.Int32(0))
         n_tasks = nblk * fx.Int32(2)
         lag = fx.min(fx.Int32(CPX), nblk)
         par = i32_epoch & fx.Int32(1)
-        ctr_idx = par * fx.Int32(NXCD) + xc
+        ctr_idx = par * fx.Int32(NUM_XCD) + xc
 
         # =============================== gemm1 task ===================================
         def g1_task(m_block, rows):
@@ -418,11 +423,11 @@ def compile_a8w4_fmoe_bm64q(*, D_HIDDEN, D_INTER, NE, TOPK=8, b_cache_mod=1, n_c
                     pk = _perm_u32(r1, r0, 0x07060302)
                     nbr = fx.Int32(rocdl.update_dpp(T.i32, _raw(pk.bitcast(fx.Int32)),
                                                     _raw(pk.bitcast(fx.Int32)),
-                                                    F.DPP_QUAD_SWAP, 0xF, 0xF, True))
+                                                    DPP_QUAD_SWAP, 0xF, 0xF, True))
                     datas.append(_raw(_perm_u32(nbr, pk, sel_pair).bitcast(fx.Int32)))
                 col = (t_prev * fx.Int32(TILE_N2) + n_wave_base) * fx.Int32(2)
-                F._atomics_mi(datas, [_raw(offs4[mi][k]) for k in ks], col, arg_out,
-                              mi_full[mi], mi_part[mi])
+                _atomics_mi(datas, [_raw(offs4[mi][k]) for k in ks], col, arg_out,
+                            mi_full[mi], mi_part[mi])
 
             def tile(t, s, b, prev, has_next):
                 rocdl.sched_barrier(0)
@@ -538,8 +543,8 @@ def compile_a8w4_fmoe_bm64q(*, D_HIDDEN, D_INTER, NE, TOPK=8, b_cache_mod=1, n_c
         def reset_next():
             # zero the other parity's counters for the next launch
             if bx == fx.Int32(0):
-                if tx < fx.Int32(NXCD):
-                    buffer_store(_raw(fx.Int32(0)), rs_ctl, (fx.Int32(1) - par) * fx.Int32(NXCD) + tx)
+                if tx < fx.Int32(NUM_XCD):
+                    buffer_store(_raw(fx.Int32(0)), rs_ctl, (fx.Int32(1) - par) * fx.Int32(NUM_XCD) + tx)
 
         @flyc.jit
         def loop():
@@ -599,7 +604,7 @@ _WS = {}
 
 def _workspace(n_blocks, device):
     """A2 [n_blocks, 64, 256] fp8, scales [n_blocks, 64, 2] f32, control i32
-    [CTL_FLAGS + n_blocks] (2 x NXCD queue counters, then per-block ready flags)."""
+    [CTL_FLAGS + n_blocks] (2 x NUM_XCD queue counters, then per-block ready flags)."""
     ws = _WS.get(device)
     if ws is None or ws["n"] < n_blocks:
         ws = {

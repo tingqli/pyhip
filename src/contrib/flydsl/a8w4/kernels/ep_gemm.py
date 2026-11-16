@@ -32,7 +32,6 @@ picks the config (``CFGS``) by token count (``AUTO``).
 """
 
 import functools
-import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -43,6 +42,7 @@ from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
 from ._act import gate_up_act, situ_args, situ_params
+from ._atomic import _atomic_bf16x4
 from ._cvt import (
     _channel_factor,
     _fp4x8_to_fp8x8_fast,
@@ -51,6 +51,7 @@ from ._cvt import (
     _pack_activation,
     _perm_u32,
 )
+from ._hw import LDS_BYTES_MAX, NUM_XCD, _opaque_tx
 from ._launch import _run_compiled
 from ._mem import (
     _buffer_i32_scalar_read,
@@ -58,6 +59,7 @@ from ._mem import (
     _global_i32_at,
     _global_i32_buffer_tiles,
     _global_i32_buffer_view,
+    _lds_f32_store_masked,
     _raw,
     _udiv,
     _umod,
@@ -69,9 +71,6 @@ from ._mem import (
     lds_vec_load,
 )
 from . import ep_prep as PR  # noqa: E402
-
-
-HERE = os.path.dirname(os.path.abspath(__file__))
 
 
 # a8w4 intermediate: one f32 scale per (row, 128 columns). An fp8 MFMA K32 step
@@ -121,24 +120,6 @@ def _dispatch_rows(rowv, pads, run_rows):
 def _masked_lds_store(atom, reg, dst, ok):
     if ok:
         fx.copy(atom, reg, dst)
-
-
-@flyc.jit
-def _lds_f32_store_masked(lds_f32, idx, val, ok):
-    if ok:
-        lds_f32[idx] = val
-
-
-@flyc.jit
-def _atomic_bf16x4(arg_out, base, v4, ok):
-    """out[base .. base+3] += 4 f32 values rounded to bf16 (2 bf16x2 agent atomics)."""
-    if ok:
-        for h in range_constexpr(2):
-            pk = Vec.from_elements([v4[2 * h], v4[2 * h + 1]], fx.Float32).to(fx.BFloat16)
-            llvm.AtomicRMWOp(
-                llvm.AtomicBinOp.fadd,
-                get_element_ptr(_global_base_ptr1(arg_out), (base + fx.Int32(2 * h)) * fx.Int32(2)),
-                _raw(pk), llvm.AtomicOrdering.monotonic, syncscope="agent", alignment=4)
 
 
 @flyc.jit
@@ -196,20 +177,10 @@ def _st_or_add_bf16x2(arg_out, idx, pk, single):
 
 def _xcd_tile(bx, bound):
     """Bijective XCD round-robin: XCD x (= bx % 8) owns a contiguous range of tiles."""
-    xq = _udiv(bound, 8)
-    xr = _umod(bound, 8)
-    xc = _umod(bx, 8)
-    return xc * xq + fx.min(xc, xr) + _udiv(bx, 8)
-
-
-def _opaque_tx(tx):
-    """(tx, lane, wave) re-derived from an asm copy of tx right before a tile body:
-    LLVM cannot hoist the body's per-lane address math (out of the tile loop / to
-    the kernel start), whose long live ranges spilled up to ~80 VGPRs (bf16); with
-    it no config spills and the fp8 kernels need ~15 VGPRs less."""
-    t = fx.Int32(llvm.inline_asm(T.i32, [_raw(tx)], "v_mov_b32 $0, $1", "=v,v",
-                                 has_side_effects=True))
-    return t, t % fx.Int32(64), fx.Int32(rocdl.readfirstlane(T.i32, _raw(t // fx.Int32(64))))
+    xq = _udiv(bound, NUM_XCD)
+    xr = _umod(bound, NUM_XCD)
+    xc = _umod(bx, NUM_XCD)
+    return xc * xq + fx.min(xc, xr) + _udiv(bx, NUM_XCD)
 
 
 def _tile_of(tile, NB):
@@ -226,10 +197,10 @@ def _bucket_bounds(arg_sched, bx, grid, NB):
     the XCDs and, inside one, to the CUs in WG order) owns the tiles [bst[x] NB,
     bst[x+1] NB) (m-major) and runs them with its nwg WGs: WG i (= bx // 8) takes
     tiles i, i + nwg, ... (one, unless the bucket outgrows the grid)."""
-    xcd = bx % fx.Int32(8)
+    xcd = bx % fx.Int32(NUM_XCD)
     lo = _sched_i32(arg_sched, xcd) * fx.Int32(NB)
     hi = _sched_i32(arg_sched, xcd + fx.Int32(1)) * fx.Int32(NB)
-    return lo, hi, (grid - xcd + fx.Int32(7)) // fx.Int32(8)
+    return lo, hi, (grid - xcd + fx.Int32(NUM_XCD - 1)) // fx.Int32(NUM_XCD)
 
 
 def _sched_tile(arg_sched, t, NB):
@@ -240,7 +211,7 @@ def _sched_tile(arg_sched, t, NB):
 def _grid(tiles, sched):
     """one WG per (upper bound) tile; with the prep's schedule a multiple of 8 (8
     XCD buckets, dead WGs exit at once)."""
-    return int(-(-tiles // 8) * 8 if sched is not None else tiles)
+    return int(-(-tiles // NUM_XCD) * NUM_XCD if sched is not None else tiles)
 
 
 def _row_pads(arg_sids, bx_m, rowv, i32_m):
@@ -681,7 +652,7 @@ def compile_ep_gemm1(*, H, I, NE, BM, NI, ROWV, PF=2, bcm=2, wpe=None, NW=4, ARB
     if XG:
         assert TK % QG1 == 0 and BM * NI * 2 <= RATIO_OFF and BM * NW * 4 <= RATIO_OFF
         LDS_BYTES = RATIO_OFF + (G + 1) * BM * 4
-    assert LDS_BYTES <= 65536, LDS_BYTES
+    assert LDS_BYTES <= LDS_BYTES_MAX, LDS_BYTES
     kname = (
         f"ep_gemm1_fp8_h{H}_i{I}_e{NE}_bm{BM}_ni{NI}_r{'x'.join(map(str, ROWV))}"
         f"_pf{PF}_bcm{bcm}_nw{NW}_a{ARB}" + (f"_w{wpe}" if wpe else "")
@@ -1131,7 +1102,7 @@ def compile_ep_gemm2(*, H, I, NE, BM, NO, ROWV, PF=2, bcm=2, wpe=None, NW=4, ARB
     KS = 32  # K per MFMA step
     RATIO_OFF = 2 * BM * ARB  # ratio table [G][BM] f32 + fin [BM] after A
     LDS_BYTES = max(RATIO_OFF + (G + 1) * BM * 4, BM * NO * 2)
-    assert LDS_BYTES <= 65536, LDS_BYTES
+    assert LDS_BYTES <= LDS_BYTES_MAX, LDS_BYTES
     kname = (
         f"ep_gemm2_fp8_h{H}_i{I}_e{NE}_bm{BM}_no{NO}_r{'x'.join(map(str, ROWV))}"
         f"_pf{PF}_bcm{bcm}_nw{NW}_a{ARB}" + (f"_w{wpe}" if wpe else "")

@@ -13,6 +13,7 @@ kernel's cache key. The scan does not enter nested functions, so a helper called
 one is still missed: after editing a helper, run with a fresh ``FLYDSL_RUNTIME_CACHE_DIR``.
 """
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm, rocdl
@@ -124,6 +125,18 @@ def get_element_ptr(base_ptr, byte_offset):
     return llvm.GEPOp(base_ptr.type, base_ptr, [offset_val], [-(2**31)], T.i8, None).result
 
 
+def _store(ptr, idx, value):
+    """ptr[idx] = value (a call: inside a dynamic if, the AST rewriter would take a
+    subscript store to a closure variable for an assignment of it)."""
+    ptr[idx] = value
+
+
+@flyc.jit
+def _lds_f32_store_masked(lds_f32, idx, val, ok):
+    if ok:
+        lds_f32[idx] = val
+
+
 # --------------------------------------------------------------------------------------
 # Buffer (V#) loads and stores: a resource descriptor (base, size, flags) in SGPRs plus a
 # 32-bit per-lane byte offset; out-of-range accesses read 0 / are dropped.
@@ -162,7 +175,7 @@ def _aux(cache_modifier):
 def buffer_load(rsrc, offset, vec_width=4, dtype=None, mask=None, cache_modifier=0):
     """``vec_width`` elements of ``dtype`` (default f32; an ir.Type or fx class) at
     element ``offset``; lanes with ``mask`` false read 0 (offset pushed out of range).
-    ``cache_modifier``: 0 cached, 2 nt, 3 sc0|sc1."""
+    ``cache_modifier``: bits ``CM_*`` of ``_hw`` (0 cached, 2 nt, 17 sc0|sc1)."""
     if dtype is None:
         dtype = T.f32
     elif hasattr(dtype, "ir_type"):
@@ -184,7 +197,7 @@ def buffer_load(rsrc, offset, vec_width=4, dtype=None, mask=None, cache_modifier
 
 def buffer_store(data, rsrc, offset, mask=None, cache_modifier=0):
     """Store ``data`` (scalar or vector) at element ``offset`` (in units of its element
-    type); lanes with ``mask`` false store nothing."""
+    type); lanes with ``mask`` false store nothing. ``cache_modifier``: as ``buffer_load``."""
     data = _unwrap_value(data)
     rsrc = _unwrap_value(rsrc)
     offset = fx.Int32(_unwrap_value(offset))
@@ -197,6 +210,20 @@ def buffer_store(data, rsrc, offset, mask=None, cache_modifier=0):
 
     soffset = fx.Int32(0).ir_value()
     rocdl.RawPtrBufferStoreOp(data, rsrc, offset.ir_value(), soffset, aux=_aux(cache_modifier))
+
+
+def _rsrc(addr, nbytes=None):
+    """Buffer resource over the i64 address ``addr``; ``nbytes``: bound of the hardware range
+    check (None: 4 GB)."""
+    if nbytes is None:
+        return create_buffer_resource_from_addr(_raw(fx.Int64(addr)))
+    return create_buffer_resource_from_addr(
+        _raw(fx.Int64(addr)), num_records_bytes=_raw(fx.Int64(nbytes)))
+
+
+def _ld(rsrc, idx, width=1, mask=None):
+    """i32 (width 1) / i32 x width at i32 element ``idx`` (masked: 0)."""
+    return buffer_load(rsrc, idx, vec_width=width, dtype=T.i32, mask=mask)
 
 
 # --------------------------------------------------------------------------------------

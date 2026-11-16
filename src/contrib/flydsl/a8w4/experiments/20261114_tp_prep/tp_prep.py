@@ -47,7 +47,9 @@ from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../..")))
+from a8w4.kernels._atomic import _latomic_add  # noqa: E402
 from a8w4.kernels._cvt import _pack_activation  # noqa: E402
+from a8w4.kernels._hw import NUM_CU  # noqa: E402
 from a8w4.kernels._launch import _run_compiled  # noqa: E402
 from a8w4.kernels._mem import (  # noqa: E402
     _raw,
@@ -57,7 +59,6 @@ from a8w4.kernels._mem import (  # noqa: E402
     global_typed_ptr,
     lds_typed_ptr,
 )
-from a8w4.kernels.ep_prep import NUM_CU, _latomic_add  # noqa: E402
 
 NT = 256
 NW = NT // 64

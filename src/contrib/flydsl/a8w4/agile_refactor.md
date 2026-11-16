@@ -105,7 +105,7 @@
 | `_cvt.py` | `_perm_u32`、`_fp8_lut_predelta`、`_fp4x8_to_fp8x8_fast`、`_channel_factor`（`tp_gemm1/2`）；`_bf16x2_rne`、`_fp8x4_pack`（`ep_gemm`）；`_rnu_hi`（`tp_fmoe`） |
 | `_mma.py`（新） | `_fp8_frag8`、`_mma_fp8`（`tp_gemm1/2`） |
 | `_act.py` | `situ_args`（host 端，`tp_gemm1`） |
-| `_hw.py`（新） | `NUM_CU`、`NUM_XCD`、LDS 上限、cache 策略位、`DPP_QUAD_SWAP`、`_getreg`、`_u`（readfirstlane）、`_opaque_tx` |
+| `_hw.py`（新） | `NUM_CU`、`NUM_XCD`、`LDS_BYTES_MAX`、cache 策略位 `CM_*`、`DPP_QUAD_SWAP`、`_u`（readfirstlane）、`_opaque_tx` |
 | `_atomic.py`（新） | `_gatomic_add`、`_gatomic_xchg`、`_gload_sys`、`_latomic_add`（`ep_prep`）；`_atomic_bf16x4`（`ep_gemm`）；`_atomics4_saddr`、`_atomics_mi`（`tp_fmoe`） |
 | `_mem.py` | `_rsrc`（3 个版本合一，`nbytes` 可选）、`_ld`、`_store`（`ep_mega`）、`_lds_f32_store_masked`（`ep_gemm`） |
 | `_kloop.py`（新） | `_make_core`（流式读 W 的 K 循环，ep3k / ep1k / megamoe 共用）、`_frag`、`_masked_lds_store`、`_dispatch_rows` |
@@ -114,7 +114,7 @@
 **任务**（每步一个提交，每步都跑 ISA 快照）：
 
 - [x] 第 1 步：TP 的重复 helper → `_cvt`、`_mma`；`situ_args` → `_act`。改 `tp_gemm1/2`、`tp_fmoe(_q)`、`ep_gemm`、`ep_mega`、`ep_small`、`megamoe.py`。
-- [ ] 第 2 步：`_hw`、`_atomic`、`_mem` 的新增；改 `ep_prep`、`tp_prep`、`ep_small`、`tp_fmoe(_q)`、`ep_mega(_comm)`、`tp_gemm1/2`（`NXCD`）。
+- [x] 第 2 步：`_hw`、`_atomic`、`_mem` 的新增；改 `ep_prep`、`tp_prep`、`ep_small`、`tp_fmoe(_q)`、`ep_mega(_comm)`、`tp_gemm1/2`（`NXCD`）。`_getreg` 只有 `tp_fmoe_q` 用，搬到那里；`CM_COH` / `_CM_SYS` 合成 `CM_SYS`，`ep_mega` 的 `P2P_AUX` / `WT_AUX` 和 `tp_fmoe_q` 的 `CM_SC1` 改用 `CM_*` 位；`ep_prep` 的 `NX`、`ep_gemm` 的 XCD 轮转里的字面量 8 改成 `NUM_XCD`；`experiments/20261114_tp_prep` 的 3 个副本跟着改 import。`prof.py` 的 65536 不改（它不导入 flydsl）。
 - [ ] 第 3 步：`_kloop`、`_protocol`；`ep_mega`、`ep_small`、`ep_mega_comm` 不再 import 别的 kernel 文件，`ep_gemm` 只剩 host 端的 `ep_prep`。
 - [ ] 第 4 步：比较 `_fp8x4_pack` 和 `_pack_activation` 的 ISA，相同就合并。
 - [ ] 文档：README 目录结构；`agile_refactor.md`。
