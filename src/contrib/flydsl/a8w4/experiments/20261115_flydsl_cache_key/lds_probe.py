@@ -14,7 +14,7 @@ import flydsl.expr as fx
 import torch
 from flydsl.expr import gpu
 
-from a8w4.kernels._launch import _run_compiled
+from a8w4.experiments._launch import _run_compiled
 from a8w4.kernels._mem import _pointer
 
 N = int(sys.argv[1])

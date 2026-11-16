@@ -2,7 +2,7 @@
 
 fp8 激活（FNUZ）× mxfp4 权重的 MoE，面向 MI300X / MI325X（gfx942）。TP 和 EP 共用一个入口 `a8w4_moe`：每次调用按（shape，token 数）查调优表，从 5 类 kernel 里选出当前上下文（激活函数、是否在 CUDA graph capture 中、token 数）允许的最快配置。EP 的 all-to-all 接收缓冲区（例如 MORI dispatch：按容量分配，有效行数只在 device 上）用 `a8w4_moe_dyn`，不做 host 同步，可以放进 CUDA graph（2.4 节）。调优表覆盖 XiaomiMiMo/MiMo-V2.6-Flash(-RL) 的 TP8、EP8 每卡 shape（另有 TP4），1–32768 tokens，SiLU 与 SiTUv2 各一组（TP4 只有 SiLU）。
 
-本目录是 pyhip 的一部分（`pyhip.contrib.flydsl.a8w4`），也可以在 `src/contrib/flydsl` 下作为顶层包 `a8w4` 运行（下文的命令都是这样用的）。kernel 依赖 torch 和 FlyDSL 0.3.2。原先从 aiter 复制来的 FlyDSL helper 只留下用到的部分，放在 `kernels/` 的共享模块里（`_mem`、`_act`、`_cvt`、`_launch`、`channel_exp`）；launch 交给 pyhip 的 `host_launch`。新代码可以直接用 pyhip 的模块，要写成绝对导入（`from pyhip.contrib.flydsl... import ...`）。aiter 只在三处用到：TP 族 kernel 跑专家切片（EP 形状）时的路由排序（`moe_sorting`）、权重 preshuffle 辅助函数，以及测试和调优。
+本目录是 pyhip 的一部分（`pyhip.contrib.flydsl.a8w4`），也可以在 `src/contrib/flydsl` 下作为顶层包 `a8w4` 运行（下文的命令都是这样用的）。kernel 依赖 torch 和 FlyDSL 0.3.2。原先从 aiter 复制来的 FlyDSL helper 只留下用到的部分，放在 `kernels/` 的共享模块里（`_mem`、`_act`、`_cvt`、`channel_exp`）；host 端封装用 pyhip `host_launch` 的 `@flydsl_kernel`。新代码可以直接用 pyhip 的模块，要写成绝对导入（`from pyhip.contrib.flydsl... import ...`）。aiter 只在三处用到：TP 族 kernel 跑专家切片（EP 形状）时的路由排序（`moe_sorting`）、权重 preshuffle 辅助函数，以及测试和调优。
 
 ## 目录
 
@@ -156,7 +156,7 @@ a8w4/
   bench/                       实验工具 python -m a8w4.bench：ab（A/B 计时）、breakdown（每个 kernel 的耗时）、check（正确性）、dist（megamoe 8 卡变体）；core.py 是计时协议和变体写法，dist.py 也是 8 卡测试共用的 helper
   prof.py                      python -m a8w4.prof：counters（rocprofv3 计数器汇总）、isa（VGPR / spill / LDS）
   exp.py                       python a8w4/exp.py：实验登记 experiments/index.csv 的 grep / ls / add / new / lint / clean
-  experiments/                 历次实验：index.csv（一行一个实验）、log_YYYYMMDD.md、各实验目录
+  experiments/                 历次实验：index.csv（一行一个实验）、log_YYYYMMDD.md、各实验目录；_launch.py 是旧实验脚本用的 _run_compiled
   configs/a8w4_moe_tuned.csv   调优表（每个点保存全部候选的耗时）
   configs/README.md            调优表的内容与生成命令
   tests/test_a8w4_moe.py       pytest
@@ -182,7 +182,6 @@ a8w4/
     _mma.py                    MFMA 操作数（寄存器里的 fp8 片段）和一步 fp8 MFMA
     _kloop.py                  EP GEMM tile 的 K 循环 _make_core（ep_gemm、ep_small、ep_mega 共用）和行数变体的分派 _dispatch_rows
     _protocol.py               一个 kernel 写、另一个 kernel 读的 buffer 格式（EP 调度表；megamoe 的 flag / 队列布局）
-    _launch.py                 host：按原始参数 launch / 只编译（封装 pyhip 的 host_launch）
     channel_exp.py             W 每行（输出通道）最大的 e8m0 scale 指数，prepare_weights 用
 ```
 
@@ -199,7 +198,7 @@ EP 族（`ep3k` / `ep1k`）和 `prepare_weights` 在运行时都不需要 aiter�
 
 **复制到其他工程**：
 
-- 整个目录复制过去即可，也可以放进别的包里。包内只有 `kernels/_launch.py` 绝对导入 `pyhip.contrib.flydsl.host_launch`，其余全部是相对 import；不带 pyhip 时，把 `host_launch.py` 一起复制过去并改这一处 import。只有 `tests/` 和 `tune.py` 的命令行入口按顶层包名 `a8w4` 导入，改了包名要同步修改。
+- 整个目录复制过去即可，也可以放进别的包里。包内只有 kernel 文件的 `from pyhip.contrib.flydsl.host_launch import flydsl_kernel` 是绝对导入（`grep -rn pyhip.contrib kernels/`），其余全部是相对 import；不带 pyhip 时，把 `host_launch.py` 一起复制过去并改这些 import。只有 `tests/` 和 `tune.py` 的命令行入口按顶层包名 `a8w4` 导入，改了包名要同步修改。
 - 调优表按 shape 存放，其他模型要先调优（第 6 节）。
 - 换了机器（不同 SKU 或功耗墙）要先跑 `verify`，必要时重新调优。
 
@@ -801,7 +800,7 @@ python a8w4/tests/test_a8w4_mori_tp8.py --allreduce aiter --act silu situv2 \
 
 ### 9.3 加一个新 kernel 或新配置
 
-1. 在 `kernels/` 加 device 代码，在 `moe.py` 加 runner，并注册到 `RUNNERS`。host 封装用 `pyhip.contrib.flydsl.host_launch` 的 `@flydsl_kernel`，不再手写 `functools.cache` + `_run_compiled`，写法见 skill `flydsl-host-launch`。
+1. 在 `kernels/` 加 device 代码，在 `moe.py` 加 runner，并注册到 `RUNNERS`。host 封装用 `pyhip.contrib.flydsl.host_launch` 的 `@flydsl_kernel`，不再手写 `functools.cache` + `_run_compiled`：builder 的关键字参数是编译 key，op 直接传 tensor（`kern(x, out, n, H=...)`），常驻对象在构造时绑定 `kern.get(**key)`；写法见 skill `flydsl-host-launch`。
 2. 更新 `config_name` / `parse_config`（名字要能解析回 dict，CSV 里存的是名字）。
 3. 在 `supported()` 里写清结构限制，包括 act、capture、tokens。
 4. 在 `tune.candidates()` 里加入候选。
@@ -859,14 +858,14 @@ TP kernel（`tp_gemm1`、`tp_gemm2`、`tp_fmoe`、`tp_fmoe_q`）里走不到的�
    - 会重新编译：`@flyc.jit` / `@flyc.kernel` 函数本身的源码；与 jit 函数**同一目录**里、按名字调用的普通 helper 的源码（本包的 helper 都在 `kernels/` 里，按名字导入：`from ._mem import buffer_load`，再写 `buffer_load(...)`）；闭包里的标量和 tuple（int / float / bool / str / None / tuple / Enum）；kernel 代码按名字读到的模块级全局变量（标量、list / dict / set 按值，callable 按名字，其他对象只按类型）。
    - **不会**重新编译（拿到旧二进制）：闭包里的 list / dict / set / 对象（例如用 list 传编译开关）；**其他目录**里的普通 helper；经模块属性调用的 helper（`G1.situ_args(...)` 这种写法：FlyDSL 只按名字查模块全局变量，查到的是模块对象）；只在嵌套函数里调用的 helper（FlyDSL 只扫描每个函数自己的字节码，不进入里面定义的函数；例如 `ep_gemm` 的 `_body` 里 `_epilogue` 调用的 `gate_up_act`、`_buffer_i32_scalar_read`）；trace 时读到的运行时值（例如调试 buffer 的地址）。
    - 函数体之外的改动（模块注释等）不触发重新编译。
-   - 对策：编译期开关用 int / tuple 放进闭包（例如 `functools.cache` 的参数）；改了 helper 或拿不准时，用一个空的 `FLYDSL_RUNTIME_CACHE_DIR` 跑。gemm2 epilogue 的消融实验曾因为复用了旧二进制，得出「写回方式不影响耗时」的错误结论。
+   - 对策：编译期开关用 int / tuple 放进闭包（例如 `@flydsl_kernel` builder 的 key 参数）；改了 helper 或拿不准时，用一个空的 `FLYDSL_RUNTIME_CACHE_DIR` 跑。gemm2 epilogue 的消融实验曾因为复用了旧二进制，得出「写回方式不影响耗时」的错误结论。
 2. **运行时控制流的写法有限制。**
    - 运行时的 `if` / `while` 必须写在 `@flyc.jit` 或 `@flyc.kernel` 函数体里（会做 AST 改写），`range()` 也只有在 jit 函数里才会生成 `scf.for`；
    - 「编译期 if 后接运行时 elif」不可靠，要写成嵌套的 if（见 `_kloop._dispatch_rows`）；
    - 嵌套的 `@flyc.jit` 不会因为 Python int 参数不同而重新特化，尺寸要从列表长度推出来。
 3. **运行时 `while` 里不要写 lane 级发散的 `if`**（例如 `if tx == 0` 去取 ticket）。LLVM 会让整个循环体在部分 exec mask 下执行，结果错误，或者直接 hang。改成 wave 级分支，再按 lane 选择增量。
 4. **改变循环结构后，LLVM 会把按 lane 计算的地址提到循环外，长期占住 VGPR。** a16w4 曾因此出现 73–83 个 spill。用 `_opaque_tx` 打断这种提升。
-5. **LDS 超过 64 KB 哪里都不抛异常**（FlyDSL 0.3.2 实测）：编译时 LLVM 只往 stderr 打印 `local memory (N) exceeds limit (65536)`，launch 时打印 `hipErrorIllegalState`，Python 继续运行，输出根本没被写。gemm2 fp8 l128 刚好用满 64 KB，再多 16 B 就失败；编译函数里要留着 LDS 大小的 assert，`python -m a8w4.prof isa` 也会报。
+5. **LDS 超过 64 KB 哪里都不抛异常**（FlyDSL 0.3.2 实测）：编译时 LLVM 只往 stderr 打印 `local memory (N) exceeds limit (65536)`，launch 时打印 `hipErrorIllegalState`，Python 继续运行，输出根本没被写。gemm2 fp8 l128 刚好用满 64 KB，再多 16 B 就失败；builder 里要留着 LDS 大小的 assert，`python -m a8w4.prof isa` 也会报。
 6. **BM ≥ 64 时打开预取，或 `dyn_m` 编进两种行数变体后，VGPR 会超过 168，每个 SIMD 少驻留 wave，大 batch 反而变慢。** 所以 pipeline 只在小 BM 时打开。
 
 **内存模型与同步**
@@ -955,7 +954,7 @@ TP kernel（`tp_gemm1`、`tp_gemm2`、`tp_fmoe`、`tp_fmoe_q`）里走不到的�
 | `weights.py` | `test_flydsl_moe_a16wfp4.a8w4_prepare_weights` + `ep8_moe.prepare_weights` |
 | `moe.py`、`tune.py` | `a8w4_moe_tune.py`（TP）+ `ep8_moe.CFGS / AUTO`（EP） |
 | `ref.py` | `ep8_common.py`、`a8w4_moe_tune.torch_ref` 的参考实现和计时部分 |
-| `kernels/_mem.py`、`_act.py`、`_cvt.py`、`_launch.py`、`channel_exp.py` | aiter 7cd70aca8 的 `aiter/ops/flydsl/kernels/{buffer_ops, mxfp4_gemm_common, tensor_shim, act, kernels_common}.py`，以及 `moe_2stage_a16wmix/{a8w4, utils}.py`：只留用到的函数和参数，只在 gfx942 / FlyDSL 0.3.2 上取一个值的分支已冻结；`_launch.py` 原是 `tensor_shim._run_compiled`，现在调用 pyhip 的 `host_launch`；aiter 的 `_pack_activation` 换成了 `_cvt._fp8x4_pack`（有限输入逐位相同，指令更少；NaN 靠 scale 传播，见它的 docstring） |
+| `kernels/_mem.py`、`_act.py`、`_cvt.py`、`channel_exp.py` | aiter 7cd70aca8 的 `aiter/ops/flydsl/kernels/{buffer_ops, mxfp4_gemm_common, tensor_shim, act, kernels_common}.py`，以及 `moe_2stage_a16wmix/{a8w4, utils}.py`：只留用到的函数和参数，只在 gfx942 / FlyDSL 0.3.2 上取一个值的分支已冻结；`tensor_shim._run_compiled` 在 I5 换成了 pyhip `host_launch` 的 `@flydsl_kernel`，只剩 `experiments/_launch.py` 给冻结的实验脚本用；aiter 的 `_pack_activation` 换成了 `_cvt._fp8x4_pack`（有限输入逐位相同，指令更少；NaN 靠 scale 传播，见它的 docstring） |
 | `kernels/_hw.py`、`_atomic.py`、`_mma.py`、`_kloop.py`、`_protocol.py`，`_mem.py` / `_cvt.py` 的其余部分 | 从本包的 kernel 文件里提出来的共用代码（原先在 `tp_gemm1`、`tp_fmoe`、`ep_prep`、`ep_gemm`、`ep_mega` 里，经 `G1.x` 这类模块属性调用） |
 
 设计过程、实验数据和放弃过的方案，见 aiter 仓库 tq/mimo-moe 分支的 `doc-mimo/README.md`（第 1–3、7、8、10 节）和 `doc-mimo/experiments/`。

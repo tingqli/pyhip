@@ -47,9 +47,9 @@ def _worker(rank, port, points, iters, warmup, variants, wcopies):
     mega = MegaMoeEpA8W4(W, rank=rank, max_tokens=max_tokens, topk=TM.TOPK)
     Ws = R.weight_copies(W, wcopies)
     nxt = itertools.cycle(Ws).__next__
-    launches = {n: K.compile_ep_mega(H=mega.H, I=mega.I, TOPK=mega.topk,
-                                     token_shift=mega.token_shift, producers=mega.producers,
-                                     lag=mega.lag, ACT=mega.act, BCM1=b1, BCM2=b2)
+    launches = {n: K.ep_mega_kernel.get(H=mega.H, I=mega.I, TOPK=mega.topk,
+                                        token_shift=mega.token_shift, producers=mega.producers,
+                                        lag=mega.lag, ACT=mega.act, BCM1=b1, BCM2=b2)
                 for n, (b1, b2) in variants.items()}
     data = [R.make_routing(ns[rank], TM.H, TM.E_GLOBAL, TM.TOPK, seed=7919 * rank + ns[rank])
             for ns in points]

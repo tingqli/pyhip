@@ -39,7 +39,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../.
 from a8w4.kernels._atomic import _latomic_add  # noqa: E402
 from a8w4.kernels._cvt import _fp8x4_pack  # noqa: E402
 from a8w4.kernels._hw import NUM_CU  # noqa: E402
-from a8w4.kernels._launch import _run_compiled  # noqa: E402
+from a8w4.experiments._launch import _run_compiled  # noqa: E402
 from a8w4.kernels._mem import (  # noqa: E402
     _raw,
     buffer_load,

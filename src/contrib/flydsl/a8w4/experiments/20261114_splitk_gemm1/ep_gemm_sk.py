@@ -54,7 +54,7 @@ from a8w4.kernels._cvt import (
     _fp8_lut_predelta,
     _perm_u32,
 )
-from a8w4.kernels._launch import _run_compiled
+from a8w4.experiments._launch import _run_compiled
 from a8w4.kernels._mem import (
     _buffer_i32_scalar_read,
     _global_base_ptr1,
