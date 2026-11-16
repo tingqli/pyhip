@@ -5,6 +5,144 @@
 
 分支：从 `tq/moe-a8w4` 拉出的 `refactor/a8w4`（Q28）。
 
+## 0. 续接：新 session 从这里开始
+
+本节写给从空 context 接手的人：读完本节和第 6 节（阶段计划）就能继续。第 1 到 5 节是已经定下的设计，不要重新讨论，除非用户提出。
+
+### 0.1 当前状态（每次停下来前更新）
+
+- **阶段**：Phase 0 已完成，**正在等用户 review Phase 0 的提交**。用户明确说了“先等我 review 提交”，没有得到用户同意前不要开始 Phase 1。
+- **分支和提交**（`/sgl-workspace/pyhip`，分支 `refactor/a8w4`）：
+  - `1383e41` 设计和计划（本文件）
+  - `64ce77c` `prof isa-snapshot` / `isa-diff`
+  - `d17f502` `tests/test_a8w4_api.py`（**ISA 基线就是在这个提交上生成的**）
+  - `4e256d9` `prof isa-cover`
+  - `0c50a56` 本文件：Phase 0 打勾、基线结果
+  - 之后的提交：本节（续接说明）
+- **待用户决定**：
+  - `ep3k l128_v1` 配合 fp8 每 128 列一个 scale 的输入时 LDS 超限（见第 6 节 Phase 0 基线）。我的建议是 Phase 1 不改，只记录；用户还没回复。
+- **工作区**：`/sgl-workspace/pyhip` 根目录下未跟踪的 `0.txt`、`1.txt` 是用户的文件，不要动、不要提交。
+
+### 0.2 工作方式（用户已确认）
+
+- 和用户用中文交流；需要用户决定的事用 `ask_user` 工具问，一次问一个问题，给出选项和推荐项。
+- 每个小步一个提交，提交信息写 ISA 对比结论，结尾加 `Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>`。
+- **每个阶段结束后停下来，等用户 review**，用户同意后才进入下一阶段。
+- 本文件是计划的唯一依据：完成一项就打勾，并更新 0.1；停下来之前也要更新 0.1。
+- 设计里没写到的问题，先问用户，不要自己决定。
+- 不要为了“差不多”的去重接受 ISA 变化（Q27）；不要中途重新调优（Q6）。
+
+### 0.3 环境
+
+- Python：`/opt/venv/bin/python`（3.10）。pyhip 是 editable 安装，`pyhip` 包映射到 `/sgl-workspace/pyhip/src`，所以 a8w4 的导入路径是 `pyhip.contrib.flydsl.a8w4`，对应目录 `src/contrib/flydsl/a8w4`。
+- FlyDSL 0.3.2：`/opt/venv/lib/python3.10/site-packages/flydsl`。ISA 快照工具 hook 了它的内部函数（`flydsl.compiler.jit_function` 里的 `_dump_ir`、`_dump_isa`、`_extract_llvm_ir`、`_infer_kernel_names_from_asm`），换 FlyDSL 版本后要重新检查。
+- 8 张 MI300X（gfx942），224 核。磁盘 `/` 已用 99%，只剩约 15 GB；一次快照约 40 MB。
+- GPU 规矩（Q29）：
+  - 用前先看 `rocm-smi --showuse`，再拿 `/tmp/gpu-N.lock`（`flock -n`）。
+  - 卡被占用时停下来问用户。
+  - `isa-snapshot` 自己会检查占用、加锁。
+- sglang 里调用 a8w4 的地方：
+  - `/sgl-workspace/sglang/python/sglang/srt/layers/quantization/mxfp4_aiter_a16w4_moe.py`
+  - `/sgl-workspace/sglang/test/registered/unit/layers/quantization/test_mxfp4_aiter_a16w4_moe.py`
+- 可参考的 skill（`/sgl-workspace/pyhip/.claude/skills/`）：
+  - `flydsl-gfx942-pitfalls`：缓存 key 规则、LDS 64 KB 等；
+  - `flydsl-host-launch`：`@flydsl_kernel` 的写法，Phase 3 要用；
+  - `a8w4-perf-experiment`、`gpu-timing-protocol`：收尾时的性能核对要用。
+
+### 0.4 安全网用法
+
+每一步的验证顺序：ISA 快照 → 对比 → 必要时跑 pytest。
+
+```bash
+cd /tmp   # 在任何目录都可以，用包路径运行
+P=pyhip.contrib.flydsl.a8w4.prof
+python -m $P isa-snapshot --out /tmp/a8w4_isa/new --gpus 0-7 --workers-per-gpu 4   # 约 105 秒
+python -m $P isa-diff /sgl-workspace/a8w4_refactor_state/isa_base /tmp/a8w4_isa/new   # 退出码 0 = 一致
+python -m $P isa-snapshot --list          # 列出 26 个 job
+python -m $P isa-snapshot --out DIR --jobs 'moe:tp8' --gpus 7   # 只跑部分 job（正则）
+python -m $P isa-cover BASE -- CMD...     # CMD 编译的 kernel 是否都在快照里
+```
+
+- **基线位置**：
+  - `/sgl-workspace/a8w4_refactor_state/isa_base`（持久）；
+  - `/tmp/a8w4_isa/base`（同一份内容，机器重启后可能丢失）。
+  - 同一目录下还有基线 pytest 日志 `pytest_moe.log`、`pytest_gpu8.log`。
+- **基线丢了怎么重新生成**：在 `d17f502` 上开 worktree，用 `PYTHONPATH` 让 `pyhip` 指向它的 `src`。PYTHONPATH 优先于 editable finder，这个方法已验证可行；收尾的性能核对（Q30）也用同样的办法。
+
+  ```bash
+  git -C /sgl-workspace/pyhip worktree add --detach /tmp/a8w4_base_wt d17f502
+  mkdir -p /tmp/a8w4_base_path && ln -sfn /tmp/a8w4_base_wt/src /tmp/a8w4_base_path/pyhip
+  cd /tmp && PYTHONPATH=/tmp/a8w4_base_path python -m pyhip.contrib.flydsl.a8w4.prof \
+      isa-snapshot --out /sgl-workspace/a8w4_refactor_state/isa_base
+  ```
+
+- **`isa-diff` 的输出怎么读**：
+  - `ISA IDENTICAL`：两次快照的规范化 ISA 哈希集合相同，结构性步骤的验收就是这个。kernel 名不同没关系，比较时已经忽略。
+  - `changed ... code`：指令变了，不合格。
+  - `changed ... metadata only`：指令相同，只有元数据变了（比如 kernarg 布局）。Phase 3 改用 `@flydsl_kernel` 时可能出现，要逐个解释原因后提交。
+  - `errors only in A/B`：某个矩阵项开始报错或不再报错。
+  - 已有的 4 个错误（`l128_v1` + fp8g128）两边都会出现，属于正常。
+- **矩阵是从当前代码生成的**：job 和配置来自 `tune.CASES`、`tune.candidates()`、`moe.supported()`、`EG.CFGS`。Phase 1 删掉的选项本来就不在矩阵里。Phase 5、6 移动 `tune` 和 `moe` 后，`isa_snapshot.py` 要同步改成用新模块，但**矩阵内容必须不变**（job 名、配置、token 列表都一样）。改完先对基线跑一次 diff，确认还是 `ISA IDENTICAL`。
+- **pytest**：
+  - 现有测试仍然用 `sys.path` hack 和 `from a8w4 import`，要在 `src/contrib/flydsl` 目录下运行：
+    - `python -m pytest -q a8w4/tests/test_a8w4_moe.py`：单卡，约 5 分钟；
+    - `python -m pytest -q a8w4/tests/test_a8w4_mori_ep8.py a8w4/tests/test_a8w4_mori_tp8.py a8w4/tests/test_a8w4_megamoe_ep8.py`：8 卡，约 4 分钟，只在阶段末跑。
+  - `tests/test_a8w4_api.py` 用包路径导入，在任何目录都能跑，不需要 GPU，约 3 秒。
+
+### 0.5 下一步：Phase 1（删除走不到的代码）的准备
+
+动手前的原则：
+
+- 一个选项只有在 `a8w4_moe`、`a8w4_moe_dyn`、`MegaMoeEpA8W4`、`tune`、`bench` 都走不到时才能删。
+- `bench` 的 variant 覆盖写法要专门检查，在 `bench/core.py` 约 160 到 260 行。ep3k 的 knob 要继续能从 bench 覆盖（Q18）。
+- 删完以后，剩下的 kernel 的 ISA 必须不变。
+
+已经查到的位置（行号对应 `0c50a56`）：
+
+- `kernels/tp_gemm1.py`：
+  - `epilog` 的 `"q8"` / `"q8push"`，以及 `tbl`、`rank`、`epoch`、`npes`。`moe.py` 只用到 `"q8s"` 和 `"bf16"`，要先确认 `"q8"` 是否被别处用到。
+  - `w_layout`（`"tile"`）。
+  - `PUSH_VAR = ()`（第 308 行，冻结）。
+- `kernels/tp_gemm2.py`：
+  - `TILE_ORDER`、`PROBE`、`AR`、`AR_SEP`：编译函数在 613 到 617 行，host 端在 1701 到 1705 行。
+  - 冻结常量：`EPI_DRAIN`（58）、`BF16_FAST`（61）、`WPERM`（66）、`PERSIST`（69）、`AR_HOOK`（705）。
+  - `moe.py:178` 用了 `epilog="direct64"`；`epilog` 默认是 `"lds"`。
+- `kernels/tp_fmoe.py`：冻结常量 `ABL`、`LDS_PAD`、`DELAY`、`G1_SPREAD`、`PROBE`（81 到 90 行）。
+- `kernels/tp_fmoe_q.py`：`DBG = ''`（67 行）。
+- `kernels/ep_gemm.py`：`TL = 0`（276 行，以及 785、790、1134、1139 行）。
+- a16w4（Q11）：
+  - `ADT in ("fp8", "bf16")`：`ep_gemm.py` 751、1269 行，`ep_small.py` 140 行；
+  - `ep_moe` 的 `adt` 参数（`ep_gemm.py` 约 1618 行）；
+  - 各处 `ADT == "bf16"` 分支。
+  - 注意：`ref.ref_moe` 的 `quant_x` 参数（False 表示不模拟 fp8 激活）属于冻结 API，sglang 的测试按位置传了这个参数，不能随 a16w4 一起删。
+- `_vendor/tensor_shim.py` 30 到 40 行读了 3 个环境变量：
+  - `AITER_FLYDSL_KERNARG_PRELOAD`、`AITER_FLYDSL_KERNARG_PRELOAD_COUNT`、`AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE`；
+  - 它们属于“冻结的环境开关”，要先查清楚影响了什么，再决定冻结成常量还是删除。
+- 每删完一组就跑一次快照和对比，然后提交。
+
+为后续阶段记下的事实：
+
+- **探索 sub-agent 说 `dpp_utils`、`layout_utils` 没人用，这是错的**：`_vendor/mxfp4_gemm_common.py` import 了这两个模块。Phase 2 要按实际调用的函数来判断。
+- kernel 文件之间的 import：
+  - ep_gemm → ep_prep、tp_gemm1
+  - ep_mega → ep_gemm、tp_gemm1
+  - ep_mega_comm → ep_gemm、ep_mega、ep_prep
+  - ep_small → ep_gemm、tp_gemm1、ep_prep
+  - tp_fmoe → tp_gemm1
+  - tp_fmoe_q → tp_fmoe、tp_gemm1
+  - tp_prep → ep_prep（`NUM_CU`、`_latomic_add`）
+  - weights → tp_gemm1.`prep_w1_fast`
+- `_fp4x8_to_fp8x8(_fast)` 在 `tp_gemm1` 和 `tp_gemm2` 里各有一份。
+- **编译 key 依赖 token 数**：
+  - tp_prep 的 `EPT` / `HU` 来自 `_route_range(M*K)` / `_hist_unroll(M*K)`；
+  - ep_prep 的 `MULTI = M*K > 2048`；
+  - ep_gemm 的 `ZRC`（由 M、H、grid 决定）、`XG`、`DYN`；
+  - ep1k 的 `maxm`。
+
+  快照的 token 列表已经覆盖了这些切换点（`isa_snapshot.isa_tokens()`）。
+- 共享 device helper 不能放进子目录（Q12，FlyDSL 0.3.2 缓存 key 的规则）。
+- 这几个时间是实测的：单卡 pytest 约 303 秒；8 卡 pytest 约 244 秒；全量快照约 104 秒，CPU 时间约 29 分钟。
+
 ## 1. 目标（Q1）
 
 验收标准：
