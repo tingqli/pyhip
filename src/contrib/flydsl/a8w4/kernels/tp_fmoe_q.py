@@ -84,7 +84,7 @@ def compile_a8w4_fmoe_bm64q(*, D_HIDDEN, D_INTER, NE, TOPK=8, b_cache_mod=1, n_c
     SC2_STRIDE = (INTER // 256) * 64
     WS2_BYTES = NE * H * (INTER // 32)
     kname = (f"a8w4_fmoe_bm64q_h{H}_i{INTER}_ne{NE}_k{TOPK}_bcm{b_cache_mod}_c{n_ctas}"
-             f"{'_noat' if F.NO_ATOMIC else ''}{'_' + DBG if DBG else ''}"
+             f"{'_' + DBG if DBG else ''}"
              f"{'' if act == 'silu' else '_' + act}")
 
     def _cta(lds_ptr, arg_x, arg_xs, arg_w1, arg_ws1, arg_exp1, arg_w2, arg_ws2, arg_eids,
