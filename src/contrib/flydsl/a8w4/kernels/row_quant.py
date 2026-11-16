@@ -12,20 +12,19 @@ read from the device); ``rows`` and the grid are passed per call. Same math, sam
 output bits.
 """
 
-from functools import cache
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 from flydsl.expr import const_expr, gpu, range_constexpr
 
+from pyhip.contrib.flydsl.host_launch import flydsl_kernel
+
 from ._cvt import _fp8x4_pack
-from ._launch import _run_compiled
 from ._mem import _pointer
 
 
-@cache
-def _compile_row_quant(cols, dynamic_rows):
+@flydsl_kernel
+def row_quant_kernel(*, cols, dynamic_rows):
     if cols % 256:
         raise ValueError("activation K must be a multiple of 256")
     chunks = cols // 256
@@ -77,7 +76,6 @@ def quantize_rows(x, valid=None):
     rows, cols = x.shape
     q = torch.empty_like(x, dtype=torch.float8_e4m3fnuz)
     scales = torch.empty(rows, device=x.device, dtype=torch.float32)
-    _run_compiled(_compile_row_quant(cols, valid is not None), x.data_ptr(), q.data_ptr(),
-                  scales.data_ptr(), valid.data_ptr() if valid is not None else 0,
-                  int(rows), (rows + 3) // 4, torch.cuda.current_stream())
+    row_quant_kernel(x, q, scales, valid, rows, (rows + 3) // 4, cols=cols,
+                     dynamic_rows=valid is not None)
     return q, scales

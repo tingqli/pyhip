@@ -5,14 +5,13 @@
 read from the preshuffled scales. ``prepare_weights`` (``weights.py``) returns them as
 ``w*_exp`` and stores the fd2 group scales relative to them."""
 
-from functools import cache
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 from flydsl.expr import gpu, range_constexpr
 
-from ._launch import _run_compiled
+from pyhip.contrib.flydsl.host_launch import flydsl_kernel
+
 from ._mem import _pointer
 
 
@@ -28,8 +27,8 @@ def _scale_index(row, group, groups):
     )
 
 
-@cache
-def _compile_channel_exponents(rows, cols):
+@flydsl_kernel
+def channel_exp_kernel(*, rows, cols):
     groups = cols // 32
     rows_per_wave = 4 if cols >= 4096 else 16
     partitions = 64 // rows_per_wave
@@ -65,6 +64,5 @@ def _compile_channel_exponents(rows, cols):
 def channel_exponents(packed, scales):
     experts, n, kp = packed.shape
     result = torch.empty((experts, n), device=packed.device, dtype=torch.int32)
-    _run_compiled(_compile_channel_exponents(experts * n, kp * 2), scales.data_ptr(), result.data_ptr(),
-         torch.cuda.current_stream())
+    channel_exp_kernel(scales, result, rows=experts * n, cols=kp * 2)
     return result
