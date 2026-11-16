@@ -89,7 +89,7 @@ def main():
                 if n in bad:
                     continue
                 try:
-                    f = lambda c=c: EG.ep_moe(x, W, tw, ti, e0=0, adt="fp8", cfg=c)  # noqa: E731
+                    f = lambda c=c: EG.ep_moe(x, W, tw, ti, e0=0, cfg=c)  # noqa: E731
                     if rnd == 0:
                         out = f().float()
                         if base_out is None:

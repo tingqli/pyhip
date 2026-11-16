@@ -33,7 +33,7 @@ for T in [int(a) for a in sys.argv[1:]] or [2048, 12288]:
     for rnd in range(3):  # interleaved rounds
         for n, c in V.items():
             try:
-                f = lambda: EG.ep_moe(x, W, tw, ti, e0=0, adt="fp8", cfg=c)
+                f = lambda: EG.ep_moe(x, W, tw, ti, e0=0, cfg=c)
                 out = f()
                 if ref is None:
                     ref = out.float()

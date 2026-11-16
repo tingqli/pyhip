@@ -62,7 +62,7 @@ def ep_moe_sk(x, W, tw, ti, *, sk, pf, arb, sk_tiles=0, poison=False):
     SKG.ep_gemm1(x8, xs, W, sids, seids, nv, a, a_s, adt="fp8", block_m=bm, zero=out,
                  zero_rc=rc, rowv=(bm,), sched=None, ni=128, nw=8, sch=3, pf=pf, arb=arb,
                  sk=sk, sk_tiles=sk_tiles)
-    EG.ep_gemm2(a, a_s, W, sids, sw, seids, nv, out, adt="fp8", block_m=bm, rowv=(bm,),
+    EG.ep_gemm2(a, a_s, W, sids, sw, seids, nv, out, block_m=bm, rowv=(bm,),
                 sched=None, single_store=True, no=64, nw=4, sch=3)
     return out
 

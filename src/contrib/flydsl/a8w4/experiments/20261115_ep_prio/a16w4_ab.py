@@ -1,4 +1,7 @@
-"""a16w4 (``adt="bf16"``) shares CFGS with a8w4: A/B of the 20261115 W cache-modifier
+"""NOTE: the a16w4 path (``adt``) was removed from the package in refactor I2; run
+this at commit 892d7f8 or earlier.
+
+a16w4 (``adt="bf16"``) shares CFGS with a8w4: A/B of the 20261115 W cache-modifier
 change on that path ("old" = all W loads nt and gemm2 PF 2, as in rotate.py; "new" = the
 first landed variants, rotate.NEW; ``--final``: the configs finally landed, CFGS).
 ``--wcopies``: weight copies the timed calls cycle through (a16w4_ab.txt: 1, the flawed

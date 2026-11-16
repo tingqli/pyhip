@@ -62,7 +62,7 @@ def main():
         res = {}
         for rnd in range(5):
             for n, c in ((na, ca), (nb, cb)) if rnd % 2 == 0 else ((nb, cb), (na, ca)):
-                fW = lambda W, c=c: EG.ep_moe(x, W, tw, ti, e0=0, adt="fp8", cfg=c)  # noqa: E731
+                fW = lambda W, c=c: EG.ep_moe(x, W, tw, ti, e0=0, cfg=c)  # noqa: E731
                 if rnd == 0:
                     rotate_pass([lambda W=W: fW(W) for W in Ws])
                 r = res.setdefault(n, {})

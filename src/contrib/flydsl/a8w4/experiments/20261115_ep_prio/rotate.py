@@ -92,7 +92,7 @@ def main():
         for rnd in range(a.rounds):
             names = list(V) if rnd % 2 == 0 else list(V)[::-1]
             for n in names:
-                fns = [lambda W=W, c=V[n]: EG.ep_moe(x, W, tw, ti, e0=0, adt="fp8", cfg=c)
+                fns = [lambda W=W, c=V[n]: EG.ep_moe(x, W, tw, ti, e0=0, cfg=c)
                        for W in Ws]
                 if rnd == 0:
                     rotate_pass(fns)  # compile / warm up

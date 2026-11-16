@@ -43,7 +43,7 @@ def run(tokens, base, reps):
             c["g1"]["bcm"], c["g2"]["bcm"] = b1, b2
             for _ in range(reps):
                 flush.zero_()
-                EG.ep_moe(x, W, tw, ti, e0=0, adt="fp8", cfg=c)
+                EG.ep_moe(x, W, tw, ti, e0=0, cfg=c)
         torch.cuda.synchronize()
 
 

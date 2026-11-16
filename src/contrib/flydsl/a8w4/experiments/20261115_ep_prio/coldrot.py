@@ -52,7 +52,7 @@ def main():
         ts = {n: [] for n in V}
         for rnd in range(a.rounds):
             for n in (list(V) if rnd % 2 == 0 else list(V)[::-1]):
-                f = lambda c=V[n]: EG.ep_moe(x, nxt(), tw, ti, e0=0, adt="fp8", cfg=c)  # noqa: E731
+                f = lambda c=V[n]: EG.ep_moe(x, nxt(), tw, ti, e0=0, cfg=c)  # noqa: E731
                 ts[n].append(R.time_cold(f, iters=a.iters))
         b = statistics.median(ts[list(V)[0]])
         print(f"== tokens {T} ({a.copies} W copies, {a.rounds} rounds x {a.iters} iters)")
