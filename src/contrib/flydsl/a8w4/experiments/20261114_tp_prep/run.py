@@ -57,9 +57,8 @@ def _tp2k_tail(cfg, x8, xs, W, sids, sw, seids, nv, out, sk=None):
     a2s = buf[nd:].view(torch.float32).view(sorted_size, groups)
     if sk is None:
         G1.a8w4_gemm1(x8, xs, W["w1"], W["w1_scale"], W["w1_exp"], sids, seids, nv, buf,
-                      num_experts=E, tile_m=bm, epilog="q8s", inter_dim=I,
-                      tile_n=128, b_cache_mod=cfg["g1_bcm"], xcd_swizzle=1, dyn_m=bm > 32,
-                      fast_dec=2, **AKW)
+                      num_experts=E, inter_dim=I, tile_m=bm, tile_n=128,
+                      b_cache_mod=cfg["g1_bcm"], xcd_swizzle=1, dyn_m=bm > 32, **AKW)
     else:
         rowv = tuple(r for r in (16, 32, 64, 128) if r <= bm)
         SKG.ep_gemm1(x8, xs, W, sids, seids, nv, buf[:nd].view(sorted_size, I), a2s,

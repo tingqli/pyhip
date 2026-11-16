@@ -1,4 +1,4 @@
-# Package copy of doc-mimo/kernels/test_a8w4_gemm1.py (test harness removed, env knobs frozen).
+# Package copy of doc-mimo/kernels/test_a8w4_gemm1.py (test harness and experiment knobs removed).
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """Standalone A8W4 MoE stage1 (gate+up GEMM + SiLU) FlyDSL kernel for gfx942.
@@ -8,12 +8,13 @@ with only the configuration the tuned A8W4 build actually runs:
 
   * A  : FP8-FNUZ row-quantized activation ``[tokens, K]`` + f32 per-token scale
   * W1 : mxfp4 (E2M1 + per-1x32 E8M0), standard GGUU N-major preshuffle
-  * MFMA(16,16,32,fp8) with fp4 -> fp8 decode through a per-32K-group byte LUT
-    (+ a sign-mask LUT, so FNUZ -0 never needs a per-fragment fix-up)
-  * runtime K loop, XOR-swizzled A-LDS, 4 waves split TILE_N; small BM prefetches
-    tile kt+1 (A + W) during kt with double-buffered A-LDS (``pipeline``)
-  * epilogue: acc * a_scale[token] * 2**(exp-132) -> SiLU(gate)*up -> bf16
-    ``[sorted_size, inter_dim]`` written by SORTED position
+  * MFMA(16,16,32,fp8) with fp4 -> fp8 decode of the fd2 weights (``prep_w1_fast``)
+    through a per-32K-group byte LUT, one v_perm per 4 nibbles
+  * runtime K loop, XOR-swizzled A-LDS, 4 waves split TILE_N; tiles of <= 32 rows
+    prefetch tile kt+1 (A + W) during kt with double-buffered A-LDS
+  * q8s epilogue: acc * a_scale[token] * 2**(exp-132) -> act(gate)*up -> bf16 in
+    LDS -> fp8 + one f32 scale per (row, TILE_N columns), written by SORTED
+    position: gemm2's A operand
 """
 
 import functools
@@ -52,8 +53,8 @@ from .._vendor.tensor_shim import _to_raw as _raw
 # W stays E2M1/E8M0. Output channel n is normalized by 2**(max_exp[n]-127-5)
 # (``_channel_factor``, applied in the epilogue); per 32-K group the remaining
 # 2**(5-delta), delta = max_exp - group_exp, is folded into an 8-entry
-# E2M1-magnitude -> FP8-FNUZ byte table (``_fp8_lut``) so each nibble decodes with
-# one v_perm.
+# E2M1-magnitude -> FP8-FNUZ byte table (``_fp8_lut_predelta``) so each nibble
+# decodes with one v_perm.
 
 
 def _perm_u32(hi, lo, sel):
@@ -64,77 +65,12 @@ def _perm_u32(hi, lo, sel):
     )
 
 
-def _fp8_lut(group_code, max_code, flush_tiny):
-    """8-entry ``|E2M1| * 2**(5-delta)`` -> FP8-FNUZ byte table.
-
-    ``group_code`` is the 32-K group's E8M0 byte, ``max_code`` the channel max.
-    Includes RNE subnormals for delta in 12..18; delta >= 19 rounds to zero.
-    Returns ``(lo, hi, sign_lo, sign_hi)``: the magnitude table plus a same-shaped
-    mask holding 0x80 for every non-zero entry, so the decode can attach the sign
-    without ever producing 0x80 (FNUZ has no -0; 0x80 is NaN).
-    """
-    difference = max_code - group_code
-    delta = fx.min(difference, 11).to(fx.Uint32) * fx.Uint32(0x08080808)
-    lo = (fx.Uint32(0x6C686080) - delta) & fx.Uint32(0xFFFFFF00)
-    hi = fx.Uint32(0x7C787470) - delta
-    if const_expr(flush_tiny):
-        # Approximation: drop groups < 2**-11 of this channel's largest scale.
-        lo = (difference > 11).select(fx.Uint32(0), lo)
-        hi = (difference > 11).select(fx.Uint32(0), hi)
-    else:
-        for diff, low, high in (
-            (12, 0x0C080400, 0x1C181410),
-            (13, 0x06040200, 0x14100C08),
-            (14, 0x03020100, 0x0C080604),
-            (15, 0x02010000, 0x06040302),
-            (16, 0x01000000, 0x03020201),
-            (17, 0, 0x02010100),
-            (18, 0, 0x01000000),
-        ):
-            lo = (difference == diff).select(fx.Uint32(low), lo)
-            hi = (difference == diff).select(fx.Uint32(high), hi)
-        lo = (difference >= 19).select(fx.Uint32(0), lo)
-        hi = (difference >= 19).select(fx.Uint32(0), hi)
-    # Entries are <= 0x7C, so +0x7F sets bit 7 exactly for non-zero bytes (no carry).
-    sign_lo = (lo + fx.Uint32(0x7F7F7F7F)) & fx.Uint32(0x80808080)
-    sign_hi = (hi + fx.Uint32(0x7F7F7F7F)) & fx.Uint32(0x80808080)
-    return lo, hi, sign_lo, sign_hi
-
-
-def _fp4x8_to_fp8x8(raw, lut):
-    """Eight consecutive FP4 nibbles (one i32) -> v8 FP8-FNUZ MFMA operand."""
-    raw = fx.Uint32(raw)
-    lo, hi, sign_lo, sign_hi = lut
-    sel_even = raw & 0x07070707  # magnitudes of nibbles 0,2,4,6
-    sel_odd = (raw >> 4) & 0x07070707  # magnitudes of nibbles 1,3,5,7
-    # byte = |value| | (nibble sign & 0x80-if-non-zero)
-    even = (_perm_u32(sign_hi, sign_lo, sel_even) & (raw << 4)) | _perm_u32(
-        hi, lo, sel_even
-    )
-    odd = (_perm_u32(sign_hi, sign_lo, sel_odd) & raw) | _perm_u32(hi, lo, sel_odd)
-    lo32 = _perm_u32(odd, even, 0x05010400).bitcast(fx.Int32)
-    hi32 = _perm_u32(odd, even, 0x07030602).bitcast(fx.Int32)
-    return fx.Vector.from_elements([lo32, hi32], fx.Int32).bitcast(fx.Float8E4M3FNUZ)
-
-
-# ---- fast decode (``fast_dec``): W pre-transformed by ``prep_w1_fast_decode`` ----
+# ---- fd2 decode: W and scales pre-transformed by ``prep_w1_fast`` ----------------
 # Each dword holds (k_j, k_{j+4}) in byte j (low, high nibble) and no -0 nibble, so
 # even nibbles decode straight to K 0..3 and odd nibbles to K 4..7 (no interleave
 # v_perm), and the sign is bit 3 of the nibble moved to bit 7 (no sign-table
-# v_perm). flush_tiny only: then every non-zero magnitude maps to a non-zero byte
-# unless the whole group is flushed, where the sign mask is zeroed instead.
-
-
-def _fp8_lut_fast(group_code, max_code):
-    difference = max_code - group_code
-    delta = fx.min(difference, 11).to(fx.Uint32) * fx.Uint32(0x08080808)
-    lo = (fx.Uint32(0x6C686080) - delta) & fx.Uint32(0xFFFFFF00)
-    hi = fx.Uint32(0x7C787470) - delta
-    flushed = difference > 11
-    lo = flushed.select(fx.Uint32(0), lo)
-    hi = flushed.select(fx.Uint32(0), hi)
-    smask = flushed.select(fx.Uint32(0), fx.Uint32(0x80808080))
-    return lo, hi, smask
+# v_perm). The scale byte already holds min(delta, 11) * 8; groups below 2**-11 of
+# the channel max (delta > 11) are zeroed in W, so they decode to 0.
 
 
 def _fp4x8_to_fp8x8_fast(raw, lut):
@@ -148,8 +84,8 @@ def _fp4x8_to_fp8x8_fast(raw, lut):
 
 
 def _fp8_lut_predelta(delta):
-    """``fast_dec=2``: the scale byte already holds min(max-code, 11)*8 (flushed
-    groups are zeroed in W by ``prep_w1_predelta``), broadcast to all 4 bytes."""
+    """LUT of a 32-K group from its fd2 scale byte (min(max-code, 11)*8, broadcast
+    to all 4 bytes)."""
     delta = fx.Uint32(delta)
     lo = (fx.Uint32(0x6C686080) - delta) & fx.Uint32(0xFFFFFF00)
     hi = fx.Uint32(0x7C787470) - delta
@@ -191,19 +127,15 @@ def compile_a8w4_gemm1(
     b_cache_mod=1,
     xcd_swizzle=0,
     waves_per_eu=None,
-    flush_tiny=True,
-    pipeline=None,
     dyn_m=False,
-    epilog="bf16",
-    fast_dec=False,
     act="silu",
 ):
-    """Build the A8W4 stage1 launcher.
+    """Build the A8W4 stage1 launcher (fd2 weights, q8s epilogue).
 
     ``act``: ``"silu"`` or ``"situv2"`` (as gemm1.py; SiTUv2 beta / linear_beta /
     clamp limit are runtime f32 launch args, nothing baked).
 
-    ``pipeline`` (default: ``rows <= 32``): prefetch tile kt+1 (A + W into VGPRs)
+    Pipelining (row tiles of <= 32 rows): prefetch tile kt+1 (A + W into VGPRs)
     while kt computes, double-buffered A-LDS, one barrier per tile. Wins in the
     memory-bound small-M regime; costs ~1 tile of staging VGPRs, so larger-BM
     (compute-bound prefill) tiles keep the single-slot loop.
@@ -217,27 +149,23 @@ def compile_a8w4_gemm1(
     Launch args (raw device pointers): ``x`` fp8 [tokens, K], ``x_scale`` f32
     [tokens], ``w`` mxfp4 [E, 2*inter, K/2] (standard preshuffle), ``w_scale`` e8m0
     (shuffled), ``w_exp`` int32 [E, 2*inter] (``channel_exponents``),
-    ``sorted_expert_ids``, ``num_valid_ids``, ``sorted_ids``, ``out`` bf16
-    [sorted_size, inter], then ``tokens``, three unused scalars (``tbl``, ``rank``,
+    ``sorted_expert_ids``, ``num_valid_ids``, ``sorted_ids``, ``out`` (the q8
+    plane, below), then ``tokens``, three unused scalars (``tbl``, ``rank``,
     ``epoch``), ``rows``, the five SiTUv2 scalars (``situ_args``), ``grid`` and the
     stream. The unused scalars (and the kernel's ``i32_tiles``) only keep the
     kernarg layout, and so the ISA, of the tuned build; they go with the host-launch
     rewrite.
 
     Nothing batch-size dependent is baked in: ``rows`` (rows of the q8 output
-    plane, below) is a launch arg, so one binary serves every token count.
+    plane) is a launch arg, so one binary serves every token count.
 
-    ``epilog``:
-      * ``"bf16"`` (default): bf16 ``[sorted_size, inter]`` by sorted position.
-      * ``"q8s"``: SiLU output staged as bf16 in LDS, quantized to fp8 FNUZ with one
-        f32 scale per (row, TILE_N columns), rows by SORTED position (``rows`` =
-        sorted_size): ``out`` = ``[sorted_size, inter]`` fp8 then
-        ``[sorted_size, inter/TILE_N]`` f32, i.e. gemm2's A + per-128-K-group scale
-        (``a8w4_gemm2(..., a_group=128)``); replaces the separate row-quant kernel.
+    q8s epilogue: the activation output is staged as bf16 in LDS, quantized to fp8
+    FNUZ with one f32 scale per (row, TILE_N columns), rows by SORTED position
+    (``rows`` = sorted_size): ``out`` = ``[sorted_size, inter]`` fp8 then
+    ``[sorted_size, inter/TILE_N]`` f32, i.e. gemm2's A + per-128-K-group scale
+    (``a8w4_gemm2(..., a_group=128)``); replaces a separate row-quant kernel.
     """
-    assert epilog in ("bf16", "q8s"), epilog
     assert act in ("silu", "situv2"), act
-    assert flush_tiny or not fast_dec, "fast_dec needs flush_tiny"
     K = D_HIDDEN
     INTER = D_INTER
     N_OUT = 2 * INTER  # gate | up
@@ -262,15 +190,14 @@ def compile_a8w4_gemm1(
         )
 
     def _pipe(rows):
-        return bool(rows <= 32 if pipeline is None else pipeline) and K_TILES > 1
+        return rows <= 32 and K_TILES > 1
 
     LDS_BYTES = max(r * TILE_K * (2 if _pipe(r) else 1) for r in ROW_VARIANTS)
-    if epilog != "bf16":
-        # bf16 tile; the BM*4 B tail is unused but keeps the tuned LDS size
-        LDS_BYTES = max(LDS_BYTES, BM * TILE_N * 2 + BM * 4)
+    # bf16 epilogue tile; the BM*4 B tail is unused but keeps the tuned LDS size
+    LDS_BYTES = max(LDS_BYTES, BM * TILE_N * 2 + BM * 4)
     Q_TPR = TILE_N // 16  # threads per row in the quant pass (16 cols each)
     Q_RPP = 256 // Q_TPR  # rows per pass
-    assert all(r % Q_RPP == 0 for r in ROW_VARIANTS) or epilog == "bf16"
+    assert all(r % Q_RPP == 0 for r in ROW_VARIANTS)
 
     # W (mxfp4) N-major preshuffle in bytes: (N/16, K/128, klane=4, nlane=16, kpack=16).
     W_K0 = K // 128
@@ -281,16 +208,15 @@ def compile_a8w4_gemm1(
     SC_STRIDE_N0 = (SCALE_K_PAD // 256) * 64
     WS_BYTES = NE * N_OUT * (SCALE_K_PAD // 32)
 
-    ftz_tag = "_ftz" if flush_tiny else ""
     wpe_tag = f"_w{waves_per_eu}" if waves_per_eu else ""
     pipe_tag = "".join("p" if _pipe(r) else "s" for r in ROW_VARIANTS)
     dyn_tag = "_dynm" if dyn_m else ""
+    # _ftz / _fd2 / _q8s: tags of options that are now always on (names unchanged)
     kname = (
         f"a8w4_gemm1_h{K}_i{INTER}_ne{NE}_bm{BM}_tn{TILE_N}_tk{TILE_K}"
-        f"_bcm{b_cache_mod}_xcd{xcd_swizzle}{wpe_tag}{ftz_tag}{dyn_tag}_{pipe_tag}"
-        + (f"_fd{int(fast_dec)}" if fast_dec else "")
+        f"_bcm{b_cache_mod}_xcd{xcd_swizzle}{wpe_tag}_ftz{dyn_tag}_{pipe_tag}_fd2"
         + ("" if act == "silu" else f"_{act}")
-        + ("" if epilog == "bf16" else f"_{epilog}")
+        + "_q8s"
     )
 
     def _body(
@@ -301,7 +227,6 @@ def compile_a8w4_gemm1(
         arg_w_scale,
         arg_w_exp,
         arg_eids,
-        arg_cumsum,
         arg_mind,
         arg_out,
         i32_ntok,
@@ -328,13 +253,6 @@ def compile_a8w4_gemm1(
         w_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(b_cache_mod), fx.Int32)
         ws_tiles = _global_i32_buffer_tiles(arg_w_scale, min(WS_BYTES, 0xFFFFFFFF), 1)
         ws_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(0), fx.Int32)
-
-        # ---- output resource: [cumsum0, INTER] bf16, OOB stores are dropped -----
-        cumsum0 = _global_i32_at(arg_cumsum, fx.Int32(0))
-        out_rsrc = buffer_ops.create_buffer_resource_from_addr(
-            _raw(fx.Int64(arg_out)),
-            num_records_bytes=_raw(fx.Int64(cumsum0) * fx.Int64(INTER * 2)),
-        )
 
         # ---- A operand: gather BM sorted rows of x -> VGPRs -> LDS (2 slots) ----
         # Extent = the real [tokens, K] alloc so padding rows (token >= tokens) read 0.
@@ -416,18 +334,12 @@ def compile_a8w4_gemm1(
             for (gu, ni, g), r in w_regs.items():
                 v4 = fx.Vector(fx.memref_load_vec(r))
                 raw[gu, ni, g] = [fx.Int32(v4[j]) for j in range(4)]
-                if const_expr(fast_dec >= 2):
-                    # byte (g%2)*2 + npack of the dword, broadcast by one v_perm
-                    p = packed[sc_key[gu, ni], g]
-                    sel = (fx.Int32((g % 2) * 2) + sc_npack[gu, ni]) * fx.Int32(
-                        0x01010101
-                    )
-                    code[gu, ni, g] = _perm_u32(p, p, sel)
-                    continue
-                shift = fx.Int32((g % 2) * 16) + sc_npack[gu, ni] * fx.Int32(8)
-                code[gu, ni, g] = packed[sc_key[gu, ni], g].shrui(shift) & fx.Int32(
-                    0xFF
+                # byte (g%2)*2 + npack of the dword, broadcast by one v_perm
+                p = packed[sc_key[gu, ni], g]
+                sel = (fx.Int32((g % 2) * 2) + sc_npack[gu, ni]) * fx.Int32(
+                    0x01010101
                 )
+                code[gu, ni, g] = _perm_u32(p, p, sel)
             return raw, code
 
         # Per-output-channel max e8m0 exponent of this lane's gate / up column.
@@ -440,7 +352,6 @@ def compile_a8w4_gemm1(
         ]
 
         mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, fx.Float8E4M3FNUZ))
-        exps = (exp_gate, exp_up)
         xs_tiles = _global_i32_buffer_tiles(
             arg_x_scale, fx.Int64(i32_ntok) * fx.Int64(4), 1
         )
@@ -523,19 +434,14 @@ def compile_a8w4_gemm1(
                     luts = [
                         [
                             _fp8_lut_predelta(code[gu, ni, g])
-                            if fast_dec >= 2
-                            else _fp8_lut_fast(code[gu, ni, g], exps[gu][ni])
-                            if fast_dec
-                            else _fp8_lut(code[gu, ni, g], exps[gu][ni], flush_tiny)
                             for g in range_constexpr(K_GROUPS)
                         ]
                         for gu in range_constexpr(2)
                     ]
-                    dec = _fp4x8_to_fp8x8_fast if fast_dec else _fp4x8_to_fp8x8
                     for ku in range_constexpr(K_STEPS):
                         g, j = ku // 4, ku % 4
                         bs = [
-                            dec(raw[gu, ni, g][j], luts[gu][g])
+                            _fp4x8_to_fp8x8_fast(raw[gu, ni, g][j], luts[gu][g])
                             for gu in range_constexpr(2)
                         ]
                         # A is re-read from LDS per N block (cheap) instead of holding
@@ -601,34 +507,10 @@ def compile_a8w4_gemm1(
 
                 _k_loop(fx.Int32(0))
 
-            # ---- epilogue: dequant -> SiLU(gate)*up -> bf16 by sorted position ------
+            # ---- epilogue -------------------------------------------------------
             f_gate = [_channel_factor(x) for x in exp_gate]
             f_up = [_channel_factor(x) for x in exp_up]
-            if const_expr(epilog != "bf16"):
-                _q8_epilogue(rows, M_REPEAT, acc_gate, acc_up, f_gate, f_up)
-                return
-            for mi in range_constexpr(M_REPEAT):
-                for ii in range_constexpr(4):
-                    row_in_tile = (
-                        fx.Int32(mi * 16) + lane_div_16 * fx.Int32(4) + fx.Int32(ii)
-                    )
-                    sorted_row = bx_m + row_in_tile
-                    fused = fx.Int32(_global_i32_at(arg_mind, sorted_row))
-                    token = fused & fx.Int32(0x00FFFFFF)
-                    valid = token < i32_ntok  # padding rows carry a sentinel token id
-                    rs = _buffer_i32_scalar_read(xs_tiles, token, xs_atom).bitcast(
-                        fx.Float32
-                    )
-                    for ni in range_constexpr(N_REPEAT):
-                        g = fx.Float32(fx.Vector(fx.memref_load_vec(acc_gate[mi][ni]))[ii])
-                        u = fx.Float32(fx.Vector(fx.memref_load_vec(acc_up[mi][ni]))[ii])
-                        g = g * (rs * f_gate[ni])
-                        u = u * (rs * f_up[ni])
-                        y = gate_up_act(act, [g], [u], situ)[0]
-                        out_idx = sorted_row * inter_i32 + out_cols[ni]
-                        buffer_ops.buffer_store(
-                            y.to(fx.BFloat16), _raw(out_rsrc), _raw(out_idx), mask=valid
-                        )
+            _q8_epilogue(rows, M_REPEAT, acc_gate, acc_up, f_gate, f_up)
 
         def _q8_epilogue(rows, M_REPEAT, acc_gate, acc_up, f_gate, f_up):
             """SiLU -> bf16 LDS tile -> per-(row, TILE_N) fp8 quant -> 16 B stores of
@@ -801,7 +683,6 @@ def compile_a8w4_gemm1(
                 arg_w_scale,
                 arg_w_exp,
                 arg_eids,
-                arg_cumsum,
                 arg_mind,
                 arg_out,
                 i32_ntok,
@@ -923,28 +804,24 @@ def a8w4_gemm1(
     out,
     *,
     num_experts,
+    inter_dim,
     tile_m=64,
     tile_n=128,
     tile_k=256,
     b_cache_mod=1,
     xcd_swizzle=0,
-    flush_tiny=True,
-    pipeline=None,
     waves_per_eu=None,
     dyn_m=False,
-    epilog="bf16",
-    inter_dim=None,
-    fast_dec=False,
     act="silu",
     situ_beta=1.0,
     situ_linear_beta=1.0,
     swiglu_limit=float("inf"),
 ):
-    """Host launcher. ``out`` is bf16 ``[sorted_expert_ids.numel()*tile_m, inter]``
-    (``epilog="bf16"``) or the q8 buffer (``"q8s"``, ``inter_dim`` required)."""
+    """Host launcher. ``w1`` / ``w1_scale`` / ``w1_exp``: fd2 weights
+    (``prepare_weights``). ``out`` is the q8 buffer: fp8 [sorted_size, inter_dim]
+    then f32 [sorted_size, inter_dim / tile_n], sorted_size =
+    ``sorted_expert_ids.numel() * tile_m``."""
     tokens, model_dim = x_fp8.shape
-    if epilog == "bf16":
-        inter_dim = out.shape[1]
     launch = compile_a8w4_gemm1(
         D_HIDDEN=model_dim,
         D_INTER=inter_dim,
@@ -954,18 +831,14 @@ def a8w4_gemm1(
         TILE_K=tile_k,
         b_cache_mod=b_cache_mod,
         xcd_swizzle=xcd_swizzle,
-        flush_tiny=flush_tiny,
-        pipeline=pipeline,
         waves_per_eu=waves_per_eu,
         dyn_m=dyn_m,
-        epilog=epilog,
-        fast_dec=fast_dec,
         act=act,
     )
     grid = sorted_expert_ids.numel() * (inter_dim // tile_n)
     # rows of the q8 plane (its scales follow it). A launch arg, not a compile
     # constant: it changes with every batch size.
-    rows = sorted_expert_ids.numel() * tile_m if epilog == "q8s" else 0
+    rows = sorted_expert_ids.numel() * tile_m
     _run_compiled(
         launch,
         x_fp8.data_ptr(),
@@ -999,7 +872,7 @@ def situ_args(situ_beta=1.0, situ_linear_beta=1.0, swiglu_limit=float("inf")):
 
 
 def prep_w1_fast_decode(w_u8):
-    """Preshuffled W bytes -> the ``fast_dec`` form, per dword:
+    """Preshuffled W bytes -> the fd2 nibble order, per dword:
     nibble order k0..k7 -> byte j = (k_j | k_{j+4} << 4), and -0 (0x8) -> +0."""
     b = w_u8.reshape(-1, 4)
     nib = torch.stack([b & 0xF, b >> 4], dim=-1).reshape(-1, 8)  # k0..k7
@@ -1008,7 +881,7 @@ def prep_w1_fast_decode(w_u8):
 
 
 def prep_w1_predelta(w1_u8, w1_scale_u8, w1_exp):
-    """``fast_dec=2`` prep on the STANDARD-preshuffled W1 bytes / e8m0 scale bytes
+    """fd2 scale prep on the STANDARD-preshuffled W1 bytes / e8m0 scale bytes
     (before ``prep_w1_fast_decode``): scale byte ->
     min(max_code - code, 11) * 8, and W of flushed groups (max_code - code > 11,
     which the kernel decodes to 0) set to 0. ``w1_exp``: ``channel_exponents``.
@@ -1034,11 +907,9 @@ def prep_w1_predelta(w1_u8, w1_scale_u8, w1_exp):
     return w.view(w1_u8.shape), s.contiguous().view(-1)
 
 
-def prep_w1_fast(w1_u8, w1_scale_u8, w1_exp, fast_dec):
-    """Standard-preshuffled W1 / scale bytes -> the ``fast_dec`` (1 or 2) form.
-    ``w1_exp`` must come from the ORIGINAL scales."""
-    assert fast_dec in (1, 2), fast_dec
-    if fast_dec == 2:
-        w1_u8, w1_scale_u8 = prep_w1_predelta(w1_u8, w1_scale_u8, w1_exp)
+def prep_w1_fast(w1_u8, w1_scale_u8, w1_exp):
+    """Standard-preshuffled W / scale bytes -> the fd2 form (any MoE weight, W1 or
+    W2). ``w1_exp`` must come from the ORIGINAL scales."""
+    w1_u8, w1_scale_u8 = prep_w1_predelta(w1_u8, w1_scale_u8, w1_exp)
     return prep_w1_fast_decode(w1_u8).view(w1_u8.shape), w1_scale_u8
 

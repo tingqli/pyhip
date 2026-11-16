@@ -41,7 +41,7 @@ def prepare_weights(w1, w2, w1_scale, w2_scale):
         w_u8 = w.contiguous().view(torch.uint8)
         s_u8 = s.view(torch.uint8).contiguous().view(-1)
         exp = channel_exponents(w_u8, s_u8)  # from the ORIGINAL scales
-        wf, sf = prep_w1_fast(w_u8, s_u8, exp, FAST_DEC)
+        wf, sf = prep_w1_fast(w_u8, s_u8, exp)
         out[f"w{i}"] = wf
         if i == 2:
             n = sf.numel()
