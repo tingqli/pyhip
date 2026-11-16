@@ -20,7 +20,7 @@ wrappers of new kernels follow `flydsl-host-launch`; for the timing rules behind
 | swept a knob before reading the scheduler (lag only matters at 3-4 groups per queue, 1114b §3.4) | wasted 8-GPU jobs | step 2: derive where the knob can matter, then pick points |
 | added up SKIP ablations (hist/scatter, 1114b §3.2) | wrong bottleneck | ablations are not additive (DCE, write patterns): cross-check by changing a parameter |
 | cross-run comparisons; <1% e2e claims at large T | false conclusions | same-process interleaving, the noise floor `<base>#2`, routing samples |
-| a non-scalar compile switch (callable / list) in a SKIP ablation: FlyDSL reused a stale binary | wrong ablation result | int / tuple switches; fresh `FLYDSL_RUNTIME_CACHE_DIR` after `_vendor` edits |
+| a non-scalar compile switch (callable / list) in a SKIP ablation: FlyDSL reused a stale binary | wrong ablation result | int / tuple switches; fresh `FLYDSL_RUNTIME_CACHE_DIR` after helper edits |
 | script named `profile.py`; `--local` read as a rank | broken import; a redone run | `exp lint`; `--local-experts-per-token` |
 
 ## 0. Orient cheaply (do not read every log)

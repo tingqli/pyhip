@@ -18,8 +18,10 @@ part of its key. Key = toolchain hash + source of the `@flyc.jit` function + sou
 | change | new binary? |
 |---|---|
 | source of the `@flyc.jit` / `@flyc.kernel` function (also a comment inside it) | yes |
-| plain helper function in the SAME directory as the jit function | yes |
-| plain helper in ANOTHER directory (e.g. `a8w4/_vendor/*.py` used by `a8w4/kernels/*.py`) | **no: stale** |
+| plain helper in the SAME directory as the jit function, called by bare name | yes |
+| plain helper in ANOTHER directory (e.g. a shared `utils/*.py` used by `kernels/*.py`) | **no: stale** |
+| plain helper called as a module attribute (`mod.helper(...)`): the name lookup finds the module | **no: stale** |
+| plain helper called only inside a nested function (a `def` inside a helper or kernel body): only each scanned function's own bytecode names are read | **no: stale** |
 | a `@flyc.jit` / `@flyc.kernel` dependency anywhere | yes (its own key) |
 | closure value int / float / bool / str / None / tuple / Enum | yes |
 | closure value list / dict / set / object | **no: stale** |
@@ -27,12 +29,17 @@ part of its key. Key = toolchain hash + source of the `@flyc.jit` function + sou
 | a value read at trace time from runtime state (tensor address, env var read in a helper) | **no: stale** |
 | text outside function bodies (module comments) | no rebuild, none needed |
 
+The module-attribute and nested-function rows come from `jit_function._collect_dependency_sources`
+(it reads `co_names` and closures of each function, not nested code objects), checked by listing
+the dependencies of a8w4 `compile_ep_gemm1`, not from the probe.
+
 Rules:
 - Compile-time switches: int / tuple arguments of the (usually `functools.cache`d) compile
   function, also folded into the kernel name (then dumps and profiles tell variants apart).
   Never a list / dict / set / callable / config object in the closure. New host wrappers use
   `@flydsl_kernel` (skill `flydsl-host-launch`), which rejects such keys.
-- After editing `_vendor/` helpers, or whenever a change "does nothing": run with a fresh cache,
+- Import helpers by name into the kernel's directory (a8w4: `kernels/_mem.py` etc.). After
+  editing any helper, or whenever a change "does nothing": run with a fresh cache,
   `FLYDSL_RUNTIME_CACHE_DIR=$(mktemp -d) python ...`. An ablation that reuses a stale binary
   reports "no effect" (this produced a wrong a8w4 gemm2 epilogue conclusion).
 - Env-var knobs: read them once into a closure int; better, freeze them as module constants.

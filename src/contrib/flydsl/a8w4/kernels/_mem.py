@@ -9,7 +9,8 @@ pointers, buffer (V#) loads and stores, i32 buffer views.
 Only what the kernels call, with the gfx942 + FlyDSL 0.3.2 branches frozen. Import these by
 name (``from ._mem import buffer_load``), not through a module object: FlyDSL 0.3.2 puts the
 source of the plain helpers a kernel reaches by name, in the kernel's own directory, into the
-kernel's cache key, so editing a helper here rebuilds the kernels that use it.
+kernel's cache key. The scan does not enter nested functions, so a helper called only inside
+one is still missed: after editing a helper, run with a fresh ``FLYDSL_RUNTIME_CACHE_DIR``.
 """
 
 import flydsl.expr as fx

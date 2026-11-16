@@ -2,7 +2,7 @@
 
 fp8 激活（FNUZ）× mxfp4 权重的 MoE，面向 MI300X / MI325X（gfx942）。TP 和 EP 共用一个入口 `a8w4_moe`：每次调用按（shape，token 数）查调优表，从 5 类 kernel 里选出当前上下文（激活函数、是否在 CUDA graph capture 中、token 数）允许的最快配置。EP 的 all-to-all 接收缓冲区（例如 MORI dispatch：按容量分配，有效行数只在 device 上）用 `a8w4_moe_dyn`，不做 host 同步，可以放进 CUDA graph（2.4 节）。调优表覆盖 XiaomiMiMo/MiMo-V2.6-Flash(-RL) 的 TP8、EP8 每卡 shape（另有 TP4），1–32768 tokens，SiLU 与 SiTUv2 各一组（TP4 只有 SiLU）。
 
-本目录是 pyhip 的一部分（`pyhip.contrib.flydsl.a8w4`），也可以在 `src/contrib/flydsl` 下作为顶层包 `a8w4` 运行（下文的命令都是这样用的）。kernel 依赖 torch 和 FlyDSL 0.3.2，aiter 的 FlyDSL helper 已复制到 `_vendor/`；新代码可以直接用 pyhip 的模块，要写成绝对导入（`from pyhip.contrib.flydsl... import ...`）。aiter 只在三处用到：TP 族 kernel 跑专家切片（EP 形状）时的路由排序（`moe_sorting`）、权重 preshuffle 辅助函数，以及测试和调优。
+本目录是 pyhip 的一部分（`pyhip.contrib.flydsl.a8w4`），也可以在 `src/contrib/flydsl` 下作为顶层包 `a8w4` 运行（下文的命令都是这样用的）。kernel 依赖 torch 和 FlyDSL 0.3.2。原先从 aiter 复制来的 FlyDSL helper 只留下用到的部分，放在 `kernels/` 的共享模块里（`_mem`、`_act`、`_cvt`、`_launch`、`channel_exp`）；launch 交给 pyhip 的 `host_launch`。新代码可以直接用 pyhip 的模块，要写成绝对导入（`from pyhip.contrib.flydsl... import ...`）。aiter 只在三处用到：TP 族 kernel 跑专家切片（EP 形状）时的路由排序（`moe_sorting`）、权重 preshuffle 辅助函数，以及测试和调优。
 
 ## 目录
 
@@ -171,21 +171,25 @@ a8w4/
     ep_prep.py                 ep3k 的 prep：本地专家排序 + x 量化 + tile 调度 + 路数统计；m_valid 变体（MDYN）
     ep_gemm.py                 ep3k 的 gemm1 / gemm2、配置表 CFGS、入口 ep_moe 和 ep_moe_dyn（XG、DYN 变体）
     ep_small.py                ep1k：单 launch 的小 batch 融合
-  _vendor/                     从 aiter/ops/flydsl/kernels（aiter 7cd70aca8）复制的 FlyDSL helper，import 已改为相对路径
+    _mem.py                    共享 device helper：IR 值转换、整数除法、global / LDS 指针、buffer 读写、i32 buffer 视图
+    _act.py                    gemm1 epilogue 的激活（silu、situv2）
+    _cvt.py                    数值格式转换（4 个 f32 打包成 fp8）
+    _launch.py                 host：按原始参数 launch / 只编译（封装 pyhip 的 host_launch）
+    channel_exp.py             W 每行（输出通道）最大的 e8m0 scale 指数，prepare_weights 用
 ```
 
 | 依赖 | 版本 | 用途 |
 |---|---|---|
 | GPU | gfx942（MI300X / MI325X） | fp8 FNUZ MFMA；硬件假设见 9.2 |
 | torch | ROCm 版，测试用 2.9.1+rocm7.2.0 | |
-| FlyDSL | **0.3.2**（用到 `flydsl.expr.meta.dsl_loc_tracing` 等新 API，0.1.x 导入时就会失败） | 全部 kernel |
+| FlyDSL | **0.3.2**（用到 0.3 的新 API，0.1.x 导入时就会失败） | 全部 kernel |
 | aiter | 测试用 tq/mimo-moe 分支 | 运行时只有 TP 族在专家切片（EP 形状）上用 `aiter.fused_moe.moe_sorting`；`shuffle_mxfp4` 用 `aiter.ops.shuffle`（纯 torch 重排）；`ref.py` 和测试用 `aiter.get_torch_quant` 生成权重 |
 
 EP 族（`ep3k` / `ep1k`）和 `prepare_weights` 在运行时都不需要 aiter。
 
 **复制到其他工程**：
 
-- 整个目录复制过去即可，包内全部使用相对 import，也可以放进别的包里。只有 `tests/` 和 `tune.py` 的命令行入口按顶层包名 `a8w4` 导入，改了包名要同步修改。
+- 整个目录复制过去即可，也可以放进别的包里。包内只有 `kernels/_launch.py` 绝对导入 `pyhip.contrib.flydsl.host_launch`，其余全部是相对 import；不带 pyhip 时，把 `host_launch.py` 一起复制过去并改这一处 import。只有 `tests/` 和 `tune.py` 的命令行入口按顶层包名 `a8w4` 导入，改了包名要同步修改。
 - 调优表按 shape 存放，其他模型要先调优（第 6 节）。
 - 换了机器（不同 SKU 或功耗墙）要先跑 `verify`，必要时重新调优。
 
@@ -390,7 +394,7 @@ ARB 是每个 K-tile 每行 A 的字节数，默认 256。`t16` 的 gemm2 用窄
 - **situv2**（所有 kernel 都支持）：
   - 公式：`β·tanh(g/β)·sigmoid(g) · β_l·tanh(u/β_l)`，计算前先 clamp：g ≤ L，|u| ≤ L；
   - β、1/β、β_l、1/β_l、L 是 5 个运行时 f32 launch 参数（`tp_gemm1.situ_args` 生成，β ≤ 0 时报 `ValueError`）；kernel 按 act 分别编译，kernel 名加 `_situv2`；silu 也带这 5 个参数，但不使用；
-  - 位置：TP 族在 gemm1 / 融合 kernel 的 epilogue；EP 族在 ep gemm1 的两种 epilogue（TR 和非 TR）以及 ep1k 的 gemm1 item。都调用同一个 `_vendor/act.gate_up_act`，gemm2 不变；
+  - 位置：TP 族在 gemm1 / 融合 kernel 的 epilogue；EP 族在 ep gemm1 的两种 epilogue（TR 和非 TR）以及 ep1k 的 gemm1 item。都调用同一个 `kernels/_act.gate_up_act`，gemm2 不变；
   - 实测（7.8 节）比 silu 慢：EP 族（ep3k）0.8–3.1%，`a8w4_moe_dyn` 0.6–4.4%，TP 族 1.5–4.7%。多出的只是 gemm1 epilogue 里的 VALU（tanh、sigmoid 各一组 exp2 + rcp），大 batch 时占比稍高。
 - MiMo-V2.6-Flash 用的是 SiLU（sglang `mimo_v2.py` 要求 `hidden_act == "silu"`）。调优表里 SiLU 和 SiTUv2 是分开的两组行（6.1 节）。
 
@@ -842,10 +846,10 @@ TP kernel（`tp_gemm1`、`tp_gemm2`、`tp_fmoe`、`tp_fmoe_q`）里走不到的�
 **FlyDSL 与编译器**
 
 1. **FlyDSL（0.3.2）的磁盘缓存 key 不包含所有会影响 kernel 的东西。** 已实测（新进程、同一个缓存目录，每次只改一处）：
-   - 会重新编译：`@flyc.jit` / `@flyc.kernel` 函数本身的源码；与 jit 函数**同一目录**里被调用的普通 helper 的源码；闭包里的标量和 tuple（int / float / bool / str / None / tuple / Enum）；kernel 代码按名字读到的模块级全局变量（标量、list / dict / set 按值，callable 按名字，其他对象只按类型）。
-   - **不会**重新编译（拿到旧二进制）：闭包里的 list / dict / set / 对象（例如用 list 传编译开关）；**其他目录**里的普通 helper（本包 `kernels/*.py` 调用的 `_vendor/*.py` helper 都是这种，改了 `_vendor` 要清缓存）；trace 时读到的运行时值（例如调试 buffer 的地址）。
+   - 会重新编译：`@flyc.jit` / `@flyc.kernel` 函数本身的源码；与 jit 函数**同一目录**里、按名字调用的普通 helper 的源码（本包的 helper 都在 `kernels/` 里，按名字导入：`from ._mem import buffer_load`，再写 `buffer_load(...)`）；闭包里的标量和 tuple（int / float / bool / str / None / tuple / Enum）；kernel 代码按名字读到的模块级全局变量（标量、list / dict / set 按值，callable 按名字，其他对象只按类型）。
+   - **不会**重新编译（拿到旧二进制）：闭包里的 list / dict / set / 对象（例如用 list 传编译开关）；**其他目录**里的普通 helper；经模块属性调用的 helper（`G1.situ_args(...)` 这种写法：FlyDSL 只按名字查模块全局变量，查到的是模块对象）；只在嵌套函数里调用的 helper（FlyDSL 只扫描每个函数自己的字节码，不进入里面定义的函数；例如 `ep_gemm` 的 `_body` 里 `_epilogue` 调用的 `gate_up_act`、`_buffer_i32_scalar_read`）；trace 时读到的运行时值（例如调试 buffer 的地址）。
    - 函数体之外的改动（模块注释等）不触发重新编译。
-   - 对策：编译期开关用 int / tuple 放进闭包（例如 `functools.cache` 的参数）；改了 `_vendor` 或拿不准时，用一个空的 `FLYDSL_RUNTIME_CACHE_DIR` 跑。gemm2 epilogue 的消融实验曾因为复用了旧二进制，得出「写回方式不影响耗时」的错误结论。
+   - 对策：编译期开关用 int / tuple 放进闭包（例如 `functools.cache` 的参数）；改了 helper 或拿不准时，用一个空的 `FLYDSL_RUNTIME_CACHE_DIR` 跑。gemm2 epilogue 的消融实验曾因为复用了旧二进制，得出「写回方式不影响耗时」的错误结论。
 2. **运行时控制流的写法有限制。**
    - 运行时的 `if` / `while` 必须写在 `@flyc.jit` 或 `@flyc.kernel` 函数体里（会做 AST 改写），`range()` 也只有在 jit 函数里才会生成 `scf.for`；
    - 「编译期 if 后接运行时 elif」不可靠，要写成嵌套的 if（见 `_dispatch_rows`）；
@@ -888,7 +892,7 @@ TP kernel（`tp_gemm1`、`tp_gemm2`、`tp_fmoe`、`tp_fmoe_q`）里走不到的�
 20. **容器自带的 FlyDSL 是 0.1.5，本包需要 0.3.2。** 用 `pip install --target <目录>` 装到独立目录，再通过 `PYTHONPATH` 生效。
 21. **aiter 的 JIT `.so` 与源码版本不一致**（`module_aiter_core` 缺 `MlaVersion`）。设置 `AITER_JIT_DIR=<新目录>`，让 aiter 在那里重新编译，不改动共享环境。
 22. **本包现在放在 pyhip 里（`pyhip.contrib.flydsl.a8w4`）。**
-    - 非 editable 安装时，`pyproject.toml` 要列出 `a8w4`、`a8w4._vendor`、`a8w4.kernels`、`a8w4.bench` 四个子包，并用 package-data 带上 `configs/*.csv`。漏了子包会 import 失败；漏了 CSV 不报错，查表会静默退回默认配置。
+    - 非 editable 安装时，`pyproject.toml` 要列出 `a8w4`、`a8w4.kernels`、`a8w4.bench` 三个子包，并用 package-data 带上 `configs/*.csv`。漏了子包会 import 失败；漏了 CSV 不报错，查表会静默退回默认配置。
     - aiter 的 import 依赖 pyhip，要用源码里的 pyhip（例如 `pip install -e`）。早先把 pyhip stub 掉的做法不再适用。
 
 **EP all-to-all（MORI）**
@@ -919,7 +923,7 @@ TP kernel（`tp_gemm1`、`tp_gemm2`、`tp_fmoe`、`tp_fmoe_q`）里走不到的�
 
 ## 12. 来源
 
-- **从哪里来**：`kernels/` 和 `_vendor/` 是从实验文件机械生成的。做法是：
+- **从哪里来**：`kernels/` 的 kernel 文件是从实验文件机械生成的（共享 helper 模块见表的最后一行）。做法是：
   - 删掉测试代码（参考实现、bench、main）；
   - import 改为指向包内；
   - 环境变量开关冻结成默认值；
@@ -941,6 +945,6 @@ TP kernel（`tp_gemm1`、`tp_gemm2`、`tp_fmoe`、`tp_fmoe_q`）里走不到的�
 | `weights.py` | `test_flydsl_moe_a16wfp4.a8w4_prepare_weights` + `ep8_moe.prepare_weights` |
 | `moe.py`、`tune.py` | `a8w4_moe_tune.py`（TP）+ `ep8_moe.CFGS / AUTO`（EP） |
 | `ref.py` | `ep8_common.py`、`a8w4_moe_tune.torch_ref` 的参考实现和计时部分 |
-| `_vendor/*` | `aiter/ops/flydsl/kernels/{buffer_ops, dpp_utils, layout_utils, kernels_common, tensor_shim, act, mxfp4_gemm_common}.py`，以及 `moe_2stage_a16wmix/{a8w4, utils}.py` 中用到的函数 |
+| `kernels/_mem.py`、`_act.py`、`_cvt.py`、`_launch.py`、`channel_exp.py` | aiter 7cd70aca8 的 `aiter/ops/flydsl/kernels/{buffer_ops, mxfp4_gemm_common, tensor_shim, act, kernels_common}.py`，以及 `moe_2stage_a16wmix/{a8w4, utils}.py`：只留用到的函数和参数，只在 gfx942 / FlyDSL 0.3.2 上取一个值的分支已冻结；`_launch.py` 原是 `tensor_shim._run_compiled`，现在调用 pyhip 的 `host_launch` |
 
 设计过程、实验数据和放弃过的方案，见 aiter 仓库 tq/mimo-moe 分支的 `doc-mimo/README.md`（第 1–3、7、8、10 节）和 `doc-mimo/experiments/`。

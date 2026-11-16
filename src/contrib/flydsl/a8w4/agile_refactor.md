@@ -13,7 +13,7 @@
 
 ### 0.1 当前状态（每次停下来前更新）
 
-- **迭代**：I1、I1b、I2 已完成。用户看过 I2 后改了 I3 的范围（见 3.1 节）：`_vendor` 只留真正用到的代码，迁到 `kernels/` 下的共享模块，删掉 `_vendor/`。I3 进行中。
+- **迭代**：I1、I1b、I2、I3 已完成。I3 的范围是用户看过 I2 后改的（见 3.1 节）：`_vendor` 只留真正用到的代码，迁到 `kernels/` 下的共享模块，删掉 `_vendor/`。现在等用户 review I3，下一个是 I4。
 - **分支**：`/sgl-workspace/pyhip` 的 `refactor/a8w4`。
 - **已有提交**：
   - 迭代 0，安全网：`64ce77c`、`d17f502`（ISA 基线在这个提交上生成）、`4e256d9`。
@@ -21,6 +21,7 @@
   - I1：`0b0e3c9`、`725209f`、`51817b1`、`f9d75f3`、`cb2e8f0`（收尾：文档和实验脚本）。
   - I1b：`aa91396`、`2b2efaa`、`4f478b4`、`8399c9d`（文档）、`bb7f40e`。
   - I2：`892d7f8`（`TL`、`DBG`）、`87fd7c8`（a16w4）、`7dbb85e`（实验脚本），`aac9bcf`（文档）。
+  - I3：`18f243f`（原地精简）、`cc44955`（迁到 `kernels/`，删除 `_vendor/`），以及文档提交。
 - **用户的文件**：未跟踪的 `refactory2.md` 属于用户，不要改，也不要提交。
 
 ### 0.2 工作方式
@@ -52,7 +53,7 @@
 | I1b | 删除 TP kernel 里调用方不用的模式取值（fast_dec 0/1、gemm1 的 bf16 epilogue 等，规则见 3.3 节） | 用户在 I1 review 时决定 | 同上 |
 | I2 | 删除 EP kernel 里走不到的选项（`TL` 等）和 a16w4 路径，包括 bench 的 `adt=bf16` 覆盖 | Q4，Q11 | 同上 |
 | I3 | 精简 `_vendor`：没人读的环境变量、类、函数、参数直接删；剩下的迁到 `kernels/` 下按主题分的共享模块；删除 `_vendor/`（规则见 3.1 节） | 原 I3 + 原 I4 前半；用户 2026-11-16 | ISA IDENTICAL；API 测试；单卡 pytest |
-| I4 | kernel 文件之间不再互相 import（共享的 device helper 搬进 I3 建的模块）；`_fp4x8_to_fp8x8`、`_fp8x4_pack` / `_pack_activation` 只留一份；硬件常量集中定义 | Q12，Q14，Phase 2 | ISA IDENTICAL |
+| I4 | kernel 文件之间不再互相 import（共享的 device helper 搬进 I3 建的模块，按名字导入；现在的 `G1.x`、`EP.x` 这类模块属性调用不进 FlyDSL 缓存 key）；`_fp4x8_to_fp8x8`、`_fp8x4_pack` / `_pack_activation` 只留一份；硬件常量集中定义 | Q12，Q14，Phase 2 | ISA IDENTICAL |
 | I5 | host 封装改用 `@flydsl_kernel`，替代 `_run_compiled` 和 `functools.cache`；每个 kernel 文件一个公开入口；同时删掉 I1 留下的无用 kernel 参数（标了 `# unused` 的那些）。到时按文件再拆成几个迭代 | Q13，Phase 3 | ISA IDENTICAL（kernarg 偏移变化要逐个解释）；pytest |
 | I6 | 新建 `workspace.py`，统一管理每张卡一份的缓冲区 | Q19 | ISA IDENTICAL；pytest |
 
@@ -83,7 +84,7 @@
 
 ## 3. 当前迭代
 
-### 3.1 I3：精简 `_vendor`，迁到 `kernels/` 的共享模块（进行中）
+### 3.1 I3：精简 `_vendor`，迁到 `kernels/` 的共享模块（已完成，等 review）
 
 **背景**：`_vendor/` 是为了不依赖 aiter，从 aiter 原样复制来的 9 个文件（2268 行）。用 AST 从包内所有调用点（含 `experiments/`）做可达性分析，约 1170 行走不到：
 
@@ -95,26 +96,36 @@
 
 - 删：走不到的定义；用到的函数里没有调用方传的参数和分支（`buffer_load` 的 `is_scalar` / `soffset_bytes`，`buffer_store` 的 `offset_is_bytes`，`get_element_ptr` 的静态偏移，`gate_up_act` 的 `swiglu`，`sigmoid_batch` 的 `alpha`）。
 - 冻结：只在 gfx942 和 FlyDSL 0.3.2 上取一个值的兼容分支（V# flags 读 `FLYDSL_GPU_ARCH` 判断 RDNA；`RawPtrBufferLoadOp` 的 `aux` 是属性还是操作数）。
-- 函数名暂不改（按术语表改名是中期的事），只改模块位置和 import。
+- 函数名暂不改（按术语表改名是中期的事），只改模块位置和 import。唯一的例外：`_gep1` 和 `get_element_ptr` 签名相同，合并成 `get_element_ptr`。
 
-**目标布局**（helper 和 kernel 在同一目录后，改 helper 会进 FlyDSL 缓存 key，不再拿到旧二进制）：
+**结果布局**（共 464 行；helper 都按名字导入，和 kernel 同一目录，大部分进了 FlyDSL 缓存 key）：
 
-| 模块 | 内容 | 来源 |
-|---|---|---|
-| `kernels/_mem.py` | IR 值转换 `_raw`；global / LDS 指针、GEP；buffer resource、`buffer_load` / `buffer_store`；i32 buffer view；`_udiv` / `_umod` | `buffer_ops`、`mxfp4_gemm_common`、`moe_utils`、`tensor_shim._to_raw`、`a8w4_ops._pointer` |
-| `kernels/_act.py` | gate / up 激活（silu、situv2） | `act`、`kernels_common.LOG2E` |
-| `kernels/_cvt.py` | 数值格式转换：`_pack_activation`（4 个 f32 打包成 fp8）；I4 去重的 fp4 解码等也放这里 | `a8w4_ops` |
-| `kernels/_launch.py` | host 端：`_run_compiled`、`_preload_compiled`（I5 换成 `@flydsl_kernel` 后删除） | `tensor_shim` |
-| `kernels/channel_exp.py` | W 的通道指数扫描 kernel 和 host 入口 `channel_exponents`（`prepare_weights` 用） | `a8w4_ops` |
+| 模块 | 行数 | 内容 | 来源 |
+|---|---|---|---|
+| `kernels/_mem.py` | 232 | IR 值转换 `_raw` / `_unwrap_value`；`_udiv` / `_umod`；global / LDS 指针、`get_element_ptr`；buffer resource、`buffer_load` / `buffer_store`；i32 buffer view | `buffer_ops`、`mxfp4_gemm_common`、`moe_utils`、`tensor_shim._to_raw`、`a8w4_ops._pointer` |
+| `kernels/_act.py` | 119 | gate / up 激活（silu、situv2） | `act`、`kernels_common.LOG2E` |
+| `kernels/_cvt.py` | 19 | `_pack_activation`（4 个 f32 打包成 fp8，饱和到 ±240，-0 → +0）；I4 去重的 fp4 解码等也放这里 | `a8w4_ops` |
+| `kernels/_launch.py` | 24 | host 端 `_run_compiled`、`_preload_compiled`：只是 `pyhip.contrib.flydsl.host_launch` 的 `_compile_and_run` / `_compile_only` 的薄封装，不再自带一份 `COMPILE_ONLY` 加锁逻辑（I5 换成 `@flydsl_kernel` 后删除） | `tensor_shim` |
+| `kernels/channel_exp.py` | 70 | W 的通道指数扫描 kernel 和 host 入口 `channel_exponents`（`prepare_weights` 用） | `a8w4_ops` |
 
 **任务**：
 
-- [x] 第 1 步：在 `_vendor` 里原地删掉走不到的代码和参数，冻结兼容分支。2268 → 553 行，删掉 `dpp_utils`、`layout_utils`、`kernels_common` 三个文件。ISA IDENTICAL。
-- [ ] 第 2 步：迁到上表的模块；kernel 文件的 import 只留用到的名字；`G1.global_typed_ptr` 这类经别的 kernel 模块转手的引用改为直接 import；`experiments/`、`megamoe.py`、`isa_snapshot.py`、`weights.py` 跟着改；删除 `_vendor/` 和 `pyproject.toml` 里的子包。
-- [ ] 文档：README（目录结构、缓存 key 规则、来源表）、`flydsl-gfx942-pitfalls` skill 里拿 `_vendor` 举的例子。
-- **验收**：ISA IDENTICAL；API 测试；单卡 pytest。
+- [x] 第 1 步（`18f243f`）：在 `_vendor` 里原地删掉走不到的代码和参数，冻结兼容分支。2268 → 553 行，删掉 `dpp_utils`、`layout_utils`、`kernels_common` 三个文件。ISA IDENTICAL。
+- [x] 第 2 步（`cc44955`）：迁到上表的模块；`bo.X` / `G1._buffer_i32_scalar_read` 这类模块属性调用改成按名字导入，import 只留用到的名字；顺手删掉 kernel 文件和 `ep_gemm_sk` 里 25 个没用的 import；`experiments/`、`megamoe.py`、`isa_snapshot.py`、`weights.py` 跟着改；删除 `_vendor/` 和 `pyproject.toml` 里的子包。
+- [x] 文档：README（简介、目录结构、依赖表、复制到其他工程、缓存 key 规则、pyproject 子包、来源表）；skill `flydsl-gfx942-pitfalls`（缓存 key 表加两行）、`flydsl-host-launch`（示例的 import）、`a8w4-perf-experiment`。
+- **验收**：ISA IDENTICAL（177 个 ISA）；`channel_exponents` 不在快照里，单独比对了新旧 ISA 和输出，逐字节相同；API 测试 23 passed；单卡 pytest 94 passed、1 skipped。
 
-### 3.2 I2：删除 EP kernel 的调试开关和 a16w4 路径（已完成，等 review）
+**经验**：
+
+- FlyDSL 0.3.2 的缓存 key 只收集“按名字引用、和 jit 文件同一目录”的普通 helper（`jit_function._collect_dependency_sources`：读每个函数的 `co_names` → `__globals__`，以及闭包）。所以：
+  - 经模块属性调用（`bo.buffer_load`、`G1.x`）的 helper 不进 key，迁移时一律改成按名字导入；
+  - `@dsl_loc_tracing` 把函数包成 FlyDSL 目录下的 wrapper，也会把 helper 挡在 key 外面。它只加 MLIR location，`.s` 里没有 `.loc`，所以去掉了；
+  - 不进入嵌套函数：`ep_gemm` 的 `_body` 里 `_epilogue` 调用的 `gate_up_act`、`lds_vec_load` 等仍然不在 key 里。这是 FlyDSL 的限制，不是这次引入的（原来 `_vendor` 的 helper 全都不在 key 里）。改 helper 后照旧用空的 `FLYDSL_RUNTIME_CACHE_DIR`。
+- `_raw` 和 `_unwrap_value` 不能合并：后者让 Python int 原样通过，`buffer_load` 等的偏移参数靠它接受常量。
+- 第 1 步删 `get_element_ptr` 的 `elem_type` 参数时漏了 `_gep1` 的调用点，ISA 快照的编译失败直接暴露了问题：快照每次用新的 `FLYDSL_RUNTIME_CACHE_DIR`，结论可信。
+- 引入 `host_launch` 后，导入 a8w4 会加载 pyhip 的这个模块（多约 0.03 s）。`kernels/_launch.py` 是包内唯一的 pyhip 绝对导入，README 的“复制到其他工程”已写明。
+
+### 3.2 I2：删除 EP kernel 的调试开关和 a16w4 路径（已完成）
 
 **范围**（a16w4 依据 Q11：以后要上线时作为独立的族加回来）：
 
@@ -217,6 +228,7 @@ host 端（`moe._run_tp2k`，G1/G2 唯一的调用方）只用到 gemm1 的 `epi
 | 2026-11-16 | I1 删除 TP kernel 的死代码 | 4 个文件净减约 830 行；ISA IDENTICAL；API 测试 23 passed；单卡 pytest 94 passed、1 skipped | `0b0e3c9` `725209f` `51817b1` `f9d75f3` |
 | 2026-11-16 | I1b 删除 TP kernel 里不用的模式取值 | `tp_gemm1` 1044→915 行，`tp_gemm2` 1225→1034 行，`tp_fmoe` 去掉两个开关；kernel 名字不变；ISA IDENTICAL；API 测试 23 passed；单卡 pytest 94 passed、1 skipped | `aa91396` `2b2efaa` `4f478b4` `8399c9d` |
 | 2026-11-16 | I2 删除 EP 的调试开关和 a16w4 路径 | `ep_gemm` 1707→1545 行，`ep_small` 609→592 行；`_make_core` 去掉 `FP8`；bench 去掉 `adt=` 覆盖；kernel 名字不变；ISA IDENTICAL；API 测试 23 passed；单卡 pytest 94 passed、1 skipped | `892d7f8` `87fd7c8` `7dbb85e` |
+| 2026-11-16 | I3 精简 `_vendor`，迁到 `kernels/` | `_vendor/` 9 个文件 2268 行 → `kernels/` 5 个共享模块 464 行；helper 按名字导入，大部分进了 FlyDSL 缓存 key；`_run_compiled` 改用 pyhip `host_launch`；删 25 个无用 import；ISA IDENTICAL；`channel_exponents` ISA 和输出逐字节相同；API 测试 23 passed；单卡 pytest 94 passed、1 skipped | `18f243f` `cc44955` |
 
 ## 5. 草图摘要：第 5–7 轮讨论（远期目标的素材，不是承诺）
 

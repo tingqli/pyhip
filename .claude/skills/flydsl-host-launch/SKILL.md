@@ -14,8 +14,8 @@ control flow, LDS, ...) are in the `flydsl-gfx942-pitfalls` skill.
 
 ## 1. The pattern
 
-This example is verified bit-exact against `a8w4/_vendor/a8w4_ops.channel_exponents`. It is
-written for a8w4 (the `.._vendor` imports); elsewhere, use
+This example is verified bit-exact against `a8w4/kernels/channel_exp.channel_exponents`. It is
+written for `a8w4/kernels/` (the `._mem` / `.channel_exp` imports); elsewhere, use
 `fx.inttoptr(fx.PointerType.get(dtype.ir_type, fx.AddressSpace.Global, align), fx.Int64(addr))`
 as the pointer helper.
 
@@ -27,7 +27,8 @@ from flydsl.expr import gpu, range_constexpr
 
 from pyhip.contrib.flydsl.host_launch import cdiv, flydsl_kernel, kernel_name, ptr
 
-from .._vendor.a8w4_ops import _pointer, _scale_index
+from ._mem import _pointer
+from .channel_exp import _scale_index
 
 
 @flydsl_kernel(heuristics={"rows_per_wave": lambda k: 4 if k["cols"] >= 4096 else 16})
@@ -184,7 +185,7 @@ The machine is shared, so only compare numbers from the same run.
 ## 5. Migrating an existing compile function
 
 Only do this when the task rewrites that wrapper anyway. Never touch `a8w4/experiments/`
-(frozen copies) or `a8w4/_vendor/` (kept diffable against aiter).
+(frozen copies).
 
 1. Replace `@cache` with `@flydsl_kernel(...)`; its parameters are now passed as keywords.
    - Alternatively, wrap it without editing:
