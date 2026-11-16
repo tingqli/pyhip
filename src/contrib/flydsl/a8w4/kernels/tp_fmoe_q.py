@@ -1,4 +1,4 @@
-# Package copy of doc-mimo/kernels/test_a8w4_fmoe_bm64q.py (test harness removed, env knobs frozen).
+# Package copy of doc-mimo/kernels/test_a8w4_fmoe_bm64q.py (test harness and experiment knobs removed).
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """Persistent work-queue fused A8W4 MoE (doc-mimo/experiments/fmoe_bm64, step 3).
@@ -64,8 +64,6 @@ A2_BYTES = BM * 256  # fp8 [64, 256] per block
 NXCD = 8
 CTL_FLAGS = 64  # i32 index of the per-block flags in the control buffer
 CM_SC1 = 16  # gfx942 buffer cache policy sc1 (sc0=1, nt=2)
-DBG = ''  # frozen (was env-tunable in the experiment copy)
-TRACE_N = 4096
 
 
 @functools.cache
@@ -84,7 +82,6 @@ def compile_a8w4_fmoe_bm64q(*, D_HIDDEN, D_INTER, NE, TOPK=8, b_cache_mod=1, n_c
     SC2_STRIDE = (INTER // 256) * 64
     WS2_BYTES = NE * H * (INTER // 32)
     kname = (f"a8w4_fmoe_bm64q_h{H}_i{INTER}_ne{NE}_k{TOPK}_bcm{b_cache_mod}_c{n_ctas}"
-             f"{'_' + DBG if DBG else ''}"
              f"{'' if act == 'silu' else '_' + act}")
 
     def _cta(lds_ptr, arg_x, arg_xs, arg_w1, arg_ws1, arg_exp1, arg_w2, arg_ws2, arg_eids,
@@ -499,36 +496,18 @@ def compile_a8w4_fmoe_bm64q(*, D_HIDDEN, D_INTER, NE, TOPK=8, b_cache_mod=1, n_c
             i_mid = r_odd.select(lag + r // fx.Int32(2), r // fx.Int32(2))
             i = head.select(j, in_mid.select(i_mid, r - mid))
             m_block = blk0 + i
-            if const_expr(DBG == "trace"):
-                trace(m_block, is_g1)
-            else:
-                run_block(m_block, is_g1)
-
-        @flyc.jit
-        def trace(m_block, is_g1):
-            if wave == fx.Int32(0):
-                idx = fx.max(fx.min(m_block, fx.Int32(TRACE_N - 1)), fx.Int32(0))
-                inc = (lane == fx.Int32(0)).select(is_g1.select(fx.Int32(1), fx.Int32(1000)),
-                                                   fx.Int32(0))
-                ptr = bo.get_element_ptr(_global_base_ptr1(arg_ctl),
-                                         byte_offset=_raw((fx.Int32(CTL_FLAGS) + idx) * fx.Int32(4)))
-                llvm.AtomicRMWOp(llvm.AtomicBinOp.add, ptr, _raw(inc),
-                                 llvm.AtomicOrdering.monotonic, syncscope="agent")
+            run_block(m_block, is_g1)
 
         @flyc.jit
         def run_block(m_block, is_g1):
             short = rows_of(m_block)
             if is_g1:
-                if const_expr(DBG == "skipg1"):
-                    publish(m_block)
-                elif short:
+                if short:
                     g1_task(m_block, 32)
                 else:
                     g1_task(m_block, BM)
             else:
-                if const_expr(DBG == "skipg2"):
-                    wait_ready(m_block)
-                elif short:
+                if short:
                     g2_task(m_block, 32)
                 else:
                     g2_task(m_block, BM)
