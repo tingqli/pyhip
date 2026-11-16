@@ -300,9 +300,9 @@ def _sweep_worker(rank, port, points, variants, iters, warmup, wcopies, act, out
         m = megas[key]
         launch = None
         if v.bcm is not None:
-            launch = K.compile_ep_mega(H=m.H, I=m.I, TOPK=m.topk, token_shift=m.token_shift,
-                                       producers=m.producers, lag=m.lag, ACT=m.act,
-                                       BCM1=v.bcm[0], BCM2=v.bcm[1])
+            launch = K.ep_mega_kernel.get(H=m.H, I=m.I, TOPK=m.topk, token_shift=m.token_shift,
+                                          producers=m.producers, lag=m.lag, ACT=m.act,
+                                          BCM1=v.bcm[0], BCM2=v.bcm[1])
         runs[v.label] = (m, launch, _mode_tables(m, scratch[key], v.mode), v.mode)
 
     def call(label, x, ti, tw, marks=None):

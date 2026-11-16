@@ -169,49 +169,24 @@ def _dyn_items(act, xf):
                            num_experts=EGl, act=act, situ=_situ(act), config=c))
 
 
-def _dummy_args(launch):
-    """Placeholder launch args from a ``@flyc.jit`` launcher's annotations (compile only:
-    nothing is dispatched)."""
-    import inspect
-
-    import torch
-
-    args = []
-    for p in inspect.signature(launch.func).parameters.values():
-        t = getattr(p.annotation, "__name__", str(p.annotation))
-        if t in ("Int64", "Int32", "Uint32", "Uint64"):
-            args.append(0)
-        elif t == "Float32":
-            args.append(0.0)
-        elif t == "Stream":
-            args.append(torch.cuda.current_stream())
-        else:
-            raise TypeError(f"{launch.func.__qualname__}: no placeholder for {p.name}: {t}")
-    return args
-
-
 def _mega_items(act):
     """The compiles of ``MegaMoeEpA8W4.__init__`` (ep8 shape, default producers / lag)."""
-    from .kernels._launch import _preload_compiled
     from .kernels import ep_mega as K
     from .kernels import ep_mega_comm as C
 
     (H, I, E, EGl, topk), _ = _case("ep8")
     token_shift = max(int(MEGA_MAX_TOKENS - 1).bit_length(), 1)
     kw = dict(H=H, I=I, TOPK=topk, token_shift=token_shift, producers=16, lag=2, ACT=act)
-    launches = {
-        "ep_mega": lambda: K.compile_ep_mega(**kw),
-        "ep_mega big": lambda: K.compile_ep_mega(**kw, BCM1=0, BCM2=1),
-        "quant": lambda: C.compile_quant(H),
-        "prep": C.compile_prep,
-        "plan": C.compile_plan,
-        "finish": C.compile_finish,
+    kernels = {
+        "ep_mega": (K.ep_mega_kernel, kw),
+        "ep_mega big": (K.ep_mega_kernel, dict(kw, BCM1=0, BCM2=1)),
+        "quant": (C.mega_quant_kernel, dict(H=H)),
+        "prep": (C.mega_prep_kernel, {}),
+        "plan": (C.mega_plan_kernel, {}),
+        "finish": (C.mega_finish_kernel, {}),
     }
-    for name, make in launches.items():
-        def run(make=make):
-            launch = make()
-            _preload_compiled(launch, *_dummy_args(launch))
-        yield name, run
+    for name, (kern, key) in kernels.items():
+        yield name, lambda kern=kern, key=key: kern.preload(**key)
 
 
 def _items(kind, args, tokens):

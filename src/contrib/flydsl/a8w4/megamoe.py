@@ -24,7 +24,6 @@ are FlyDSL (``kernels/ep_mega.py``, ``kernels/ep_mega_comm.py``).
 import torch
 
 from .kernels._act import situ_args
-from .kernels._launch import _run_compiled
 from .kernels._protocol import ARRIVED, BLOCK_M, E_LOCAL, NPES, QUEUES, ROW_BITS, SCHED_EXPECTED
 from .kernels import ep_mega as K
 from .kernels import ep_mega_comm as C
@@ -102,11 +101,11 @@ class MegaMoeEpA8W4:
         # every call on its own weight copy, experiments/log_20261115.md)
         kw = dict(H=H, I=I, TOPK=topk, token_shift=self.token_shift, producers=producers,
                   lag=lag, ACT=act)
-        self.launch = K.compile_ep_mega(**kw)
-        self.launch_big = K.compile_ep_mega(**kw, BCM1=0, BCM2=1)
+        self.launch = K.ep_mega_kernel.get(**kw)
+        self.launch_big = K.ep_mega_kernel.get(**kw, BCM1=0, BCM2=1)
         self.big_tokens = BLOCK_M * E_LOCAL // topk
-        self.quant_k, self.prep_k = C.compile_quant(H), C.compile_prep()
-        self.plan_k, self.finish_k = C.compile_plan(), C.compile_finish()
+        self.quant_k, self.prep_k = C.mega_quant_kernel.get(H=H), C.mega_prep_kernel.get()
+        self.plan_k, self.finish_k = C.mega_plan_kernel.get(), C.mega_finish_kernel.get()
         self.epoch = 0
 
     def __call__(self, x, topk_ids, topk_weights, x_scale=None, marks=None):
@@ -127,7 +126,6 @@ class MegaMoeEpA8W4:
         assert topk_ids.dtype == torch.int32 and topk_weights.dtype == torch.float32
         topk_ids, topk_weights = topk_ids.contiguous(), topk_weights.contiguous()
         tab = self.tables
-        stream = torch.cuda.current_stream()
         self.epoch += 1
         routes = T * self.topk
         quant = x_scale is None
@@ -138,38 +136,25 @@ class MegaMoeEpA8W4:
             x8, xs = x.contiguous().view(torch.uint8), x_scale.contiguous()
         if T:
             waves = T * (H // 512)
-            _run_compiled(self.quant_k, x.data_ptr() if quant else 0, x8.data_ptr(),
-                          xs.data_ptr(), self.out.data_ptr(), T, int(quant), -(-waves // 4),
-                          stream)
+            self.quant_k(x if quant else None, x8, xs, self.out, T, int(quant), -(-waves // 4))
         mark("quant")
-        _run_compiled(self.prep_k, topk_ids.data_ptr(), self.route_idx.data_ptr(),
-                      self.ws.data_ptr(), tab["ws"].data_ptr(), self.num_valid.data_ptr(),
-                      self.status.data_ptr(), self.sched.data_ptr(), self.plan.data_ptr(),
-                      routes, self.rank, self.epoch, self.s_cap, stream)
+        self.prep_k(topk_ids, self.route_idx, self.ws, tab["ws"], self.num_valid, self.status,
+                    self.sched, self.plan, routes, self.rank, self.epoch, self.s_cap)
         mark("prep")
-        _run_compiled(self.plan_k, topk_ids.data_ptr(), self.route_idx.data_ptr(),
-                      self.plan.data_ptr(), self.send_route.data_ptr(),
-                      self.send_info.data_ptr(), self.down_ids.data_ptr(),
-                      self.expert_ids.data_ptr(), self.sched.data_ptr(), routes, self.rank,
-                      self.s_cap, self.slices, stream)
+        self.plan_k(topk_ids, self.route_idx, self.plan, self.send_route, self.send_info,
+                    self.down_ids, self.expert_ids, self.sched, routes, self.rank, self.s_cap,
+                    self.slices)
         mark("plan")
         W = self.W
-        _run_compiled(
-            self.launch_big if T >= self.big_tokens else self.launch,
-            x8.data_ptr(), xs.data_ptr(), topk_weights.data_ptr(),
-            self.send_route.data_ptr(), self.send_info.data_ptr(), tab["recv_a"].data_ptr(),
-            tab["recv_scale"].data_ptr(), tab["down_ids"].data_ptr(), tab["recv_w"].data_ptr(),
-            tab["ws"].data_ptr(), tab["out"].data_ptr(), self.recv_a.data_ptr(),
-            self.recv_scale.data_ptr(), self.down_ids.data_ptr(), self.recv_w.data_ptr(),
-            self.ws.data_ptr(), W["w1"].data_ptr(), W["w1_scale"].data_ptr(),
-            W["w1_exp"].data_ptr(), W["w2"].data_ptr(), W["w2_scale"].data_ptr(),
-            W["w2_exp"].data_ptr(), self.a2.data_ptr(), self.a2_scale.data_ptr(),
-            self.expert_ids.data_ptr(), self.num_valid.data_ptr(), self.sched.data_ptr(),
-            routes, T, self.rank, self.nblk, *self.situ, self.grid,
-            stream)
+        mega = self.launch_big if T >= self.big_tokens else self.launch
+        mega(x8, xs, topk_weights, self.send_route, self.send_info, tab["recv_a"],
+             tab["recv_scale"], tab["down_ids"], tab["recv_w"], tab["ws"], tab["out"],
+             self.recv_a, self.recv_scale, self.down_ids, self.recv_w, self.ws, W["w1"],
+             W["w1_scale"], W["w1_exp"], W["w2"], W["w2_scale"], W["w2_exp"], self.a2,
+             self.a2_scale, self.expert_ids, self.num_valid, self.sched, routes, T, self.rank,
+             self.nblk, *self.situ, self.grid)
         mark("mega")
-        _run_compiled(self.finish_k, self.ws.data_ptr(), tab["ws"].data_ptr(), self.rank,
-                      self.epoch, stream)
+        self.finish_k(self.ws, tab["ws"], self.rank, self.epoch)
         mark("finish")
         return self.out[:T]
 

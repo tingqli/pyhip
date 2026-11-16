@@ -33,8 +33,6 @@ A task only waits for producers (which never wait) or for lower tickets of its q
 co-residency.
 """
 
-import functools
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
@@ -42,6 +40,8 @@ from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
+
+from pyhip.contrib.flydsl.host_launch import flydsl_kernel
 
 from ._act import gate_up_act, situ_params
 from ._cvt import _channel_factor, _fp8x4_pack
@@ -95,10 +95,10 @@ def _inv_l1():
     llvm.inline_asm(None, [], "buffer_inv sc0", "", has_side_effects=True)
 
 
-@functools.cache
-def compile_ep_mega(*, H, I, TOPK, token_shift, producers=16, lag=2, ROWV=(32, 64, 128),
-                    NI=128, NO=256, NW=8, PF=2, ACT="silu", BCM1=2, BCM2=2):
-    """Launcher of the mega kernel for (H, I, top-k); ``token_shift``: bits of the source
+@flydsl_kernel
+def ep_mega_kernel(*, H, I, TOPK, token_shift, producers=16, lag=2, ROWV=(32, 64, 128),
+                   NI=128, NO=256, NW=8, PF=2, ACT="silu", BCM1=2, BCM2=2):
+    """The mega kernel for (H, I, top-k); ``token_shift``: bits of the source
     token in a row's down id (max tokens per rank <= 1 << token_shift). ``BCM1`` /
     ``BCM2``: gemm1 / gemm2 W load cache modifier (2 = nt)."""
     assert ACT in ("silu", "situv2"), ACT

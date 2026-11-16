@@ -19,14 +19,14 @@ block b at SCHED_EXPECTED + s_cap / BLOCK_M + b. ``plan`` (local, int32): ep_pre
 ep_plan tables (PLAN_*), incl. a copy of the count matrix.
 """
 
-import functools
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
+
+from pyhip.contrib.flydsl.host_launch import flydsl_kernel
 
 from ._atomic import _latomic_add
 from ._cvt import _fp8x4_pack
@@ -104,8 +104,8 @@ def _scan(v, lane, seg):
 # =============================================================================
 
 
-@functools.cache
-def compile_quant(H):
+@flydsl_kernel
+def mega_quant_kernel(*, H):
     """x bf16 [T, H] -> x8 fp8 [T, H] + xs f32 [T, H / 128] (one scale per (token, 128
     columns): amax / 240, 1 for an all-zero group), and out [T, H] bf16 (the combine
     target) zeroed; quant == 0: only the zeroing. One wave per (token, 512 columns): a
@@ -162,8 +162,8 @@ def compile_quant(H):
 # =============================================================================
 
 
-@functools.cache
-def compile_prep():
+@flydsl_kernel
+def mega_prep_kernel():
     """route_idx [T*TOPK]: rank of each route among this rank's routes to its global
     expert. Writes this rank's count row to every rank, waits for all rows, and fills
     ``plan``, num_valid [1] (rows this rank receives, capped at s_cap) and status[1] (rows
@@ -286,8 +286,8 @@ def compile_prep():
 # =============================================================================
 
 
-@functools.cache
-def compile_plan():
+@flydsl_kernel
+def mega_plan_kernel():
     """send_route / send_info [T*TOPK]: workgroup j sorts routes [j S, (j + 1) S) (S =
     ceil(routes / grid)) by when the destination's mega-kernel queues need them (block
     position in the queue) into the same range; the producer wave j sends that range in
@@ -403,8 +403,8 @@ def compile_plan():
 # =============================================================================
 
 
-@functools.cache
-def compile_finish():
+@flydsl_kernel
+def mega_finish_kernel():
     """After the mega kernel (same stream): tell every rank this rank's remote adds are
     done, then wait for all ranks."""
 
