@@ -91,11 +91,8 @@ def tp_gemm1_kernel(
     [tokens], ``w`` mxfp4 [E, 2*inter, K/2] (standard preshuffle), ``w_scale`` e8m0
     (shuffled), ``w_exp`` int32 [E, 2*inter] (``channel_exponents``),
     ``sorted_expert_ids``, ``num_valid_ids``, ``sorted_ids``, ``out`` (the q8
-    plane, below), then ``tokens``, three unused scalars (``tbl``, ``rank``,
-    ``epoch``), ``rows``, the five SiTUv2 scalars (``situ_args``), ``grid`` and the
-    stream. The unused scalars (and the kernel's ``i32_tiles``) only keep the
-    kernarg layout, and so the ISA, of the tuned build; they go with the host-launch
-    rewrite.
+    plane, below), then ``tokens``, ``rows``, the five SiTUv2 scalars
+    (``situ_args``), ``grid`` and the stream.
 
     Nothing batch-size dependent is baked in: ``rows`` (rows of the q8 output
     plane) is a launch arg, so one binary serves every token count.
@@ -566,11 +563,7 @@ def tp_gemm1_kernel(
         arg_mind,
         arg_out,
         i32_ntok,
-        arg_tbl,
-        i32_rank,
-        i32_epoch,
         i32_rows,
-        i32_tiles,
         f32_situ_beta,
         f32_situ_beta_rcp,
         f32_situ_linbeta,
@@ -645,11 +638,7 @@ def tp_gemm1_kernel(
         arg_mind: fx.Int64,
         arg_out: fx.Int64,
         i32_ntok: fx.Int32,
-        arg_tbl: fx.Int64,  # unused (kernarg layout of the tuned build)
-        i32_rank: fx.Int32,  # unused
-        i32_epoch: fx.Int32,  # unused
         i32_rows: fx.Int32,
-        i32_tiles: fx.Int32,  # unused
         f32_situ_beta: fx.Float32,
         f32_situ_beta_rcp: fx.Float32,
         f32_situ_linbeta: fx.Float32,
@@ -667,11 +656,7 @@ def tp_gemm1_kernel(
             arg_mind,
             arg_out,
             i32_ntok,
-            arg_tbl,
-            i32_rank,
-            i32_epoch,
             i32_rows,
-            i32_tiles,
             f32_situ_beta,
             f32_situ_beta_rcp,
             f32_situ_linbeta,
@@ -691,9 +676,6 @@ def tp_gemm1_kernel(
         arg_mind: fx.Int64,
         arg_out: fx.Int64,
         i32_ntok: fx.Int32,
-        arg_tbl: fx.Int64,
-        i32_rank: fx.Int32,
-        i32_epoch: fx.Int32,
         i32_rows: fx.Int32,
         f32_situ_beta: fx.Float32,
         f32_situ_beta_rcp: fx.Float32,
@@ -714,11 +696,7 @@ def tp_gemm1_kernel(
             arg_mind,
             arg_out,
             i32_ntok,
-            arg_tbl,
-            i32_rank,
-            i32_epoch,
             i32_rows,
-            i32_grid,  # i32_tiles (unused)
             f32_situ_beta,
             f32_situ_beta_rcp,
             f32_situ_linbeta,
@@ -777,9 +755,6 @@ def a8w4_gemm1(
         sorted_ids,
         out,
         tokens,
-        0,  # tbl, rank, epoch: unused kernel args
-        0,
-        0,
         rows,
         *situ_args(situ_beta, situ_linear_beta, swiglu_limit),
         grid,

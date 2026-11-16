@@ -521,8 +521,7 @@ def tp_fmoe_kernel(*, D_HIDDEN, D_INTER, NE, TOPK=8, b_cache_mod=2,
 
     @flyc.jit
     def _entry(arg_x, arg_xs, arg_w1, arg_ws1, arg_exp1, arg_w2, arg_ws2, arg_eids,
-               arg_cumsum, arg_stids, arg_sw, arg_out, i32_M, arg_dbg, f_b, f_br, f_lb, f_lbr,
-               f_lim):
+               arg_cumsum, arg_stids, arg_sw, arg_out, i32_M, f_b, f_br, f_lb, f_lbr, f_lim):
         if const_expr(act == "situv2"):
             situ = situ_params(fx.Float32(f_b), fx.Float32(f_br), fx.Float32(f_lb),
                                fx.Float32(f_lbr), fx.Float32(f_lim))
@@ -550,24 +549,20 @@ def tp_fmoe_kernel(*, D_HIDDEN, D_INTER, NE, TOPK=8, b_cache_mod=2,
     def kernel(arg_x: fx.Int64, arg_xs: fx.Int64, arg_w1: fx.Int64, arg_ws1: fx.Int64,
                arg_exp1: fx.Int64, arg_w2: fx.Int64, arg_ws2: fx.Int64, arg_eids: fx.Int64,
                arg_cumsum: fx.Int64, arg_stids: fx.Int64, arg_sw: fx.Int64,
-               arg_out: fx.Int64, i32_M: fx.Int32,
-               arg_dbg: fx.Int64,  # unused (kernarg layout of the tuned build)
-               f_b: fx.Float32,
-               f_br: fx.Float32, f_lb: fx.Float32, f_lbr: fx.Float32, f_lim: fx.Float32):
+               arg_out: fx.Int64, i32_M: fx.Int32, f_b: fx.Float32, f_br: fx.Float32,
+               f_lb: fx.Float32, f_lbr: fx.Float32, f_lim: fx.Float32):
         _entry(arg_x, arg_xs, arg_w1, arg_ws1, arg_exp1, arg_w2, arg_ws2, arg_eids,
-               arg_cumsum, arg_stids, arg_sw, arg_out, i32_M, arg_dbg, f_b, f_br, f_lb, f_lbr,
-               f_lim)
+               arg_cumsum, arg_stids, arg_sw, arg_out, i32_M, f_b, f_br, f_lb, f_lbr, f_lim)
 
     @flyc.jit
     def launch(arg_x: fx.Int64, arg_xs: fx.Int64, arg_w1: fx.Int64, arg_ws1: fx.Int64,
                arg_exp1: fx.Int64, arg_w2: fx.Int64, arg_ws2: fx.Int64, arg_eids: fx.Int64,
                arg_cumsum: fx.Int64, arg_stids: fx.Int64, arg_sw: fx.Int64,
-               arg_out: fx.Int64, i32_M: fx.Int32, arg_dbg: fx.Int64, f_b: fx.Float32,
-               f_br: fx.Float32, f_lb: fx.Float32, f_lbr: fx.Float32, f_lim: fx.Float32,
-               i32_grid: fx.Int32, stream: fx.Stream):
+               arg_out: fx.Int64, i32_M: fx.Int32, f_b: fx.Float32, f_br: fx.Float32,
+               f_lb: fx.Float32, f_lbr: fx.Float32, f_lim: fx.Float32, i32_grid: fx.Int32,
+               stream: fx.Stream):
         kernel(arg_x, arg_xs, arg_w1, arg_ws1, arg_exp1, arg_w2, arg_ws2, arg_eids,
-               arg_cumsum, arg_stids, arg_sw, arg_out, i32_M, arg_dbg, f_b, f_br, f_lb, f_lbr,
-               f_lim,
+               arg_cumsum, arg_stids, arg_sw, arg_out, i32_M, f_b, f_br, f_lb, f_lbr, f_lim,
                value_attrs={"rocdl.waves_per_eu": waves_per_eu},
                ).launch(grid=(fx.Int64(i32_grid), 1, 1), block=(256, 1, 1), stream=stream)
 
@@ -588,9 +583,7 @@ def a8w4_fmoe_bm64(x_fp8, x_scale, weights, sorted_ids, sorted_weights,
     tp_fmoe_kernel(
         x_fp8, x_scale, weights["w1"], weights["w1_scale"], weights["w1_exp"], weights["w2"],
         weights["w2_scale"], sorted_expert_ids, num_valid_ids, sorted_ids, sorted_weights,
-        out, tokens,
-        0,  # dbg: unused kernel arg
-        *situ_args(situ_beta, situ_linear_beta, swiglu_limit),
+        out, tokens, *situ_args(situ_beta, situ_linear_beta, swiglu_limit),
         sorted_expert_ids.numel() * ksplit,
         D_HIDDEN=model_dim, D_INTER=weights["w1"].shape[1] // 2, NE=E, TOPK=topk,
         b_cache_mod=b_cache_mod, waves_per_eu=waves_per_eu, ksplit=ksplit, act=act)

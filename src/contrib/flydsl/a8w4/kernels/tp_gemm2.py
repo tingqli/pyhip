@@ -246,9 +246,7 @@ def tp_gemm2_kernel(
     [sorted_size, K/128], ``w`` fd2 mxfp4 [E, N, K/2], ``w_scale`` (fd2 scales +
     max codes), ``sorted_expert_ids``, ``num_valid_ids``, ``sorted_ids``,
     ``sorted_weights``, ``out`` bf16 [tokens, N] (pre-zeroed, atomically
-    accumulated), then ``tokens``, four unused scalars (``dbg``, ``tbl``,
-    ``rank``, ``epoch``: they only keep the kernarg layout, and so the ISA, of the
-    tuned build; they go with the host-launch rewrite), ``grid`` and the stream.
+    accumulated), then ``tokens``, ``grid`` and the stream.
     """
     K = D_INTER
     N_OUT = D_HIDDEN
@@ -783,10 +781,6 @@ def tp_gemm2_kernel(
         arg_sweights,
         arg_out,
         i32_M,
-        arg_dbg,
-        arg_tbl,
-        i32_rank,
-        i32_epoch,
     ):
         lds_ptr = fx.SharedAllocator().allocate(SharedStorage).peek().raw.ptr
         tx = fx.Int32(gpu.thread_id("x"))
@@ -843,10 +837,6 @@ def tp_gemm2_kernel(
         arg_sweights: fx.Int64,
         arg_out: fx.Int64,
         i32_M: fx.Int32,
-        arg_dbg: fx.Int64,  # unused (kernarg layout of the tuned build)
-        arg_tbl: fx.Int64,  # unused
-        i32_rank: fx.Int32,  # unused
-        i32_epoch: fx.Int32,  # unused
     ):
         _entry(
             arg_a,
@@ -859,10 +849,6 @@ def tp_gemm2_kernel(
             arg_sweights,
             arg_out,
             i32_M,
-            arg_dbg,
-            arg_tbl,
-            i32_rank,
-            i32_epoch,
         )
 
     @flyc.jit
@@ -877,10 +863,6 @@ def tp_gemm2_kernel(
         arg_sweights: fx.Int64,
         arg_out: fx.Int64,
         i32_M: fx.Int32,
-        arg_dbg: fx.Int64,
-        arg_tbl: fx.Int64,
-        i32_rank: fx.Int32,
-        i32_epoch: fx.Int32,
         i32_grid: fx.Int32,
         stream: fx.Stream,
     ):
@@ -895,10 +877,6 @@ def tp_gemm2_kernel(
             arg_sweights,
             arg_out,
             i32_M,
-            arg_dbg,
-            arg_tbl,
-            i32_rank,
-            i32_epoch,
             value_attrs=(
                 {"rocdl.waves_per_eu": waves_per_eu} if waves_per_eu else None
             ),
@@ -947,10 +925,6 @@ def a8w4_gemm2(
         sorted_weights,
         out,
         tokens,
-        0,  # dbg, tbl, rank, epoch: unused kernel args
-        0,
-        0,
-        0,
         grid,
         D_HIDDEN=model_dim,
         D_INTER=inter_dim,
