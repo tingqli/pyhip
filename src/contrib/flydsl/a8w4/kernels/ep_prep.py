@@ -44,7 +44,7 @@ from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
 from ._atomic import _gatomic_add, _gatomic_xchg, _gload_sys, _latomic_add
-from ._cvt import _pack_activation
+from ._cvt import _fp8x4_pack
 from ._hw import NUM_CU, NUM_XCD
 from ._launch import _run_compiled
 from ._mem import (
@@ -134,8 +134,8 @@ def compile_ep_prep(*, H, TOPK, EL, BM, EPT, QUANT, MULTI, MDYN=False):
             _store_scale(xs, t, s, lane)
             for j in range_constexpr(CH):
                 v = vals[j]
-                p0 = _pack_activation(v[0] * inv, v[1] * inv, v[2] * inv, v[3] * inv)
-                p1 = _pack_activation(v[4] * inv, v[5] * inv, v[6] * inv, v[7] * inv)
+                p0 = _fp8x4_pack(v[0] * inv, v[1] * inv, v[2] * inv, v[3] * inv)
+                p1 = _fp8x4_pack(v[4] * inv, v[5] * inv, v[6] * inv, v[7] * inv)
                 buffer_store(
                     Vec.from_elements([p0, p1], fx.Int32), rs_x8,
                     t * fx.Int32(H // 4) + (fx.Int32(j * 64) + lane) * fx.Int32(2))

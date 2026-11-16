@@ -37,7 +37,7 @@ from flydsl.expr.typing import Vector as Vec
 
 from ._act import gate_up_act, situ_args, situ_params
 from ._atomic import _atomic_bf16x4, _gatomic_add, _gatomic_xchg, _gload_sys
-from ._cvt import _bf16x2_rne, _channel_factor, _pack_activation
+from ._cvt import _bf16x2_rne, _channel_factor, _fp8x4_pack
 from ._hw import CM_SYS, NUM_CU
 from ._kloop import _dispatch_rows, _make_core
 from ._launch import _run_compiled
@@ -295,8 +295,8 @@ def compile_ep_small(*, H, I, EL, TOPK, BM, NW, C1, C2, PF, ROWV, MAXM, SCH=3,
             buffer_store(s, rs_xs, t, mask=lane == fx.Int32(0), cache_modifier=CM_SYS)
             for j in range_constexpr(CHL):
                 v = vals[j]
-                p0 = _pack_activation(v[0] * inv, v[1] * inv, v[2] * inv, v[3] * inv)
-                p1 = _pack_activation(v[4] * inv, v[5] * inv, v[6] * inv, v[7] * inv)
+                p0 = _fp8x4_pack(v[0] * inv, v[1] * inv, v[2] * inv, v[3] * inv)
+                p1 = _fp8x4_pack(v[4] * inv, v[5] * inv, v[6] * inv, v[7] * inv)
                 buffer_store(
                     Vec.from_elements([p0, p1], fx.Int32), rs_x8,
                     t * fx.Int32(H // 4) + (fx.Int32(j * 64) + lane) * fx.Int32(2),

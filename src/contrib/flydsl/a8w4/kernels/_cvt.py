@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-# _pack_activation is from aiter 7cd70aca8 aiter/ops/flydsl/kernels/moe_2stage_a16wmix/a8w4.py.
 """Number format conversions on registers.
 
 f32 -> fp8 (FNUZ) / bf16 packing for the epilogues, and the fd2 decode of the mxfp4
@@ -14,20 +13,15 @@ from flydsl.expr.typing import T
 from ._mem import _raw
 
 
-def _pack_activation(a, b, c, d):
-    """Four f32 -> four fp8 (FNUZ) in one i32: saturate to +-240, and map a rounded-to-zero
-    magnitude to +0 (FNUZ has no -0: 0x80 is NaN)."""
-    values = [fx.max(fx.min(v, 240.0), -240.0) for v in (a, b, c, d)]
-    lo = rocdl.cvt_pk_fp8_f32(T.i32, values[0], values[1], fx.Int32(0), False)
-    packed = fx.Uint32(rocdl.cvt_pk_fp8_f32(T.i32, values[2], values[3], lo, True))
-    mag = packed & fx.Uint32(0x7F7F7F7F)
-    zero = (~(mag + fx.Uint32(0x7F7F7F7F))) & fx.Uint32(0x80808080)
-    return (packed & ~zero).bitcast(fx.Int32)
-
-
 def _fp8x4_pack(a, b, c, d):
-    """4 finite f32 -> 4 fp8 FNUZ in one i32 (same result as ``_pack_activation``:
-    clamp to +-240, RNE, no negative zero), with NaN-free min/max."""
+    """Four finite f32 -> four fp8 (FNUZ) in one i32: saturate to +-240, round to nearest
+    even, and map a rounded-to-zero magnitude to +0 (FNUZ has no -0: 0x80 is NaN).
+
+    Inputs are assumed NaN-free (activations and weights never hold NaN in normal use), so
+    min / max are minnumf / maxnumf: one v_min / v_max each. aiter's ``_pack_activation``
+    (7cd70aca8, moe_2stage_a16wmix/a8w4.py) used the NaN-propagating minimumf / maximumf,
+    which gives the same bits on finite inputs but cost an ep_gemm1 bm128 kernel 324 of its
+    5919 instructions."""
     v = [fx.maxnumf(fx.Float32(fx.arith.minnumf(_raw(fx.Float32(x)), _raw(fx.Float32(240.0)))),
                     fx.Float32(-240.0))
          for x in (a, b, c, d)]

@@ -19,7 +19,7 @@ import flydsl.expr as fx
 import torch
 from flydsl.expr import const_expr, gpu, range_constexpr
 
-from ._cvt import _pack_activation
+from ._cvt import _fp8x4_pack
 from ._launch import _run_compiled
 from ._mem import _pointer
 
@@ -57,7 +57,7 @@ def _compile_row_quant(cols, dynamic_rows):
                 fx.ptr_store(s, fx.add_offset(_pointer(scale, fx.Float32, 4), row))
             for j in range_constexpr(chunks):
                 v = values[j] * inv
-                packed = _pack_activation(v[0], v[1], v[2], v[3])
+                packed = _fp8x4_pack(v[0], v[1], v[2], v[3])
                 offset = fx.Int64(row) * (cols // 4) + lane + j * 64
                 fx.ptr_store(packed, fx.add_offset(_pointer(output, fx.Int32, 4), offset))
 

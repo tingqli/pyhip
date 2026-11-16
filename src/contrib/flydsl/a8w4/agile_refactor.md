@@ -53,7 +53,7 @@
 | I1b | 删除 TP kernel 里调用方不用的模式取值（fast_dec 0/1、gemm1 的 bf16 epilogue 等，规则见 3.4 节） | 用户在 I1 review 时决定 | 同上 |
 | I2 | 删除 EP kernel 里走不到的选项（`TL` 等）和 a16w4 路径，包括 bench 的 `adt=bf16` 覆盖 | Q4，Q11 | 同上 |
 | I3 | 精简 `_vendor`：没人读的环境变量、类、函数、参数直接删；剩下的迁到 `kernels/` 下按主题分的共享模块；删除 `_vendor/`（规则见 3.2 节） | 原 I3 + 原 I4 前半；用户 2026-11-16 | ISA IDENTICAL；API 测试；单卡 pytest |
-| I4 | kernel 文件之间不再互相 import（共享的 device helper 搬进 I3 建的模块，按名字导入；现在的 `G1.x`、`EP.x` 这类模块属性调用不进 FlyDSL 缓存 key）；`_fp4x8_to_fp8x8`、`_fp8x4_pack` / `_pack_activation` 只留一份；硬件常量集中定义 | Q12，Q14，Phase 2 | ISA IDENTICAL |
+| I4 | kernel 文件之间不再互相 import（共享的 device helper 搬进 I3 建的模块，按名字导入；现在的 `G1.x`、`EP.x` 这类模块属性调用不进 FlyDSL 缓存 key）；`_fp4x8_to_fp8x8`、`_fp8x4_pack` / `_pack_activation` 只留一份；硬件常量集中定义 | Q12，Q14，Phase 2 | ISA IDENTICAL（第 4 步除外：有意改动，输出逐位比较 + 性能 A/B） |
 | I5 | host 封装改用 `@flydsl_kernel`，替代 `_run_compiled` 和 `functools.cache`；每个 kernel 文件一个公开入口；同时删掉 I1 留下的无用 kernel 参数（标了 `# unused` 的那些）。到时按文件再拆成几个迭代 | Q13，Phase 3 | ISA IDENTICAL（kernarg 偏移变化要逐个解释）；pytest |
 | I6 | 新建 `workspace.py`，统一管理每张卡一份的缓冲区 | Q19 | ISA IDENTICAL；pytest |
 
@@ -95,7 +95,7 @@
 **范围**：只动 device 代码。host 端的组合（`ep_gemm.ep_moe` 调 `ep_prep`）留给 I5。规则：
 
 - 被两个以上 kernel 文件用到的 helper 和常量，搬进共享模块，按名字导入（这样也进缓存 key）；只有一个文件用的留在原处。
-- 函数体不改，名字不改；逐字节相同的重复定义只留一份。实现不同的（`_fp8x4_pack` 和 `_pack_activation`）先比 ISA，相同才合并。
+- 函数体不改，名字不改；逐字节相同的重复定义只留一份。实现不同的（`_fp8x4_pack` 和 `_pack_activation`）先比 ISA，相同才合并；不同就问用户（结果见第 4 步）。
 - 顺手删掉没用的模块级名字（`ep_gemm`、`ep_small` 的 `HERE`）。
 
 **目标布局**（新模块都在 `kernels/`）：
@@ -116,9 +116,15 @@
 - [x] 第 1 步：TP 的重复 helper → `_cvt`、`_mma`；`situ_args` → `_act`。改 `tp_gemm1/2`、`tp_fmoe(_q)`、`ep_gemm`、`ep_mega`、`ep_small`、`megamoe.py`。
 - [x] 第 2 步：`_hw`、`_atomic`、`_mem` 的新增；改 `ep_prep`、`tp_prep`、`ep_small`、`tp_fmoe(_q)`、`ep_mega(_comm)`、`tp_gemm1/2`（`NXCD`）。`_getreg` 只有 `tp_fmoe_q` 用，搬到那里；`CM_COH` / `_CM_SYS` 合成 `CM_SYS`，`ep_mega` 的 `P2P_AUX` / `WT_AUX` 和 `tp_fmoe_q` 的 `CM_SC1` 改用 `CM_*` 位；`ep_prep` 的 `NX`、`ep_gemm` 的 XCD 轮转里的字面量 8 改成 `NUM_XCD`；`experiments/20261114_tp_prep` 的 3 个副本跟着改 import。`prof.py` 的 65536 不改（它不导入 flydsl）。
 - [x] 第 3 步：`_kloop`、`_protocol`；`ep_mega`、`ep_small`、`ep_mega_comm` 不再 import 别的 kernel 文件，`ep_gemm` 只剩 host 端的 `ep_prep`。`megamoe.py` 的 `K.NPES` 这类常量改成从 `_protocol` 按名字导入；`experiments/20261114_splitk_gemm1/ep_gemm_sk.py` 跟着改 import。改写工具误报过两次（元组赋值里定义的名字、从非 kernel 模块导入的同名常量），已修。
-- [ ] 第 4 步：比较 `_fp8x4_pack` 和 `_pack_activation` 的 ISA，相同就合并。
+- [x] 第 4 步：`_fp8x4_pack` 和 `_pack_activation` 的 ISA 不同（后者用传播 NaN 的 `minimumf` / `maximumf`，前者用 `minnumf` / `maxnumf`），不能无损合并。用户定的前提：正常使用中激活和权重不含 NaN。据此全部改用 `_fp8x4_pack`，删掉 `_pack_activation`。这是本迭代唯一有意改变 ISA 的一步，验证如下：
+  - ISA：只有原来调用 `_pack_activation` 的 kernel 变了，指令数都减少，VGPR 和 spill 不变或更少。按族：`tp_prep` 266 个全变，−22% 到 −27%；`ep_prep` −12% 到 −19%；TP 的 gemm1 −4% 到 −8%；`fmoe` 约 −4%；`ep_small` −6.5%；`ep_gemm1` 的非 tr epilogue −3% 到 −4%；`row_quant` −33%。megamoe、gemm2、`ep_gemm1` 的 tr epilogue 不变。
+  - 输出逐位相同：topk 1 下用 HEAD 的 worktree 和改后的代码各跑一遍，覆盖 tp8 / tp4 / ep8 × silu / situv2 的全部族，以及 dyn 的 bf16 / fp8g128 / fp8tok。380 个确定性输出全部相同。另有 43 个没比：split-K 原子累加本身不确定的 `tp1k ks4/ks8`，以及已知 LDS 超限的 `l128_v1` fp8g128。
+  - NaN 端到端不变：prep 和 epilogue 的 amax 用 `fx.max`（传播 NaN），组 scale 照样是 NaN，反量化后仍是 NaN，只是 fp8 字节从 0 变成 240。dyn 测试的无效行填 NaN，pytest 通过。
+  - 性能（coldrot，同进程交替，HEAD 为 base）：tp8、tp4、ep8 共 20 个点，加 tp8 situv2 的 3 个点，没有变慢的。tp8 和 tp4 在 64–256 token、tp8 situv2 在 16 和 1024 token 超出噪声，快 0.4%–1.6%，其余在噪声内。
+  - API 测试 23 passed；单卡 pytest 94 passed、1 skipped。
+  - ISA 基线从这一步的提交起换成新快照（见 0.3 节）。
 - [ ] 文档：README 目录结构；`agile_refactor.md`。
-- **验收**：ISA IDENTICAL；API 测试；单卡 pytest；`grep "from \. import\|from \.[a-z]" kernels/*.py` 只剩共享模块（`_` 开头）和 `ep_gemm` 的 `ep_prep`。
+- **验收**：ISA IDENTICAL（第 4 步除外）；API 测试；单卡 pytest；`grep "from \. import\|from \.[a-z]" kernels/*.py` 只剩共享模块（`_` 开头）和 `ep_gemm` 的 `ep_prep`。
 
 ### 3.2 I3：精简 `_vendor`，迁到 `kernels/` 的共享模块（已完成）
 

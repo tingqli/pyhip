@@ -38,7 +38,7 @@ from ._cvt import (
     _channel_factor,
     _fp4x8_to_fp8x8_fast,
     _fp8_lut_predelta,
-    _pack_activation,
+    _fp8x4_pack,
     _perm_u32,
     _rnu_hi,
 )
@@ -310,7 +310,7 @@ def compile_a8w4_fmoe_bm64q(*, D_HIDDEN, D_INTER, NE, TOPK=8, b_cache_mod=1, n_c
                     s = (amax == 0.0).select(fx.Float32(1.0), amax / 240.0)
                     inv = 1.0 / s
                     packed = Vec.from_elements(
-                        [_pack_activation(*[vals[4 * q + k] * inv for k in range(4)])
+                        [_fp8x4_pack(*[vals[4 * q + k] * inv for k in range(4)])
                          for q in range(4)], fx.Int32)
                     # row-major [64, 256] fp8: dword offset
                     dst = m_block * fx.Int32(A2_BYTES // 4) + row * fx.Int32(64) \

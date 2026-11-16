@@ -48,7 +48,7 @@ from flydsl.expr.typing import Vector as Vec
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../..")))
 from a8w4.kernels._atomic import _latomic_add  # noqa: E402
-from a8w4.kernels._cvt import _pack_activation  # noqa: E402
+from a8w4.kernels._cvt import _fp8x4_pack  # noqa: E402
 from a8w4.kernels._hw import NUM_CU  # noqa: E402
 from a8w4.kernels._launch import _run_compiled  # noqa: E402
 from a8w4.kernels._mem import (  # noqa: E402
@@ -134,8 +134,8 @@ def compile_tp_prep(*, H, TOPK, E, BM, EPT, HU, ZERO, SKIP=""):
             _store_scale(xs, t, s, lane)
             for j in range_constexpr(CH):
                 v = vals[j]
-                p0 = _pack_activation(v[0] * inv, v[1] * inv, v[2] * inv, v[3] * inv)
-                p1 = _pack_activation(v[4] * inv, v[5] * inv, v[6] * inv, v[7] * inv)
+                p0 = _fp8x4_pack(v[0] * inv, v[1] * inv, v[2] * inv, v[3] * inv)
+                p1 = _fp8x4_pack(v[4] * inv, v[5] * inv, v[6] * inv, v[7] * inv)
                 buffer_store(
                     Vec.from_elements([p0, p1], fx.Int32), rs_x8,
                     t * fx.Int32(H // 4) + (fx.Int32(j * 64) + lane) * fx.Int32(2))

@@ -43,7 +43,7 @@ from flydsl.expr.typing import Vector as Vec
 
 from ._act import gate_up_act, situ_args, situ_params
 from ._atomic import _atomic_bf16x4
-from ._cvt import _channel_factor, _fp8x4_pack, _pack_activation
+from ._cvt import _channel_factor, _fp8x4_pack
 from ._hw import LDS_BYTES_MAX, NUM_XCD, _opaque_tx
 from ._kloop import _dispatch_rows, _make_core
 from ._launch import _run_compiled
@@ -470,7 +470,7 @@ def compile_ep_gemm1(*, H, I, NE, BM, NI, ROWV, PF=2, bcm=2, wpe=None, NW=4, ARB
                 s = (amax == 0.0).select(fx.Float32(1.0), amax / 240.0)
                 inv = 1.0 / s
                 packed = Vec.from_elements(
-                    [_pack_activation(*[vals[4 * q + k] * inv for k in range(4)])
+                    [_fp8x4_pack(*[vals[4 * q + k] * inv for k in range(4)])
                      for q in range(4)], fx.Int32)
                 srow = bx_m + rit
                 buffer_store(
