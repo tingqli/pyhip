@@ -13,7 +13,7 @@
 
 ### 0.1 当前状态（每次停下来前更新）
 
-- **迭代**：I1、I1b、I2、I3、I4 已完成。I3 的范围是用户看过 I2 后改的（见 3.3 节）：`_vendor` 只留真正用到的代码，迁到 `kernels/` 下的共享模块，删掉 `_vendor/`。用户看过 I4 后决定先跳过 I4b（NaN 传播，1.1 节），做 I5（3.1 节），I5 进行中。
+- **迭代**：I1、I1b、I2、I3、I4 已完成。I3 的范围是用户看过 I2 后改的（见 3.3 节）：`_vendor` 只留真正用到的代码，迁到 `kernels/` 下的共享模块，删掉 `_vendor/`。用户看过 I4 后决定先跳过 I4b（NaN 传播，1.1 节），先做 I5（3.1 节）。I5 已完成，等用户 review；下一步候选是 I4b 或 I6。
 - **分支**：`/sgl-workspace/pyhip` 的 `refactor/a8w4`。
 - **已有提交**：
   - 迭代 0，安全网：`64ce77c`、`d17f502`（ISA 基线在这个提交上生成）、`4e256d9`。
@@ -23,6 +23,7 @@
   - I2：`892d7f8`（`TL`、`DBG`）、`87fd7c8`（a16w4）、`7dbb85e`（实验脚本），`aac9bcf`（文档）。
   - I3：`18f243f`（原地精简）、`cc44955`（迁到 `kernels/`，删除 `_vendor/`）、`bf95fe8`（文档）。
   - I4：`47bde29`（计划）、`6c8434c`、`4b9eb2f`、`5e5d9e3`、`e565657`（合并 fp8x4 pack）、`f9d0ca1`（`tp_fmoe` 的 `NUM_XCD`）、`f95a9e6`（文档）。
+  - I5：`97eb73e`（计划）、`d306c51`、`3067a2d`、`af9f077`、`89bf081`、`06d3875`（删 `kernels/_launch.py`）、`ff82c3d`（删无用 kernel 参数，有意改 ISA）。
 - **用户的文件**：未跟踪的 `refactory2.md` 属于用户，不要改，也不要提交。
 
 ### 0.2 工作方式
@@ -40,7 +41,7 @@
 ### 0.3 不变量（每个迭代都要守住）
 
 - **纯结构性的改动**（删除走不到的分支、搬文件、改名、换 host 封装）：`prof isa-diff` 对基线必须输出 `ISA IDENTICAL`。kernel 名字可以变。
-- **ISA 基线**：`/sgl-workspace/a8w4_refactor_state/isa_base` 从 I4 第 4 步起是 `e565657` 的快照（之前是 `d17f502` 的，留在同目录的 `isa_base_d17f502`）。基线丢了就按 `refactory.md` §0.4 重新生成，但 worktree 开在 `e565657`；以后有意改变 ISA 的提交，也要这样换基线并在这里记下。
+- **ISA 基线**：`/sgl-workspace/a8w4_refactor_state/isa_base` 从 I5 第 6 步起是 `ff82c3d` 的快照。更早的留在同目录：`isa_base_e565657`（I4 第 4 步到 I5 第 5 步）、`isa_base_d17f502`（I4 第 4 步之前）。基线丢了就按 `refactory.md` §0.4 重新生成，但 worktree 开在 `ff82c3d`；以后有意改变 ISA 的提交，也要这样换基线并在这里记下。
 - **中途不重新调优**：哪个改动需要重新调优，就说明它不是纯结构性的（Q6）。
 - **冻结的公开 API**：7 个函数和 `ref`（Q8、Q17），由 `tests/test_a8w4_api.py` 守护，不用 GPU，约 3 秒跑完。
 - **用 GPU 前**：先看 `rocm-smi --showuse`，再拿 `flock /tmp/gpu-N.lock`。卡被占用时停下来问用户（Q29）。
@@ -56,8 +57,8 @@
 | I2 | 删除 EP kernel 里走不到的选项（`TL` 等）和 a16w4 路径，包括 bench 的 `adt=bf16` 覆盖 | Q4，Q11 | 同上 |
 | I3 | 精简 `_vendor`：没人读的环境变量、类、函数、参数直接删；剩下的迁到 `kernels/` 下按主题分的共享模块；删除 `_vendor/`（规则见 3.3 节） | 原 I3 + 原 I4 前半；用户 2026-11-16 | ISA IDENTICAL；API 测试；单卡 pytest |
 | I4 | kernel 文件之间不再互相 import（共享的 device helper 搬进 I3 建的模块，按名字导入；现在的 `G1.x`、`EP.x` 这类模块属性调用不进 FlyDSL 缓存 key）；`_fp4x8_to_fp8x8`、`_fp8x4_pack` / `_pack_activation` 只留一份；硬件常量集中定义 | Q12，Q14，Phase 2 | ISA IDENTICAL（第 4 步除外：有意改动，输出逐位比较 + 性能 A/B） |
-| I4b | 量化的 amax 改成传播 NaN（PyTorch 要求算子尽量传播 NaN）。I4 第 4 步实测：输入 x 的一个元素是 NaN 时，ep3k 的 3 个 tr 配置（`m64`、`l128`、`l128c`）、`ep1k`，以及对应的 dyn 配置输出有限的错误值；ref 和其他配置是整行 NaN。原因是 gemm1→gemm2 的重量化用 `maxnumf` 求 amax，忽略了 NaN：`ep_gemm` 的 tr epilogue（约 376–396 行）、`_kloop.quant_chunk`（ep1k 的 gemm2 输入）。同样写法的还有 megamoe 的 `ep_mega` epilogue 和 `ep_mega_comm.compile_quant`（量化原始 x），多卡，测试脚本还没覆盖。改成 `fx.max`，pack 函数不用动 | 用户 2026-11-16 | 每个配置注入 NaN / ±Inf 后输出和 ref 一样整行 NaN、其他行不受影响（加进 pytest）；ISA 只在这几处变；性能 A/B；单卡 pytest |
-| I5 | host 封装改用 `@flydsl_kernel`，替代 `_run_compiled` 和 `functools.cache`；每个 kernel 文件一个公开入口；同时删掉 I1 留下的无用 kernel 参数（标了 `# unused` 的那些）。到时按文件再拆成几个迭代 | Q13，Phase 3 | ISA IDENTICAL（kernarg 偏移变化要逐个解释）；pytest |
+| I4b | 量化的 amax 改成传播 NaN（PyTorch 要求算子尽量传播 NaN）。I4 第 4 步实测：输入 x 的一个元素是 NaN 时，ep3k 的 3 个 tr 配置（`m64`、`l128`、`l128c`）、`ep1k`，以及对应的 dyn 配置输出有限的错误值；ref 和其他配置是整行 NaN。原因是 gemm1→gemm2 的重量化用 `maxnumf` 求 amax，忽略了 NaN：`ep_gemm` 的 tr epilogue（约 376–396 行）、`_kloop.quant_chunk`（ep1k 的 gemm2 输入）。同样写法的还有 megamoe 的 `ep_mega` epilogue 和 `ep_mega_comm.mega_quant_kernel`（量化原始 x），多卡，测试脚本还没覆盖。改成 `fx.max`，pack 函数不用动 | 用户 2026-11-16 | 每个配置注入 NaN / ±Inf 后输出和 ref 一样整行 NaN、其他行不受影响（加进 pytest）；ISA 只在这几处变；性能 A/B；单卡 pytest |
+| I5 | host 封装改用 `@flydsl_kernel`，替代 `_run_compiled` 和 `functools.cache`；每个 kernel 文件一个公开入口；同时删掉 I1 留下的无用 kernel 参数（标了 `# unused` 的那些）。已完成，见 3.1 节 | Q13，Phase 3 | ISA IDENTICAL（kernarg 偏移变化要逐个解释）；pytest |
 | I6 | 新建 `workspace.py`，统一管理每张卡一份的缓冲区 | Q19 | ISA IDENTICAL；pytest |
 
 ### 1.2 中期：方向清楚，细节做到时再定
@@ -76,7 +77,7 @@
 - 一条命令尝试一个优化思路（refactory2 §3）：
   - 用 tune 和基线比较，先过精度门；
   - 结果好就更新调优表里相关的行，并在 `perf_log.md` 里加一行。
-- 降低 host 开销：现在每次调用约 75 µs。
+- 降低 host 开销：I5 后每次调用约 40–67 µs（I5 前 45–79 µs，见 3.1 节）。
 - 已知问题，只记录不处理：`ep3k l128_v1` 配合 fp8 每 128 列一个 scale 的输入时 LDS 超限，`supported()` 没有拒绝这种组合。
 
 ## 2. 删除规则（I1–I3 共用）
@@ -87,7 +88,7 @@
 
 ## 3. 当前迭代
 
-### 3.1 I5：host 封装改用 `@flydsl_kernel`（进行中）
+### 3.1 I5：host 封装改用 `@flydsl_kernel`（已完成）
 
 **现状**（I4 之后）：16 个编译函数用 `functools.cache` 缓存，返回 `@flyc.jit` launcher；op 函数用 `_run_compiled(launch, x.data_ptr(), ..., torch.cuda.current_stream())` 启动。
 
@@ -114,19 +115,48 @@
 - 默认值和 builder 的 keyword 默认值保持原样，不搬进 `heuristics`。省略某个 key 和显式传默认值会得到两个 variant，但它们是同一个二进制。
 - `channel_exp` 的 `rows` 仍在 key 里：它只在准备权重时调用，每个模型一个形状。改成运行时参数会改 ISA，不在本迭代做。
 - 常驻对象（megamoe）在 `__init__` 里用 `kern.get(**key)` 绑定一次，热路径直接调用。
-- `_run_compiled` 搬到 `experiments/_launch.py`，实验脚本只改 import；调用 `compile_x(...)` 的地方改成 `x_kernel.builder(...)`（用户 2026-11-16 定）。
+- `_run_compiled` 搬到 `experiments/_launch.py`，实验脚本只改 import；调用 `compile_x(...)` 的地方改成 `x_kernel.builder(...)`（用户 2026-11-16 定）。例外：`20261115_mega_bcm/sweep.py` 把结果赋给 `MegaMoeEpA8W4.launch`，而它现在存的是 specialization，所以改成 `ep_mega_kernel.get(...)`。
 - 无用的 kernel 参数（`tp_gemm1` 的 `tbl` / `rank` / `epoch` / `tiles`，`tp_gemm2` 的 `dbg` / `tbl` / `rank` / `epoch`，`tp_fmoe` 的 `dbg`）最后一步单独删。会改 kernarg 布局，ISA 的差异要逐个解释。
 
 **任务**（每步一个提交；每步都跑 ISA 快照、API 测试和单卡 pytest，并用 `PYHIP_FLYDSL_CHECK=1` 跑一次 pytest，检查参数顺序、dtype 和对齐）：
 
-- [ ] 第 1 步（试点）：`row_quant`、`channel_exp`。
-- [ ] 第 2 步：TP，即 `tp_prep`、`tp_gemm1`、`tp_gemm2`、`tp_fmoe`、`tp_fmoe_q`。
-- [ ] 第 3 步：EP，即 `ep_prep`、`ep_gemm`、`ep_small`。
-- [ ] 第 4 步：megamoe，即 `ep_mega`、`ep_mega_comm`、`megamoe.py`、`isa_snapshot.py`、`bench/dist.py`；多卡 pytest。
-- [ ] 第 5 步：删除 `kernels/_launch.py`；新建 `experiments/_launch.py`，改实验脚本的 import 和 `.builder(...)`。
-- [ ] 第 6 步：删无用的 kernel 参数，ISA 的差异逐个解释。
-- [ ] 文档：README、本文件。
-- **验收**：第 1–5 步 ISA IDENTICAL；第 6 步只有 kernarg 相关的差异；API 测试；单卡和多卡 pytest；`grep -rn "_run_compiled\|current_stream()\|functools.cache\|@cache" kernels/ megamoe.py` 没有结果。
+- [x] 第 1 步（试点）：`row_quant`、`channel_exp`。`d306c51`
+- [x] 第 2 步：TP，即 `tp_prep`、`tp_gemm1`、`tp_gemm2`、`tp_fmoe`、`tp_fmoe_q`。`3067a2d`
+- [x] 第 3 步：EP，即 `ep_prep`、`ep_gemm`、`ep_small`。`af9f077`。`ep_small` 的 builder 原来返回 `(launch, info)`，现在只返回 launcher；容量改由 builder 和 op 共用的 `_capacity()` 计算。
+- [x] 第 4 步：megamoe，即 `ep_mega`、`ep_mega_comm`、`megamoe.py`、`isa_snapshot.py`、`bench/dist.py`；多卡 pytest。`89bf081`。`isa_snapshot` 改用 `kern.preload(**key)`，删掉 `_dummy_args`；8 卡 mori ep8 / tp8 和 megamoe 通过，megamoe 在 `PYHIP_FLYDSL_CHECK=1` 下也通过。
+- [x] 第 5 步：删除 `kernels/_launch.py`；新建 `experiments/_launch.py`，改实验脚本的 import 和 `.builder(...)`。`06d3875`。实验脚本都能 import，`20261115_flydsl_cache_key/run_probe.py` 跑通、结论不变；`exp.py lint` 输出不变。
+- [x] 第 6 步：删无用的 kernel 参数，ISA 的差异逐个解释。`ff82c3d`，结果见下。
+- [x] 文档：README（文件表、复制到其他工程、加 kernel 的写法、9.5 节）、本文件。
+- **验收**：第 1–5 步 ISA IDENTICAL；第 6 步只有 kernarg 相关的差异；API 测试；单卡和多卡 pytest；`grep -rn "_run_compiled\|current_stream()\|functools.cache\|@cache" kernels/ megamoe.py` 没有结果（已满足）。
+
+**第 6 步的 ISA 差异**（177 个不同 ISA 里变了 52 个，都是 `a8w4_gemm1`、`a8w4_gemm2`、`a8w4_fmoe_bm64`；按指令助记符逐对比较，脚本 `kclass2.py` 在 session 的 `files/i5_ab/`）：
+
+| kernel | 变化 |
+|---|---|
+| `a8w4_gemm2`（8 个）、silu 的 `a8w4_fmoe_bm64`（10 个） | 只有 kernarg 元数据（`kernarg_size`、参数 offset）；指令完全相同（silu 不读 situ 的 f32 参数） |
+| `a8w4_gemm1`（24 个） | kernarg 变短后标量 load 合并：silu 是 2 个 `s_load_dword` → 1 个 `s_load_dwordx2`，或 2 个 `s_load_dword` + 1 个 `s_load_dwordx2` → 1 个 `s_load_dwordx4`；situv2 是 `s_load_dwordx4` + 3 个 `s_load_dword` → 1 个 `s_load_dwordx8`。随之调度有小的重排，多 / 少 1 个 `s_mov`、`s_nop`、`s_waitcnt`；VGPR、SGPR、LDS 不变 |
+| situv2 的 `a8w4_fmoe_bm64`（10 个） | 同上：2 个 `s_load_dword` → 1 个 `s_load_dwordx2`；寄存器分配变了，主循环里 MFMA、`v_perm` 等的顺序有小的重排 |
+
+**第 6 步的性能 A/B**（`bench ab`，coldrot，5 轮；base 是 `06d3875` 的副本，以 `py:` variant 跑调优表的选择，new 是 `@table`；结果表在 session 的 `files/i5_ab/`）：
+
+| case | act | tokens | new 相对 old | 噪声带 |
+|---|---|---|---|---|
+| TP8 | silu | 1、16、64、512 | +0.2、-0.2、+0.0、+0.1% | ≤1.0% |
+| TP8 | situv2 | 1、16、64、512、1024、2048、8192 | -0.2、+0.0、-0.0、-0.0、+0.3、-0.1、+1.3% | ≤2.5% |
+| TP4 | silu | 1、2、64、512 | +0.0、+0.1、+0.2、-0.0% | ≤0.4% |
+| TP4 | situv2 | 1、2、64、512、2048、8192 | -0.2、+0.1、-0.2、-0.1、+0.8、-0.4% | ≤1.3% |
+
+全部在噪声带内（verdict 都是 “~”）。
+
+**host 开销**（每次 `a8w4_moe` 调用的 CPU 入队时间，200 次不同步取中位数，脚本 `host.py` 在 session 的 `files/i5_ab/`；I5 前 = `97eb73e`）：
+
+| case | config | I5 前 | I5 后 |
+|---|---|---|---|
+| TP8 1 / 64 tokens | `tp2k bm32 g1bcm2 g2base` | 71–74 µs | 61 µs |
+| TP8 1 / 64 tokens | `tp1k bcm1 ks1` | 45–47 µs | 40 µs |
+| EP8 1 / 64 tokens | `ep3k m64` | 78–80 µs | 67 µs |
+
+省下的主要是每次 launch 的 `torch.cuda.current_stream()` 和 `.data_ptr()`。剩下的大头在 op 的 Python 逻辑（查表、分配、`moe_sorting` 等），留给远期的“降低 host 开销”。
 
 ### 3.2 I4：kernel 文件之间不再互相 import（已完成）
 
@@ -214,7 +244,7 @@
   - 不进入嵌套函数：`ep_gemm` 的 `_body` 里 `_epilogue` 调用的 `gate_up_act`、`lds_vec_load` 等仍然不在 key 里。这是 FlyDSL 的限制，不是这次引入的（原来 `_vendor` 的 helper 全都不在 key 里）。改 helper 后照旧用空的 `FLYDSL_RUNTIME_CACHE_DIR`。
 - `_raw` 和 `_unwrap_value` 不能合并：后者让 Python int 原样通过，`buffer_load` 等的偏移参数靠它接受常量。
 - 第 1 步删 `get_element_ptr` 的 `elem_type` 参数时漏了 `_gep1` 的调用点，ISA 快照的编译失败直接暴露了问题：快照每次用新的 `FLYDSL_RUNTIME_CACHE_DIR`，结论可信。
-- 引入 `host_launch` 后，导入 a8w4 会加载 pyhip 的这个模块（多约 0.03 s）。`kernels/_launch.py` 是包内唯一的 pyhip 绝对导入，README 的“复制到其他工程”已写明。
+- 引入 `host_launch` 后，导入 a8w4 会加载 pyhip 的这个模块（多约 0.03 s）。`kernels/_launch.py` 是包内唯一的 pyhip 绝对导入，README 的“复制到其他工程”已写明（I5 删了它，改为各 kernel 文件导入 `flydsl_kernel`）。
 
 ### 3.4 I2：删除 EP kernel 的调试开关和 a16w4 路径（已完成）
 
@@ -321,6 +351,7 @@ host 端（`moe._run_tp2k`，G1/G2 唯一的调用方）只用到 gemm1 的 `epi
 | 2026-11-16 | I2 删除 EP 的调试开关和 a16w4 路径 | `ep_gemm` 1707→1545 行，`ep_small` 609→592 行；`_make_core` 去掉 `FP8`；bench 去掉 `adt=` 覆盖；kernel 名字不变；ISA IDENTICAL；API 测试 23 passed；单卡 pytest 94 passed、1 skipped | `892d7f8` `87fd7c8` `7dbb85e` |
 | 2026-11-16 | I3 精简 `_vendor`，迁到 `kernels/` | `_vendor/` 9 个文件 2268 行 → `kernels/` 5 个共享模块 464 行；helper 按名字导入，大部分进了 FlyDSL 缓存 key；`_run_compiled` 改用 pyhip `host_launch`；删 25 个无用 import；ISA IDENTICAL；`channel_exponents` ISA 和输出逐字节相同；API 测试 23 passed；单卡 pytest 94 passed、1 skipped | `18f243f` `cc44955` |
 | 2026-11-16 | I4 kernel 文件之间不再互相 import | 新增共享模块 `_mma`、`_hw`、`_atomic`、`_kloop`、`_protocol`，扩充 `_cvt`、`_mem`、`_act`；kernel 之间只剩 host 端 `ep_gemm` → `ep_prep`；重复的 helper 和硬件常量各只一份。第 1–3 步和补漏 ISA IDENTICAL；第 4 步有意改 ISA（合并 fp8x4 pack，指令更少，输出逐位相同，NaN 不变、±Inf 更接近 ref，快 0–1.6%）；API 测试 23 passed；单卡 pytest 94 passed、1 skipped | `6c8434c` `4b9eb2f` `5e5d9e3` `e565657` `f9d0ca1` |
+| 2026-11-16 | I5 host 封装改用 `@flydsl_kernel` | 16 个编译函数改成 kernel 对象（`<文件名>_kernel`），op 直接传 tensor，去掉 `_run_compiled`、`current_stream()`、`.data_ptr()`、`functools.cache`；megamoe 构造时绑定 `kern.get()`；删除 `kernels/_launch.py`（实验脚本改用 `experiments/_launch.py`）；删除 TP kernel 的 9 个无用参数。第 1–5 步 ISA IDENTICAL；第 6 步有意改 ISA（kernarg 变短、标量 load 合并），TP4 / TP8 A/B 在噪声内；host 开销每次调用少 6–13 µs；API 测试 23 passed；单卡 pytest 94 passed、1 skipped（含 CHECK 模式）；8 卡 pytest 3 passed | `d306c51` `3067a2d` `af9f077` `89bf081` `06d3875` `ff82c3d` |
 
 **I4 的经验**：
 
@@ -328,6 +359,12 @@ host 端（`moe._run_tp2k`，G1/G2 唯一的调用方）只用到 gemm1 的 `epi
 - 实验脚本（`experiments/`）也按名字从 kernel 文件导入 helper，搬 helper 时要一起改。
 - GPU 偶尔被别的容器占用，ISA 快照报 “GPUs busy”。用每 5 秒重试一次的包装脚本（`/tmp/i4/snap.sh`）等空闲时再跑。
 - “两个函数要不要合并”这类问题，先实测端到端行为再让用户决定：NaN 传播看的是 amax，不是 pack 函数。
+
+**I5 的经验**：
+
+- 迁移时要找出所有把 launcher 存起来再调用的地方（megamoe 的 `self.launch`、bench / 实验脚本里替换它的代码）。存的东西从 JitFunction 变成 specialization 后，替换方也要改成 `.get(...)`。
+- 删 kernel 参数即使只改 kernarg 布局，也可能让编译器合并标量 load 并重排调度。ISA 差异要按指令助记符逐对比较，不能只看 offset；会重排的 kernel 要做性能 A/B。
+- A/B 新旧代码：把旧提交 `git archive` 成另一个包名（`/tmp/i5/oldpkg/a8w4_old`），用 `bench ab` 的 `py:` variant 跑它，不用另写计时脚本。
 
 ## 5. 草图摘要：第 5–7 轮讨论（远期目标的素材，不是承诺）
 
