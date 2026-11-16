@@ -21,6 +21,8 @@ Per CTA (sorted rows m_row .. m_row+63, one expert, 4 waves, 1x4 N split):
     distance 1, single accumulator rescaled by s0/s1 at the K-group boundary,
     epilogue of tile t-1 interleaved into tile t's K steps, LDS-free 64 B-segment
     bf16x2 atomics (as the experiment gemm2_bm128).
+A block whose rows 32.. are all padding runs a 32-row variant. CTAs are remapped
+so each XCD gets a contiguous range of (m-block, split) work items.
 LDS: A tile / bf16 staging 16 KB + fp8 half 8 KB + scales 0.5 KB = 24.5 KB.
 """
 
@@ -122,7 +124,7 @@ def _atomics_mi(datas, offs, col, out_i64, full, part):
 
 @functools.cache
 def compile_a8w4_fmoe_bm64(*, D_HIDDEN, D_INTER, NE, TOPK=8, b_cache_mod=2,
-                           waves_per_eu=2, dyn_rows=True, xcd=True, ksplit=1, act="silu"):
+                           waves_per_eu=2, ksplit=1, act="silu"):
     H, INTER = D_HIDDEN, D_INTER
     assert act in ("silu", "situv2"), act
     assert INTER % 256 == 0 and H % TILE_K1 == 0 and H % TILE_N2 == 0
@@ -142,8 +144,9 @@ def compile_a8w4_fmoe_bm64(*, D_HIDDEN, D_INTER, NE, TOPK=8, b_cache_mod=2,
     W2_K0 = INTER // 128
     SC2_STRIDE = (INTER // 256) * 64
     WS2_BYTES = NE * H * (INTER // 32)
+    # _dyn / _xcd: tags of options that are now always on (names unchanged)
     kname = (f"a8w4_fmoe_bm64_h{H}_i{INTER}_ne{NE}_k{TOPK}_bcm{b_cache_mod}"
-             f"_w{waves_per_eu}{'_dyn' if dyn_rows else ''}{'_xcd' if xcd else ''}"
+             f"_w{waves_per_eu}_dyn_xcd"
              f"{f'_ks{ksplit}' if ksplit > 1 else ''}{'' if act == 'silu' else '_' + act}")
 
     def _body(lds_ptr, arg_x, arg_xs, arg_w1, arg_ws1, arg_exp1, arg_w2, arg_ws2,
@@ -548,22 +551,19 @@ def compile_a8w4_fmoe_bm64(*, D_HIDDEN, D_INTER, NE, TOPK=8, b_cache_mod=2,
             for mi in range_constexpr(MR):
                 epilogue_mi(1, t_last, mi)
 
-        if const_expr(dyn_rows):
-            tok32 = fx.Int32(rocdl.readfirstlane(
-                T.i32, _raw(_global_i32_at(arg_stids, m_row + fx.Int32(32))))) \
-                & fx.Int32(0x00FFFFFF)
-            cond = tok32 >= i32_M  # rows 32.. are padding
+        tok32 = fx.Int32(rocdl.readfirstlane(
+            T.i32, _raw(_global_i32_at(arg_stids, m_row + fx.Int32(32))))) \
+            & fx.Int32(0x00FFFFFF)
+        cond = tok32 >= i32_M  # rows 32.. are padding
 
-            @flyc.jit
-            def _dispatch():
-                if cond:
-                    run(32)
-                else:
-                    run(BM)
+        @flyc.jit
+        def _dispatch():
+            if cond:
+                run(32)
+            else:
+                run(BM)
 
-            _dispatch()
-        else:
-            run(BM)
+        _dispatch()
 
     @fx.struct
     class SharedStorage:
@@ -585,13 +585,11 @@ def compile_a8w4_fmoe_bm64(*, D_HIDDEN, D_INTER, NE, TOPK=8, b_cache_mod=2,
         wave = rocdl.readfirstlane(T.i32, tx // fx.Int32(64))
         total_m = _global_i32_at(arg_cumsum, fx.Int32(0)) // fx.Int32(BM)
         if bx < total_m * fx.Int32(ksplit):
-            lid = bx
-            if const_expr(xcd):
-                # WGs go round-robin over the 8 XCDs: give XCD x a contiguous range of
-                # (m-block, split) work items so same-expert blocks share its L2.
-                tot = total_m * fx.Int32(ksplit)
-                xc = _umod(bx, 8)
-                lid = (xc * _udiv(tot, 8) + fx.min(xc, _umod(tot, 8)) + _udiv(bx, 8))
+            # WGs go round-robin over the 8 XCDs: give XCD x a contiguous range of
+            # (m-block, split) work items so same-expert blocks share its L2.
+            tot = total_m * fx.Int32(ksplit)
+            xc = _umod(bx, 8)
+            lid = (xc * _udiv(tot, 8) + fx.min(xc, _umod(tot, 8)) + _udiv(bx, 8))
             m_block = lid // fx.Int32(ksplit)
             c0 = (lid % fx.Int32(ksplit)) * fx.Int32(CH)
             _body(lds_ptr, arg_x, arg_xs, arg_w1, arg_ws1, arg_exp1, arg_w2, arg_ws2,
@@ -628,7 +626,7 @@ def compile_a8w4_fmoe_bm64(*, D_HIDDEN, D_INTER, NE, TOPK=8, b_cache_mod=2,
 
 def a8w4_fmoe_bm64(x_fp8, x_scale, weights, sorted_ids, sorted_weights,
                    sorted_expert_ids, num_valid_ids, out, *, topk=8, b_cache_mod=1,
-                   waves_per_eu=2, dyn_rows=True, xcd=True, ksplit=1, act="silu",
+                   waves_per_eu=2, ksplit=1, act="silu",
                    situ_beta=1.0, situ_linear_beta=1.0, swiglu_limit=float("inf")):
     """Fused stage1 + stage2. ``weights``: ``a8w4_prepare_weights(..., fast_dec=2)``
     (doc-mimo/kernels/test_flydsl_moe_a16wfp4.py); sorting block_m 64; ``out`` bf16
@@ -639,8 +637,7 @@ def a8w4_fmoe_bm64(x_fp8, x_scale, weights, sorted_ids, sorted_weights,
     E, _, _ = weights["w2"].shape
     launch = compile_a8w4_fmoe_bm64(
         D_HIDDEN=model_dim, D_INTER=weights["w1"].shape[1] // 2, NE=E, TOPK=topk,
-        b_cache_mod=b_cache_mod, waves_per_eu=waves_per_eu, dyn_rows=dyn_rows, xcd=xcd,
-        ksplit=ksplit, act=act)
+        b_cache_mod=b_cache_mod, waves_per_eu=waves_per_eu, ksplit=ksplit, act=act)
     _run_compiled(
         launch, x_fp8.data_ptr(), x_scale.data_ptr(), weights["w1"].data_ptr(),
         weights["w1_scale"].data_ptr(), weights["w1_exp"].data_ptr(),
