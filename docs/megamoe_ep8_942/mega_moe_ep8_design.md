@@ -555,7 +555,8 @@ stage发；一个unit里GateUp和Down交替排；4个block共享一个权重tile
 
 ### 9.2 接入
 
-补丁在[sglang_mimo_mega_moe.patch](../../tests/contrib/moe/ep8/sglang_mimo_mega_moe.patch)（对fork的eb86ca1）：
+补丁在[sglang_mimo_mega_moe.patch](../../tests/contrib/moe/ep8/sglang_mimo_mega_moe.patch)（fork的eb86ca1上的一个提交，
+`git format-patch`导出，`git am`或`git apply`都可以）：
 
 - `MiMoV2MoE.forward_deepep`里，`SGLANG_USE_PYHIP_MEGA_MOE=1`并且这一步有任何一个rank在做prefill时，调
   `EPMoEGfx942.forward`（quant + mega + `ep_finish`），否则照旧走MORI。decode的CUDA graph（捕获时）不用mega：

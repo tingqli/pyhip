@@ -1,21 +1,33 @@
-diff --git a/python/sglang/srt/configs/qwen3_asr.py b/python/sglang/srt/configs/qwen3_asr.py
-index cb3252b..bf2ce3a 100644
---- a/python/sglang/srt/configs/qwen3_asr.py
-+++ b/python/sglang/srt/configs/qwen3_asr.py
-@@ -164,5 +164,5 @@ class Qwen3ASRConfig(PretrainedConfig):
-         return self.thinker_config.text_config
- 
- 
--AutoConfig.register("qwen3_asr", Qwen3ASRConfig)
--AutoConfig.register("qwen3_asr_thinker", Qwen3ASRThinkerConfig)
-+AutoConfig.register("qwen3_asr", Qwen3ASRConfig, exist_ok=True)
-+AutoConfig.register("qwen3_asr_thinker", Qwen3ASRThinkerConfig, exist_ok=True)
+From cacede0e3369c41de20fb9f5ed5fafdd4ec2ca43 Mon Sep 17 00:00:00 2001
+From: Luwei Zhou <Luwei.Zhou@amd.com>
+Date: Mon, 16 Nov 2026 01:34:19 +0000
+Subject: [PATCH] feat(mimo): EP8 prefill MoE through pyhip's mega kernel on
+ gfx942
+
+SGLANG_USE_PYHIP_MEGA_MOE=1 sends the MiMoV2MoE.forward_deepep batches that
+contain a prefill on any rank through pyhip's EPMoEGfx942 (dispatch, GateUp,
+Down and combine in one persistent kernel) instead of MORI dispatch -> AITER
+MoE -> MORI combine. The choice uses is_extend_in_batch, which all EP ranks
+see alike; CUDA-graph captures (decode) keep MORI.
+
+Needs MORI_SHMEM_MODE=STATIC_HEAP: in ISOLATION mode MORI's shmem_ptr_p2p
+gives no peer address for pyhip's symmetric buffers.
+
+MiMo-V2.6-Flash, DP2 x attention TP4, EP8 on 8x MI300X: prefill input
+throughput +9.5% to +13.6% (fake routing) and +9.9% to +10.7% (real routing)
+over MORI; GSM8K 0.897 vs 0.902, within the run-to-run spread.
+---
+ .../sglang/srt/layers/moe/pyhip_mega_moe.py   | 120 ++++++++++++++++++
+ python/sglang/srt/models/mimo_v2.py           |   5 +
+ 2 files changed, 125 insertions(+)
+ create mode 100644 python/sglang/srt/layers/moe/pyhip_mega_moe.py
+
 diff --git a/python/sglang/srt/layers/moe/pyhip_mega_moe.py b/python/sglang/srt/layers/moe/pyhip_mega_moe.py
 new file mode 100644
-index 0000000..75728aa
+index 0000000..f1994e4
 --- /dev/null
 +++ b/python/sglang/srt/layers/moe/pyhip_mega_moe.py
-@@ -0,0 +1,83 @@
+@@ -0,0 +1,120 @@
 +"""EP8 MoE through pyhip's mega kernel (dispatch + GateUp + Down + combine in one persistent kernel) for MiMo.
 +
 +SGLANG_USE_PYHIP_MEGA_MOE=1 sends the batches of MiMoV2MoE.forward_deepep that contain a prefill on any rank through
@@ -45,12 +57,20 @@ index 0000000..75728aa
 +
 +
 +def _max_tokens() -> int:
-+    return int(os.environ.get("SGLANG_PYHIP_MEGA_MOE_MAX_TOKENS",
-+                              os.environ.get("SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK", "16384")))
++    return int(
++        os.environ.get(
++            "SGLANG_PYHIP_MEGA_MOE_MAX_TOKENS",
++            os.environ.get("SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK", "16384"),
++        )
++    )
 +
 +
 +def use_mega(forward_batch) -> bool:
-+    if not enabled() or forward_batch is None or torch.cuda.is_current_stream_capturing():
++    if (
++        not enabled()
++        or forward_batch is None
++        or torch.cuda.is_current_stream_capturing()
++    ):
 +        return False
 +    return bool(getattr(forward_batch, "is_extend_in_batch", False))
 +
@@ -61,13 +81,33 @@ index 0000000..75728aa
 +        from aiter import QuantType, get_hip_quant
 +        from pyhip.contrib.flydsl.ep_moe_gfx942 import EPMoEGfx942
 +
-+        from sglang.srt.distributed import get_moe_expert_parallel_rank, get_moe_expert_parallel_world_size
++        from sglang.srt.distributed import (
++            get_moe_expert_parallel_rank,
++            get_moe_expert_parallel_world_size,
++        )
 +
-+        rank, world = get_moe_expert_parallel_rank(), get_moe_expert_parallel_world_size()
-+        _op = EPMoEGfx942(rank, world, experts.w13_weight, experts.w13_weight_scale_inv, experts.w2_weight,
-+                          experts.w2_weight_scale_inv, experts.top_k, _max_tokens())
++        rank, world = (
++            get_moe_expert_parallel_rank(),
++            get_moe_expert_parallel_world_size(),
++        )
++        _op = EPMoEGfx942(
++            rank,
++            world,
++            experts.w13_weight,
++            experts.w13_weight_scale_inv,
++            experts.w2_weight,
++            experts.w2_weight_scale_inv,
++            experts.top_k,
++            _max_tokens(),
++        )
 +        _quant = get_hip_quant(QuantType.per_1x128)
-+        logger.info("pyhip mega MoE: rank %d/%d, %d tokens per rank, s_cap %d rows", rank, world, _op.tcap, _op.s_cap)
++        logger.info(
++            "pyhip mega MoE: rank %d/%d, %d tokens per rank, s_cap %d rows",
++            rank,
++            world,
++            _op.tcap,
++            _op.s_cap,
++        )
 +    return _op
 +
 +
@@ -86,8 +126,12 @@ index 0000000..75728aa
 +    if hidden_states.shape[0] == 0:
 +        # Idle rank: no routes to send, but it still serves its experts to the other ranks.
 +        hidden = hidden_states.shape[1]
-+        x_fp8 = torch.empty((0, hidden), dtype=experts.w13_weight.dtype, device=hidden_states.device)
-+        x_scale = torch.empty((0, hidden // 128), dtype=torch.float32, device=hidden_states.device)
++        x_fp8 = torch.empty(
++            (0, hidden), dtype=experts.w13_weight.dtype, device=hidden_states.device
++        )
++        x_scale = torch.empty(
++            (0, hidden // 128), dtype=torch.float32, device=hidden_states.device
++        )
 +        ids = ids.reshape(0, experts.top_k)
 +        weights = weights.reshape(0, experts.top_k)
 +    else:
@@ -96,8 +140,13 @@ index 0000000..75728aa
 +    _calls += 1
 +    if _calls == 1 or (_calls % 4700 == 0):
 +        needed = op.rows_needed()
-+        logger.info("pyhip mega MoE call %d: %d tokens, %d rows needed of %d", _calls, hidden_states.shape[0], needed,
-+                    op.s_cap)
++        logger.info(
++            "pyhip mega MoE call %d: %d tokens, %d rows needed of %d",
++            _calls,
++            hidden_states.shape[0],
++            needed,
++            op.s_cap,
++        )
 +    return out
 diff --git a/python/sglang/srt/models/mimo_v2.py b/python/sglang/srt/models/mimo_v2.py
 index 40ae059..e1b97aa 100644
@@ -115,3 +164,6 @@ index 40ae059..e1b97aa 100644
          final_hidden_states = self.experts(
              hidden_states=hidden_states, topk_output=topk_output
          )
+-- 
+2.43.0
+
