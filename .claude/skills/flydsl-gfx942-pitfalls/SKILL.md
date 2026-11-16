@@ -31,20 +31,20 @@ part of its key. Key = toolchain hash + source of the `@flyc.jit` function + sou
 
 The module-attribute and nested-function rows come from `jit_function._collect_dependency_sources`
 (it reads `co_names` and closures of each function, not nested code objects), checked by listing
-the dependencies of a8w4 `compile_ep_gemm1`, not from the probe.
+the dependencies of the a8w4 `ep_gemm1_kernel` builder, not from the probe.
 
 Rules:
-- Compile-time switches: int / tuple arguments of the (usually `functools.cache`d) compile
-  function, also folded into the kernel name (then dumps and profiles tell variants apart).
-  Never a list / dict / set / callable / config object in the closure. New host wrappers use
-  `@flydsl_kernel` (skill `flydsl-host-launch`), which rejects such keys.
+- Compile-time switches: int / tuple key arguments of the `@flydsl_kernel` builder (skill
+  `flydsl-host-launch`, which rejects other key types), also folded into the kernel name (then
+  dumps and profiles tell variants apart). Never a list / dict / set / callable / config object
+  in the closure.
 - Import helpers by name into the kernel's directory (a8w4: `kernels/_mem.py` etc.). After
   editing any helper, or whenever a change "does nothing": run with a fresh cache,
   `FLYDSL_RUNTIME_CACHE_DIR=$(mktemp -d) python ...`. An ablation that reuses a stale binary
   reports "no effect" (this produced a wrong a8w4 gemm2 epilogue conclusion).
 - Env-var knobs: read them once into a closure int; better, freeze them as module constants.
-- In-process, `functools.cache` on the compile function also returns the old launcher: start
-  a new process after editing.
+- In-process, the kernel object (`kern.variants`) also returns the old launcher: start a new
+  process after editing.
 
 ## 2. Control flow
 

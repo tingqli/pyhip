@@ -185,7 +185,8 @@ The machine is shared, so only compare numbers from the same run.
 ## 5. Migrating an existing compile function
 
 Only do this when the task rewrites that wrapper anyway. Never touch `a8w4/experiments/`
-(frozen copies).
+(frozen copies). a8w4 itself is fully migrated (I5); its frozen experiment scripts import
+`_run_compiled` from `a8w4/experiments/_launch.py`.
 
 1. Replace `@cache` with `@flydsl_kernel(...)`; its parameters are now passed as keywords.
    - Alternatively, wrap it without editing:

@@ -77,8 +77,8 @@ python -m a8w4.bench ab --case ep8 -t 4096 --samples 3 -v l128 l128c     # EP8: 
 
 ## 4. A kernel variant
 
-- Prefer a compile-time switch in the kernel (int / tuple argument of the `functools.cache`
-  compile function, part of the kernel name) over a copied 1700-line file; keep only a diff in
+- Prefer a compile-time switch in the kernel (int / tuple key argument of the `@flydsl_kernel`
+  builder, part of the kernel name) over a copied 1700-line file; keep only a diff in
   the experiment dir, record the commit hash in the log.
 - Correctness before timing: `python -m a8w4.bench check --case ep8 -t 1 77 600 4096 -v l128
   "x=l128:g1.pf=1" --graph`; bit-exact checks need one route per token:
