@@ -36,8 +36,8 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
-from ._act import gate_up_act, situ_params
-from ._cvt import _pack_activation
+from ._act import gate_up_act, situ_args, situ_params
+from ._cvt import _bf16x2_rne, _channel_factor, _pack_activation
 from ._launch import _run_compiled
 from ._mem import (
     _global_i32_at,
@@ -49,7 +49,6 @@ from ._mem import (
     lds_typed_ptr,
 )
 from . import ep_gemm as EP  # noqa: E402
-from . import tp_gemm1 as G1  # noqa: E402
 from .ep_prep import _gatomic_add, _gatomic_xchg, _gload_sys  # noqa: E402
 
 
@@ -364,7 +363,7 @@ def compile_ep_small(*, H, I, EL, TOPK, BM, NW, C1, C2, PF, ROWV, MAXM, SCH=3,
 
             acc = core(R, row_base16, pre_a=pre_a)
             MR = R // 16
-            fac = {k: G1._channel_factor(v) for k, v in exps.items()}
+            fac = {k: _channel_factor(v) for k, v in exps.items()}
             rows = [fx.Int32(mi * 16) + lane_mod_16 for mi in range(MR)]
             rs = [_gload_sys(a["xs"], fx.min(_row_token(lds, e, k0 + r, cnt, a["m"]),
                                              a["m"] - fx.Int32(1))).bitcast(fx.Float32)
@@ -383,8 +382,8 @@ def compile_ep_small(*, H, I, EL, TOPK, BM, NW, C1, C2, PF, ROWV, MAXM, SCH=3,
                     gv = [fx.Float32(g4[v]) * (rs[mi] * fac[0, c, v]) for v in range(4)]
                     uv = [fx.Float32(u4[v]) * (rs[mi] * fac[1, c, v]) for v in range(4)]
                     y = gate_up_act(ACT, gv, uv, situ)
-                    w2 = Vec.from_elements([EP._bf16x2_rne(y[0], y[1]),
-                                            EP._bf16x2_rne(y[2], y[3])], fx.Int32)
+                    w2 = Vec.from_elements([_bf16x2_rne(y[0], y[1]),
+                                            _bf16x2_rne(y[2], y[3])], fx.Int32)
                     buffer_store(
                         w2, out_rsrc,
                         ((bx_m + rows[mi]) * fx.Int32(I) + ccol + fx.Int32(c * 16)) // fx.Int32(2),
@@ -437,7 +436,7 @@ def compile_ep_small(*, H, I, EL, TOPK, BM, NW, C1, C2, PF, ROWV, MAXM, SCH=3,
 
             acc = core(R, row_base16, hook, pre_a=pre_a)
             MR = R // 16
-            fac = [[G1._channel_factor(x) for x in xs4] for xs4 in exps]
+            fac = [[_channel_factor(x) for x in xs4] for xs4 in exps]
             wts = global_typed_ptr(a["wts"], T.f32)
             for mi in range_constexpr(MR):
                 r = fx.Int32(mi * 16) + lane_mod_16
@@ -582,5 +581,5 @@ def ep_moe_small(x, W, topk_weights, topk_ids, *, e0, maxm=512, cfg=None,
         topk_weights.data_ptr(), W["w1"].data_ptr(), W["w1_scale"].data_ptr(),
         W["w1_exp"].data_ptr(), W["w2"].data_ptr(), W["w2_scale"].data_ptr(),
         W["w2_exp"].data_ptr(), out.data_ptr(), s["inter"].data_ptr(), s["ctr"].data_ptr(),
-        int(M), int(e0), *G1.situ_args(**situ), int(grid), torch.cuda.current_stream())
+        int(M), int(e0), *situ_args(**situ), int(grid), torch.cuda.current_stream())
     return out

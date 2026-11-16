@@ -113,7 +113,7 @@
 
 **任务**（每步一个提交，每步都跑 ISA 快照）：
 
-- [ ] 第 1 步：TP 的重复 helper → `_cvt`、`_mma`；`situ_args` → `_act`。改 `tp_gemm1/2`、`tp_fmoe(_q)`、`ep_gemm`、`ep_mega`、`ep_small`、`megamoe.py`。
+- [x] 第 1 步：TP 的重复 helper → `_cvt`、`_mma`；`situ_args` → `_act`。改 `tp_gemm1/2`、`tp_fmoe(_q)`、`ep_gemm`、`ep_mega`、`ep_small`、`megamoe.py`。
 - [ ] 第 2 步：`_hw`、`_atomic`、`_mem` 的新增；改 `ep_prep`、`tp_prep`、`ep_small`、`tp_fmoe(_q)`、`ep_mega(_comm)`、`tp_gemm1/2`（`NXCD`）。
 - [ ] 第 3 步：`_kloop`、`_protocol`；`ep_mega`、`ep_small`、`ep_mega_comm` 不再 import 别的 kernel 文件，`ep_gemm` 只剩 host 端的 `ep_prep`。
 - [ ] 第 4 步：比较 `_fp8x4_pack` 和 `_pack_activation` 的 ISA，相同就合并。

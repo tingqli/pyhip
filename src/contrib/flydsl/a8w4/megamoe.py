@@ -23,10 +23,10 @@ are FlyDSL (``kernels/ep_mega.py``, ``kernels/ep_mega_comm.py``).
 
 import torch
 
+from .kernels._act import situ_args
 from .kernels._launch import _run_compiled
 from .kernels import ep_mega as K
 from .kernels import ep_mega_comm as C
-from .kernels import tp_gemm1 as G1
 
 
 class MegaMoeEpA8W4:
@@ -48,7 +48,7 @@ class MegaMoeEpA8W4:
         self.W, self.rank, self.topk = W, rank, topk
         self.H, self.I = W["w2"].shape[1], N2 // 2
         self.producers, self.lag, self.act = producers, lag, act
-        self.situ = G1.situ_args(**(situ or {}))
+        self.situ = situ_args(**(situ or {}))
         self.token_shift = max(int(max_tokens - 1).bit_length(), 1)
         self.tcap = 1 << self.token_shift
         bm = K.BLOCK_M

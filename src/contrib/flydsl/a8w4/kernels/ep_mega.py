@@ -44,6 +44,7 @@ from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
 from ._act import gate_up_act, situ_params
+from ._cvt import _channel_factor, _fp8x4_pack
 from ._mem import (
     _buffer_i32_scalar_read,
     _global_base_ptr1,
@@ -59,7 +60,6 @@ from ._mem import (
     lds_vec_load,
 )
 from . import ep_gemm as EP
-from . import tp_gemm1 as G1
 
 # Must match ep_mega_comm.py.
 NPES, E_LOCAL = 8, 32
@@ -427,7 +427,7 @@ def compile_ep_mega(*, H, I, TOPK, token_shift, producers=16, lag=2, ROWV=(32, 6
                 MR = R // 16
                 rows = [fx.Int32(mi * 16) + lane_mod_16 for mi in range(MR)]
                 valid = [r < n_valid for r in rows]
-                fac = {k: G1._channel_factor(v) for k, v in exps.items()}
+                fac = {k: _channel_factor(v) for k, v in exps.items()}
                 rsc = [fx.Float32(lds_f32[fx.Int32(RATIO // 4 + G1N * BM) + r]) for r in rows]
                 situ = None
                 if const_expr(ACT == "situv2"):
@@ -464,7 +464,7 @@ def compile_ep_mega(*, H, I, TOPK, token_shift, producers=16, lag=2, ROWV=(32, 6
                     inv = fx.Float32(rocdl.rcp(T.f32, _raw(s)))
                     srow = bx_m + rows[mi]
                     for c in range_constexpr(NC1):
-                        q = EP._fp8x4_pack(*[ys[mi, c][v] * inv for v in range(4)])
+                        q = _fp8x4_pack(*[ys[mi, c][v] * inv for v in range(4)])
                         buffer_store(
                             q, out_rs, (srow * fx.Int32(I) + col + fx.Int32(c * 16)) // fx.Int32(4),
                             mask=valid[mi], cache_modifier=WT_AUX)
@@ -580,7 +580,7 @@ def compile_ep_mega(*, H, I, TOPK, token_shift, producers=16, lag=2, ROWV=(32, 6
             def epilogue(R, acc):
                 """acc * fin * channel factor * route weight -> bf16 LDS tile [R, NO] -> scatter."""
                 MR = R // 16
-                fac = [G1._channel_factor(x) for x in exps]
+                fac = [_channel_factor(x) for x in exps]
                 sw_tiles = _global_i32_buffer_tiles(a["rw"], fx.Int64(rows_cap) * fx.Int64(4), 1)
                 sw_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Int32)
                 lds_bf16 = lds_typed_ptr(lds_i32, T.bf16)

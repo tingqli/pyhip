@@ -117,3 +117,12 @@ def gate_up_act(act, gs, us, situ=None):
     if const_expr(act == "situv2"):
         return situ_mul_batch(gs, us, *situ)
     return silu_mul_batch(gs, us)
+
+
+def situ_args(situ_beta=1.0, situ_linear_beta=1.0, swiglu_limit=float("inf")):
+    """Runtime SiTUv2 launch args (beta, 1/beta, linear_beta, 1/linear_beta,
+    clamp limit; +inf = no clamp), as flydsl_a16w4_gemm1. Ignored by silu."""
+    beta, lbeta = float(situ_beta), float(situ_linear_beta)
+    if beta <= 0.0 or lbeta <= 0.0:
+        raise ValueError(f"situ_beta/situ_linear_beta must be > 0, got {beta}/{lbeta}")
+    return beta, 1.0 / beta, lbeta, 1.0 / lbeta, float(swiglu_limit)

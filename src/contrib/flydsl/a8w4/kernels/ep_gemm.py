@@ -42,8 +42,15 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
-from ._act import gate_up_act, situ_params
-from ._cvt import _pack_activation
+from ._act import gate_up_act, situ_args, situ_params
+from ._cvt import (
+    _channel_factor,
+    _fp4x8_to_fp8x8_fast,
+    _fp8_lut_predelta,
+    _fp8x4_pack,
+    _pack_activation,
+    _perm_u32,
+)
 from ._launch import _run_compiled
 from ._mem import (
     _buffer_i32_scalar_read,
@@ -62,7 +69,6 @@ from ._mem import (
     lds_vec_load,
 )
 from . import ep_prep as PR  # noqa: E402
-from . import tp_gemm1 as G1  # noqa: E402
 
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -89,29 +95,6 @@ def _frag(v_i32, elem, n):
     t = fx.make_rmem_tensor(fx.make_layout(n, 1), elem)
     t.store(Vec(v_i32).bitcast(elem))
     return t
-
-
-def _bf16x2_rne(a, b):
-    """2 finite f32 -> one i32 of 2 bf16, round-to-nearest-even (a in the low half;
-    no NaN handling: epilogue values are finite)."""
-    r = []
-    for x in (a, b):
-        u = fx.Float32(x).bitcast(fx.Uint32)
-        r.append(u + fx.Uint32(0x7FFF) + ((u >> fx.Uint32(16)) & fx.Uint32(1)))
-    return G1._perm_u32(r[1], r[0], 0x07060302).bitcast(fx.Int32)
-
-
-def _fp8x4_pack(a, b, c, d):
-    """4 finite f32 -> 4 fp8 FNUZ in one i32 (same result as ``_pack_activation``:
-    clamp to +-240, RNE, no negative zero), with NaN-free min/max."""
-    v = [fx.maxnumf(fx.Float32(fx.arith.minnumf(_raw(fx.Float32(x)), _raw(fx.Float32(240.0)))),
-                    fx.Float32(-240.0))
-         for x in (a, b, c, d)]
-    lo = rocdl.cvt_pk_fp8_f32(T.i32, v[0], v[1], fx.Int32(0), False)
-    packed = fx.Uint32(rocdl.cvt_pk_fp8_f32(T.i32, v[2], v[3], lo, True))
-    mag = packed & fx.Uint32(0x7F7F7F7F)
-    zero = (~(mag + fx.Uint32(0x7F7F7F7F))) & fx.Uint32(0x80808080)
-    return (packed & ~zero).bitcast(fx.Int32)
 
 
 def _dispatch_rows(rowv, pads, run_rows):
@@ -351,7 +334,7 @@ def _make_core(*, K, W_ROWS, BM, PF, bcm, cols, lds_ptr, LDS_BYTES, lane, tx, NT
             p = packed[skey_of[k]]
             kpack = (kt * fx.Int32(KG) + fx.Int32(g)) % fx.Int32(2)  # 128-K chunk parity
             sel = (kpack * fx.Int32(2) + npack[k]) * fx.Int32(0x01010101)
-            lut[k, g] = G1._fp8_lut_predelta(G1._perm_u32(p, p, sel))
+            lut[k, g] = _fp8_lut_predelta(_perm_u32(p, p, sel))
         return raw, lut
 
     a_tiles = fx.logical_divide(_global_i32_buffer_view(arg_a, a_num_bytes),
@@ -477,7 +460,7 @@ def _make_core(*, K, W_ROWS, BM, PF, bcm, cols, lds_ptr, LDS_BYTES, lane, tx, NT
             """B operand words (2 x i32) of MFMA step s, per key."""
             bws = {}
             for k in keys:  # step s = 128-K chunk s//4, dword s%4
-                b8 = G1._fp4x8_to_fp8x8_fast(raw[k, s // 4][s % 4], lut[k, s // 4])
+                b8 = _fp4x8_to_fp8x8_fast(raw[k, s // 4][s % 4], lut[k, s // 4])
                 bws[k] = Vec(b8.bitcast(fx.Int32))
             return bws
 
@@ -662,7 +645,7 @@ def compile_ep_gemm1(*, H, I, NE, BM, NI, ROWV, PF=2, bcm=2, wpe=None, NW=4, ARB
     block, NI inter columns per WG.
 
     ``ACT``: "silu" or "situv2" (as tp_gemm1: SiTUv2 beta / linear_beta / clamp
-    limit are runtime f32 launch args, see ``G1.situ_args``; silu ignores them).
+    limit are runtime f32 launch args, see ``situ_args``; silu ignores them).
 
     A = fp8 x + f32 row scale; out = fp8 [sorted, I] by sorted row + f32 scale per
     (row, 128 cols) group, ``[sorted, I/128]``.
@@ -822,7 +805,7 @@ def compile_ep_gemm1(*, H, I, NE, BM, NI, ROWV, PF=2, bcm=2, wpe=None, NW=4, ARB
             toks = [fx.Int32(_global_i32_at(arg_sids, bx_m + r)) & fx.Int32(0x00FFFFFF)
                     for r in rows]
             valid = [t < i32_m for t in toks]
-            fac = {k: G1._channel_factor(v) for k, v in exps.items()}
+            fac = {k: _channel_factor(v) for k, v in exps.items()}
             if const_expr(XG):
                 rs = [fin_of(r) for r in rows]
             else:
@@ -882,7 +865,7 @@ def compile_ep_gemm1(*, H, I, NE, BM, NI, ROWV, PF=2, bcm=2, wpe=None, NW=4, ARB
             quant, 16 B stores by sorted row."""
             MR = R // 16
             lds_bf16 = lds_typed_ptr(lds_i32, T.bf16)
-            fac = {k: G1._channel_factor(v) for k, v in exps.items()}
+            fac = {k: _channel_factor(v) for k, v in exps.items()}
             if const_expr(not XG):
                 xs_tiles = _global_i32_buffer_tiles(arg_xs, fx.Int64(i32_m) * fx.Int64(4), 1)
                 xs_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Int32)
@@ -1084,7 +1067,7 @@ def ep_gemm1(x, x_scale, W, sorted_ids, sorted_expert_ids, num_valid_ids, out, o
     != 1 route (``zero_rc`` required) are zeroed; ``grid`` (a multiple of 8) may be
     below the tile bound (the WGs stride over the tiles).
     ``act``: "silu" or "situv2" with ``situ_beta`` / ``situ_linear_beta`` /
-    ``swiglu_limit`` (+inf: no clamp), as ``G1.a8w4_gemm1``."""
+    ``swiglu_limit`` (+inf: no clamp), as ``tp_gemm1.a8w4_gemm1``."""
     M, H = x.shape
     NE, N2, _ = W["w1"].shape
     I = N2 // 2
@@ -1113,7 +1096,7 @@ def ep_gemm1(x, x_scale, W, sorted_ids, sorted_expert_ids, num_valid_ids, out, o
         int(zero.numel() * zero.element_size() // 16) if zero is not None else 0,
         sched.data_ptr() if sched is not None else 0,
         zero_rc.data_ptr() if (zrc or dyn) else 0,
-        *G1.situ_args(situ_beta, situ_linear_beta, swiglu_limit),
+        *situ_args(situ_beta, situ_linear_beta, swiglu_limit),
         int(grid), torch.cuda.current_stream())
     return out
 
@@ -1246,7 +1229,7 @@ def compile_ep_gemm2(*, H, I, NE, BM, NO, ROWV, PF=2, bcm=2, wpe=None, NW=4, ARB
             acc * fin * route weight * channel factor -> 2 bf16x2 atomics per (mi, c)
             straight from registers (no staging tile, no barrier)."""
             MR = R // 16
-            fac = [[G1._channel_factor(x) for x in xs4] for xs4 in exps]
+            fac = [[_channel_factor(x) for x in xs4] for xs4 in exps]
             sw_tiles = _global_i32_buffer_tiles(arg_sw, fx.Int64(i32_sorted) * fx.Int64(4), 1)
             sw_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Int32)
             for mi in range_constexpr(MR):
@@ -1264,7 +1247,7 @@ def compile_ep_gemm2(*, H, I, NE, BM, NO, ROWV, PF=2, bcm=2, wpe=None, NW=4, ARB
             """acc * fin * channel factor * route weight -> bf16 LDS tile [R, NO] ->
             bf16x2 atomics, 128 B per row (8 rows x 32 lanes x 2 cols per pass)."""
             MR = R // 16
-            fac = [G1._channel_factor(x) for x in exps]
+            fac = [_channel_factor(x) for x in exps]
             sw_tiles = _global_i32_buffer_tiles(arg_sw, fx.Int64(i32_sorted) * fx.Int64(4), 1)
             sw_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Int32)
             lds_bf16 = lds_typed_ptr(lds_i32, T.bf16)

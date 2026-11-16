@@ -32,8 +32,15 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
-from ._act import gate_up_act, situ_params
-from ._cvt import _pack_activation
+from ._act import gate_up_act, situ_args, situ_params
+from ._cvt import (
+    _channel_factor,
+    _fp4x8_to_fp8x8_fast,
+    _fp8_lut_predelta,
+    _pack_activation,
+    _perm_u32,
+    _rnu_hi,
+)
 from ._launch import _run_compiled
 from ._mem import (
     _global_base_ptr1,
@@ -48,8 +55,8 @@ from ._mem import (
     lds_typed_ptr,
     lds_vec_load,
 )
+from ._mma import _mma_fp8
 from . import tp_fmoe as F  # noqa: E402
-from . import tp_gemm1 as G1  # noqa: E402
 
 
 BM = 64
@@ -213,20 +220,20 @@ def compile_a8w4_fmoe_bm64q(*, D_HIDDEN, D_INTER, NE, TOPK=8, b_cache_mod=1, n_c
                         p = fx.Int32(Vec(s_regs[gu].load())[0])
                         for ni in range_constexpr(N_REPEAT):
                             for g in range_constexpr(K_GROUPS):
-                                luts[gu, ni, g] = G1._fp8_lut_predelta(
-                                    G1._perm_u32(p, p, ((g % 2) * 2 + ni) * 0x01010101))
+                                luts[gu, ni, g] = _fp8_lut_predelta(
+                                    _perm_u32(p, p, ((g % 2) * 2 + ni) * 0x01010101))
                     if const_expr(nxt is not None):
                         load_s(nxt)
                     for ku in range_constexpr(K_STEPS):
                         g, j = ku // 4, ku % 4
-                        bs = {(gu, ni): G1._fp4x8_to_fp8x8_fast(
+                        bs = {(gu, ni): _fp4x8_to_fp8x8_fast(
                             fx.Int32(Vec(w_regs[gu, ni, g].load())[j]), luts[gu, ni, g])
                             for gu in range(2) for ni in range(N_REPEAT)}
                         for mi in range_constexpr(MR):
                             a8 = load_a(mi, ku)
                             for ni in range_constexpr(N_REPEAT):
                                 for gu in range_constexpr(2):
-                                    G1._mma_fp8(mma_atom, acc[gu, mi, ni], a8, bs[gu, ni])
+                                    _mma_fp8(mma_atom, acc[gu, mi, ni], a8, bs[gu, ni])
                         if const_expr(nxt is not None):
                             if const_expr(ku < A_LOADS):
                                 load_a_one(ku, nxt)
@@ -261,8 +268,8 @@ def compile_a8w4_fmoe_bm64q(*, D_HIDDEN, D_INTER, NE, TOPK=8, b_cache_mod=1, n_c
                 gpu.barrier()  # A reads done: the A slot becomes the bf16 staging
 
                 # ---- dequant -> SiLU -> bf16 staging [rows, 128] ------------------------
-                f_g = [G1._channel_factor(ld(rs_e1, e * fx.Int32(N1) + c)) for c in n_cols]
-                f_u = [G1._channel_factor(ld(rs_e1, e * fx.Int32(N1) + fx.Int32(INTER) + c))
+                f_g = [_channel_factor(ld(rs_e1, e * fx.Int32(N1) + c)) for c in n_cols]
+                f_u = [_channel_factor(ld(rs_e1, e * fx.Int32(N1) + fx.Int32(INTER) + c))
                        for c in n_cols]
                 stg = lds_typed_ptr(lds_i32, T.bf16)
                 for mi in range_constexpr(MR):
@@ -406,13 +413,13 @@ def compile_a8w4_fmoe_bm64q(*, D_HIDDEN, D_INTER, NE, TOPK=8, b_cache_mod=1, n_c
                 fn = Vec(fn2[s].load())
                 datas = []
                 for k in ks:
-                    r0 = F._rnu_hi(Vec(acc2[s][mi][0].load())[k] * (fin4[mi][k] * fn[0]))
-                    r1 = F._rnu_hi(Vec(acc2[s][mi][1].load())[k] * (fin4[mi][k] * fn[1]))
-                    pk = G1._perm_u32(r1, r0, 0x07060302)
+                    r0 = _rnu_hi(Vec(acc2[s][mi][0].load())[k] * (fin4[mi][k] * fn[0]))
+                    r1 = _rnu_hi(Vec(acc2[s][mi][1].load())[k] * (fin4[mi][k] * fn[1]))
+                    pk = _perm_u32(r1, r0, 0x07060302)
                     nbr = fx.Int32(rocdl.update_dpp(T.i32, _raw(pk.bitcast(fx.Int32)),
                                                     _raw(pk.bitcast(fx.Int32)),
                                                     F.DPP_QUAD_SWAP, 0xF, 0xF, True))
-                    datas.append(_raw(G1._perm_u32(nbr, pk, sel_pair).bitcast(fx.Int32)))
+                    datas.append(_raw(_perm_u32(nbr, pk, sel_pair).bitcast(fx.Int32)))
                 col = (t_prev * fx.Int32(TILE_N2) + n_wave_base) * fx.Int32(2)
                 F._atomics_mi(datas, [_raw(offs4[mi][k]) for k in ks], col, arg_out,
                               mi_full[mi], mi_part[mi])
@@ -426,8 +433,8 @@ def compile_a8w4_fmoe_bm64q(*, D_HIDDEN, D_INTER, NE, TOPK=8, b_cache_mod=1, n_c
                 p = fx.Int32(Vec(wb[b]["packed"].load())[0])
                 ex = Vec(wb[b]["exp"].load())
                 fn2[s].store(Vec.from_elements(
-                    [G1._channel_factor(fx.Int32(ex[ni])) for ni in range(N_REPEAT)], fx.Float32))
-                luts = [[G1._fp8_lut_predelta(G1._perm_u32(p, p, ((g % 2) * 2 + ni) * 0x01010101))
+                    [_channel_factor(fx.Int32(ex[ni])) for ni in range(N_REPEAT)], fx.Float32))
+                luts = [[_fp8_lut_predelta(_perm_u32(p, p, ((g % 2) * 2 + ni) * 0x01010101))
                          for g in range(K_GROUPS)] for ni in range(N_REPEAT)]
                 for mi in range_constexpr(MR):
                     for ni in range_constexpr(N_REPEAT):
@@ -439,12 +446,12 @@ def compile_a8w4_fmoe_bm64q(*, D_HIDDEN, D_INTER, NE, TOPK=8, b_cache_mod=1, n_c
                                 a4 = Vec(acc2[s][mi][ni].load())
                                 acc2[s][mi][ni].store(Vec.from_elements(
                                     [a4[v] * ratio4[mi][v] for v in range(4)], fx.Float32))
-                    b8s = [G1._fp4x8_to_fp8x8_fast(raw[ni, ku // 4][ku % 4], luts[ni][ku // 4])
+                    b8s = [_fp4x8_to_fp8x8_fast(raw[ni, ku // 4][ku % 4], luts[ni][ku // 4])
                            for ni in range(N_REPEAT)]
                     for mi in range_constexpr(MR):
                         a8 = a2[mi, ku].bitcast(fx.Float8E4M3FNUZ)
                         for ni in range_constexpr(N_REPEAT):
-                            G1._mma_fp8(mma_atom, acc2[s][mi][ni], a8, b8s[ni])
+                            _mma_fp8(mma_atom, acc2[s][mi][ni], a8, b8s[ni])
                     if const_expr(prev is not None):
                         per = MR * 4 // K_STEPS
                         u0 = ku * per
@@ -629,7 +636,7 @@ def a8w4_fmoe_bm64q(x_fp8, x_scale, weights, sorted_ids, sorted_weights,
         sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), sorted_ids.data_ptr(),
         sorted_weights.data_ptr(), out.data_ptr(), int(tokens), ws["a2"].data_ptr(),
         ws["sc"].data_ptr(), ws["ctl"].data_ptr(), ws["epoch"],
-        *G1.situ_args(situ_beta, situ_linear_beta, swiglu_limit), torch.cuda.current_stream())
+        *situ_args(situ_beta, situ_linear_beta, swiglu_limit), torch.cuda.current_stream())
     return out
 
 

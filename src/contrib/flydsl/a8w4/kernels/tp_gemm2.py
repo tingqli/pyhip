@@ -30,6 +30,7 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
+from ._cvt import _channel_factor, _fp4x8_to_fp8x8_fast, _fp8_lut_predelta, _perm_u32
 from ._launch import _run_compiled
 from ._mem import (
     _buffer_i32_scalar_read,
@@ -47,67 +48,7 @@ from ._mem import (
     lds_typed_ptr,
     lds_vec_load,
 )
-
-
-# =============================================================================
-# Device helpers: fp4 -> fp8 decode, channel factor, MFMA (same as test_a8w4_gemm1)
-# =============================================================================
-#
-# W stays E2M1/E8M0. Output channel n is normalized by 2**(max_exp[n]-127-5)
-# (``_channel_factor``, applied in the epilogue); per 32-K group the remaining
-# 2**(5-delta), delta = max_exp - group_exp, is folded into an 8-entry
-# E2M1-magnitude -> FP8-FNUZ byte table (``_fp8_lut_predelta``) so each nibble
-# decodes with one v_perm.
-
-
-def _perm_u32(hi, lo, sel):
-    return fx.Uint32(
-        rocdl.perm_b32(
-            fx.Uint32(hi).ir_value(), fx.Uint32(lo).ir_value(), fx.Uint32(sel).ir_value()
-        )
-    )
-
-
-# ---- fd2 decode (same scheme as tp_gemm1) ----------------------------------------
-# W pre-transformed by ``prep_w1_fast``: byte j of a dword = (k_j, k_{j+4}) and no -0,
-# so even/odd nibbles decode straight to K 0..3 / 4..7 and the sign is a bit move.
-# The scale bytes hold delta*8, delta = min(max_code - code, 11) (flushed groups
-# zeroed in W); the per-channel max codes (int32) follow the scales.
-
-
-def _fp8_lut_predelta(delta):
-    delta = fx.Uint32(delta)
-    lo = (fx.Uint32(0x6C686080) - delta) & fx.Uint32(0xFFFFFF00)
-    hi = fx.Uint32(0x7C787470) - delta
-    return lo, hi, fx.Uint32(0x80808080)
-
-
-def _fp4x8_to_fp8x8_fast(raw, lut):
-    lo, hi, smask = lut
-    raw = fx.Uint32(raw)
-    even = ((raw << 4) & smask) | _perm_u32(hi, lo, raw & 0x07070707)
-    odd = (raw & smask) | _perm_u32(hi, lo, (raw >> 4) & 0x07070707)
-    return fx.Vector.from_elements(
-        [even.bitcast(fx.Int32), odd.bitcast(fx.Int32)], fx.Int32
-    ).bitcast(fx.Float8E4M3FNUZ)
-
-
-def _channel_factor(exponent):
-    """2**(exponent-127-5) as f32 (subnormal-safe)."""
-    normal = ((exponent - 5).to(fx.Uint32) << 23).bitcast(fx.Float32)
-    subnormal = (fx.Uint32(1) << (exponent + 17).to(fx.Uint32)).bitcast(fx.Float32)
-    return (exponent >= 6).select(normal, subnormal)
-
-
-def _fp8_frag8(v8):
-    t = fx.make_rmem_tensor(fx.make_layout(8, 1), fx.Float8E4M3FNUZ)
-    t.store(v8)
-    return t
-
-
-def _mma_fp8(mma_atom, acc, a8, b8):
-    """acc += A(16x32) * B(32x16), one MFMA(16,16,32,fp8 FNUZ)."""
-    fx.gemm(mma_atom, acc, _fp8_frag8(a8), _fp8_frag8(b8), acc)
+from ._mma import _mma_fp8
 
 
 # =============================================================================

@@ -28,8 +28,8 @@ from flydsl.expr import gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
+from ._cvt import _fp8x4_pack
 from ._mem import _global_base_ptr1, _raw, buffer_store, global_typed_ptr, lds_typed_ptr
-from . import ep_gemm as EP
 from .ep_mega import (
     ARRIVED,
     BLOCK_M,
@@ -133,7 +133,7 @@ def compile_quant(H):
                 scale = (am == fx.Float32(0.0)).select(fx.Float32(1.0), am / fx.Float32(240.0))
                 inv = fx.Float32(1.0) / scale
                 q = Vec.from_elements(
-                    [EP._fp8x4_pack(*[fx.Float32(f[4 * h + i]) * inv for i in range(4)])
+                    [_fp8x4_pack(*[fx.Float32(f[4 * h + i]) * inv for i in range(4)])
                      for h in range(2)], fx.Int32)
                 buffer_store(q, _rsrc(x8, fx.Int64(tokens) * fx.Int64(H)),
                                         u16 * fx.Int32(2))
