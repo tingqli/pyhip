@@ -43,7 +43,7 @@ import os
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl._mlir.dialects import arith, llvm
+from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
@@ -267,45 +267,6 @@ def _bucket_bounds(arg_sched, bx, grid, NB):
 def _sched_tile(arg_sched, t, NB):
     return (_sched_i32(arg_sched, fx.Int32(PR.SCHED_BORDER) + t // fx.Int32(NB)),
             t % fx.Int32(NB))
-
-
-# --- debug timeline (EP8_TL=1 at compile time): per tile v, 8 i32 at TL_BUF[8 v]:
-# [bx, HW_ID, XCC_ID, t0 lo, t0 hi, t1 lo, t1 hi, m_block] (s_memrealtime, 100 MHz).
-# The buffer address is baked into the code as a closure scalar (TLP) of the entry
-# function, which FlyDSL's on-disk cache key includes (a stale address would fault).
-TL = 0  # frozen (was env-tunable in the experiment copy)
-TL_BUF = None
-
-
-def tl_buffer():
-    global TL_BUF
-    if TL_BUF is None:
-        TL_BUF = torch.zeros(1 << 21, dtype=torch.int32, device="cuda")
-    return TL_BUF
-
-
-def _sreg(asm, ty):
-    return llvm.inline_asm(ty, [], asm, "=s", has_side_effects=True)
-
-
-def _tl_now():
-    return fx.Int64(_sreg("s_memrealtime $0\n s_waitcnt lgkmcnt(0)", T.i64))
-
-
-@flyc.jit
-def _tl_record(tlp, v, bx, m_block, t0, tx):
-    t1 = _tl_now()
-    if tx == fx.Int32(0):
-        p = global_typed_ptr(fx.Int64(tlp), T.i32)
-        b = v * fx.Int32(8)
-        vals = [bx, fx.Int32(_sreg("s_getreg_b32 $0, hwreg(HW_REG_HW_ID)", T.i32)),
-                fx.Int32(_sreg("s_getreg_b32 $0, hwreg(HW_REG_XCC_ID)", T.i32))]
-        for t in (t0, t1):
-            vals += [fx.Int32(arith.trunci(T.i32, _raw(t))),
-                     fx.Int32(arith.trunci(T.i32, _raw(t >> fx.Int64(32))))]
-        vals.append(m_block)
-        for i, val in enumerate(vals):
-            p[b + fx.Int32(i)] = val
 
 
 def _grid(tiles, sched):
@@ -782,12 +743,10 @@ def compile_ep_gemm1(*, H, I, NE, ADT, BM, NI, ROWV, PF=2, bcm=2, wpe=None, NW=4
         + ("_tr" if TR else "") + ("_o" if ORDER else "") + ("_zrc" if ZRC else "")
         + ("_xg" if XG else "") + ("_dyn" if DYN else "")
         + ("" if ACT == "silu" else f"_{ACT}")
-        + ("_tl" if TL else "")
     )
     # route-count-aware zeroing of gemm2's out [M, H] bf16: <= ZRC_UPT units / thread
     ZRC_ROW16 = H * 2 // 16
     ZRC_UPT = -(-ZRC_ROW16 // NT)
-    TLP = tl_buffer().data_ptr() if TL else 0  # closure scalar -> in the cache key
 
     def _body(lds_ptr, arg_x, arg_xs, arg_w, arg_ws, arg_wexp, arg_eids, arg_sids,
               arg_out, arg_outs, i32_m, m_block, n_block, lane, wave, tx, situ):
@@ -1131,13 +1090,9 @@ def compile_ep_gemm1(*, H, I, NE, ADT, BM, NI, ROWV, PF=2, bcm=2, wpe=None, NW=4
             t = lo + bx // fx.Int32(8)
             while t < hi:
                 m_block, n_block = _sched_tile(arg_sched, t, NB)
-                if const_expr(TL):
-                    t0 = _tl_now()
                 txo, laneo, waveo = _opaque_tx(tx)
                 _body(lds_ptr, arg_x, arg_xs, arg_w, arg_ws, arg_wexp, arg_eids, arg_sids,
                       arg_out, arg_outs, i32_m, m_block, n_block, laneo, waveo, txo, situ)
-                if const_expr(TL):
-                    _tl_record(TLP, t, bx, m_block, t0, tx)
                 t = t + nwg
                 if t < hi:
                     gpu.barrier()
@@ -1157,14 +1112,10 @@ def compile_ep_gemm1(*, H, I, NE, ADT, BM, NI, ROWV, PF=2, bcm=2, wpe=None, NW=4
                 if bx < bound:
                     tile = _xcd_tile(bx, bound)
                     m_block, n_block = _tile_of(tile, NB)
-                    if const_expr(TL):
-                        t0 = _tl_now()
                     txo, laneo, waveo = _opaque_tx(tx)
                     _body(lds_ptr, arg_x, arg_xs, arg_w, arg_ws, arg_wexp, arg_eids,
                           arg_sids, arg_out, arg_outs, i32_m, m_block, n_block, laneo,
                           waveo, txo, situ)
-                    if const_expr(TL):
-                        _tl_record(TLP, tile, bx, m_block, t0, tx)
         if const_expr(ZRC):
             _zero_rc_post(arg_zero, i32_zero16, ZRC_ROW16, ZRC_UPT, zpre, bx, tx, NT)
         if const_expr(DYN):
@@ -1290,10 +1241,9 @@ def compile_ep_gemm2(*, H, I, NE, ADT, BM, NO, ROWV, PF=2, bcm=2, wpe=None, NW=4
         + (f"_acm{acm}" if acm != 2 else "") + (f"_s{SCH}" if SCH != 1 else "")
         + (f"_st{ST}" if ST is not None else "") + (f"_p{PRIO}" if PRIO else "")
         + ("_tr" if TR else "") + ("_o" if ORDER else "") + ("_sst" if SST else "")
-        + ("_dyn" if DYN else "") + ("_tl" if TL else "")
+        + ("_dyn" if DYN else "")
     )
     assert not (SST and TR), "single_store: LDS-staged epilogue only"
-    TLP = tl_buffer().data_ptr() if TL else 0  # closure scalar -> in the cache key
 
     def _body(lds_ptr, arg_a, arg_as, arg_w, arg_ws, arg_wexp, arg_eids, arg_sids, arg_sw,
               arg_out, i32_m, i32_sorted, m_block, n_block, lane, wave, tx):
@@ -1482,13 +1432,9 @@ def compile_ep_gemm2(*, H, I, NE, ADT, BM, NO, ROWV, PF=2, bcm=2, wpe=None, NW=4
             t = lo + bx // fx.Int32(8)
             while t < hi:
                 m_block, n_block = _sched_tile(arg_sched, t, NB)
-                if const_expr(TL):
-                    t0 = _tl_now()
                 txo, laneo, waveo = _opaque_tx(tx)
                 _body(lds_ptr, arg_a, arg_as, arg_w, arg_ws, arg_wexp, arg_eids, arg_sids,
                       arg_sw, arg_out, i32_m, i32_sorted, m_block, n_block, laneo, waveo, txo)
-                if const_expr(TL):
-                    _tl_record(TLP, t, bx, m_block, t0, tx)
                 t = t + nwg
                 if t < hi:
                     gpu.barrier()
@@ -1508,14 +1454,10 @@ def compile_ep_gemm2(*, H, I, NE, ADT, BM, NO, ROWV, PF=2, bcm=2, wpe=None, NW=4
                 if bx < bound:
                     tile = _xcd_tile(bx, bound)
                     m_block, n_block = _tile_of(tile, NB)
-                    if const_expr(TL):
-                        t0 = _tl_now()
                     txo, laneo, waveo = _opaque_tx(tx)
                     _body(lds_ptr, arg_a, arg_as, arg_w, arg_ws, arg_wexp, arg_eids,
                           arg_sids, arg_sw, arg_out, i32_m, i32_sorted, m_block, n_block,
                           laneo, waveo, txo)
-                    if const_expr(TL):
-                        _tl_record(TLP, tile, bx, m_block, t0, tx)
 
     @flyc.kernel(name=kname, known_block_size=[NT, 1, 1])
     def kernel(arg_a: fx.Int64, arg_as: fx.Int64, arg_w: fx.Int64, arg_ws: fx.Int64,

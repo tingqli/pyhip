@@ -134,7 +134,7 @@ def _signal2(arg_ctr, top, sub0, bx, grid, tx):
 
 
 @functools.cache
-def compile_ep_small(*, H, I, EL, TOPK, ADT, BM, NW, C1, C2, PF, ROWV, MAXM, SCH=3, DBG=0,
+def compile_ep_small(*, H, I, EL, TOPK, ADT, BM, NW, C1, C2, PF, ROWV, MAXM, SCH=3,
                      ACT="silu"):
     FP8 = ADT == "fp8"
     assert ADT in ("fp8", "bf16")
@@ -162,7 +162,7 @@ def compile_ep_small(*, H, I, EL, TOPK, ADT, BM, NW, C1, C2, PF, ROWV, MAXM, SCH
     LDS_BYTES = (L_TOK8 + MAXM * 2) * 4
     assert LDS_BYTES <= 32768, LDS_BYTES  # 2 WGs per CU
     kname = (f"ep_small_{ADT}_h{H}_i{I}_e{EL}_bm{BM}_nw{NW}_c{C1}x{C2}_pf{PF}"
-             f"_r{'x'.join(map(str, ROWV))}_m{MAXM}_s{SCH}_d{DBG}"
+             f"_r{'x'.join(map(str, ROWV))}_m{MAXM}_s{SCH}_d0"  # _d0: no debug mode (name unchanged)
              + ("" if ACT == "silu" else f"_{ACT}"))
 
     @fx.struct
@@ -526,10 +526,6 @@ def compile_ep_small(*, H, I, EL, TOPK, ADT, BM, NW, C1, C2, PF, ROWV, MAXM, SCH
         nmb = fx.Int32(rocdl.readfirstlane(T.i32, _raw(lds[fx.Int32(L_OFF + EL)]))) // fx.Int32(BM)
         ng1 = nmb * fx.Int32(NB1)
         ntot = ng1 + nmb * fx.Int32(NB2)
-        if const_expr(DBG == 1):
-            ntot = ng1
-        if const_expr(DBG == 2):
-            ntot = fx.Int32(0)
         for item in range(bx, ntot, grid):
             _item(lds_ptr, a, fx.Int32(item), ng1, fx.Int32(item) == bx, lane, wave, tx)
             gpu.barrier()  # LDS A slots reused by the next item
@@ -596,7 +592,7 @@ def ep_moe_small(x, W, topk_weights, topk_ids, *, e0, adt="fp8", maxm=512, cfg=N
     launch, info = compile_ep_small(
         H=H, I=I, EL=E, TOPK=K, ADT=adt, BM=cfg["bm"], NW=cfg["nw"], C1=cfg["c1"],
         C2=cfg["c2"], PF=cfg["pf"], ROWV=tuple(cfg["rowv"]), MAXM=maxm,
-        SCH=cfg.get("sch", 3), DBG=cfg.get("dbg", 0), ACT=act)
+        SCH=cfg.get("sch", 3), ACT=act)
     s = _scratch(x.device, adt, maxm, H, I, info["CAP"], info["NMBMAX"])
     out = torch.empty((M, H), dtype=torch.bfloat16, device=x.device)
     grid = NUM_CU * cfg["wpc"]
