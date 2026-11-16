@@ -13,7 +13,7 @@
 
 ### 0.1 当前状态（每次停下来前更新）
 
-- **迭代**：I1、I1b、I2、I3、I4 已完成。I3 的范围是用户看过 I2 后改的（见 3.2 节）：`_vendor` 只留真正用到的代码，迁到 `kernels/` 下的共享模块，删掉 `_vendor/`。I4（3.1 节）完成后等用户 review；下一个是 I4b（NaN 传播，1.1 节），再往后是 I5。
+- **迭代**：I1、I1b、I2、I3、I4 已完成。I3 的范围是用户看过 I2 后改的（见 3.3 节）：`_vendor` 只留真正用到的代码，迁到 `kernels/` 下的共享模块，删掉 `_vendor/`。用户看过 I4 后决定先跳过 I4b（NaN 传播，1.1 节），做 I5（3.1 节），I5 进行中。
 - **分支**：`/sgl-workspace/pyhip` 的 `refactor/a8w4`。
 - **已有提交**：
   - 迭代 0，安全网：`64ce77c`、`d17f502`（ISA 基线在这个提交上生成）、`4e256d9`。
@@ -52,9 +52,9 @@
 | # | 内容 | 来源 | 验收 |
 |---|---|---|---|
 | I1 | 删除 TP kernel（`tp_gemm1`、`tp_gemm2`、`tp_fmoe`、`tp_fmoe_q`）里走不到的选项和冻结常量 | Q4，Phase 1 | ISA IDENTICAL；API 测试；单卡 pytest |
-| I1b | 删除 TP kernel 里调用方不用的模式取值（fast_dec 0/1、gemm1 的 bf16 epilogue 等，规则见 3.4 节） | 用户在 I1 review 时决定 | 同上 |
+| I1b | 删除 TP kernel 里调用方不用的模式取值（fast_dec 0/1、gemm1 的 bf16 epilogue 等，规则见 3.5 节） | 用户在 I1 review 时决定 | 同上 |
 | I2 | 删除 EP kernel 里走不到的选项（`TL` 等）和 a16w4 路径，包括 bench 的 `adt=bf16` 覆盖 | Q4，Q11 | 同上 |
-| I3 | 精简 `_vendor`：没人读的环境变量、类、函数、参数直接删；剩下的迁到 `kernels/` 下按主题分的共享模块；删除 `_vendor/`（规则见 3.2 节） | 原 I3 + 原 I4 前半；用户 2026-11-16 | ISA IDENTICAL；API 测试；单卡 pytest |
+| I3 | 精简 `_vendor`：没人读的环境变量、类、函数、参数直接删；剩下的迁到 `kernels/` 下按主题分的共享模块；删除 `_vendor/`（规则见 3.3 节） | 原 I3 + 原 I4 前半；用户 2026-11-16 | ISA IDENTICAL；API 测试；单卡 pytest |
 | I4 | kernel 文件之间不再互相 import（共享的 device helper 搬进 I3 建的模块，按名字导入；现在的 `G1.x`、`EP.x` 这类模块属性调用不进 FlyDSL 缓存 key）；`_fp4x8_to_fp8x8`、`_fp8x4_pack` / `_pack_activation` 只留一份；硬件常量集中定义 | Q12，Q14，Phase 2 | ISA IDENTICAL（第 4 步除外：有意改动，输出逐位比较 + 性能 A/B） |
 | I4b | 量化的 amax 改成传播 NaN（PyTorch 要求算子尽量传播 NaN）。I4 第 4 步实测：输入 x 的一个元素是 NaN 时，ep3k 的 3 个 tr 配置（`m64`、`l128`、`l128c`）、`ep1k`，以及对应的 dyn 配置输出有限的错误值；ref 和其他配置是整行 NaN。原因是 gemm1→gemm2 的重量化用 `maxnumf` 求 amax，忽略了 NaN：`ep_gemm` 的 tr epilogue（约 376–396 行）、`_kloop.quant_chunk`（ep1k 的 gemm2 输入）。同样写法的还有 megamoe 的 `ep_mega` epilogue 和 `ep_mega_comm.compile_quant`（量化原始 x），多卡，测试脚本还没覆盖。改成 `fx.max`，pack 函数不用动 | 用户 2026-11-16 | 每个配置注入 NaN / ±Inf 后输出和 ref 一样整行 NaN、其他行不受影响（加进 pytest）；ISA 只在这几处变；性能 A/B；单卡 pytest |
 | I5 | host 封装改用 `@flydsl_kernel`，替代 `_run_compiled` 和 `functools.cache`；每个 kernel 文件一个公开入口；同时删掉 I1 留下的无用 kernel 参数（标了 `# unused` 的那些）。到时按文件再拆成几个迭代 | Q13，Phase 3 | ISA IDENTICAL（kernarg 偏移变化要逐个解释）；pytest |
@@ -87,7 +87,48 @@
 
 ## 3. 当前迭代
 
-### 3.1 I4：kernel 文件之间不再互相 import（进行中）
+### 3.1 I5：host 封装改用 `@flydsl_kernel`（进行中）
+
+**现状**（I4 之后）：16 个编译函数用 `functools.cache` 缓存，返回 `@flyc.jit` launcher；op 函数用 `_run_compiled(launch, x.data_ptr(), ..., torch.cuda.current_stream())` 启动。
+
+| 文件 | 编译函数 → kernel 对象 | op（启动方） |
+|---|---|---|
+| `row_quant` | `_compile_row_quant` → `row_quant_kernel` | `quantize_rows` |
+| `channel_exp` | `_compile_channel_exponents` → `channel_exp_kernel` | `channel_exponents` |
+| `tp_prep` | `compile_tp_prep` → `tp_prep_kernel` | `tp_prep` |
+| `tp_gemm1` / `tp_gemm2` | `compile_a8w4_gemm1/2` → `tp_gemm1_kernel` / `tp_gemm2_kernel` | `a8w4_gemm1/2` |
+| `tp_fmoe` / `tp_fmoe_q` | `compile_a8w4_fmoe_bm64(q)` → `tp_fmoe_kernel` / `tp_fmoe_q_kernel` | `a8w4_fmoe_bm64(q)` |
+| `ep_prep` | `compile_ep_prep` → `ep_prep_kernel` | `ep_prep` |
+| `ep_gemm` | `compile_ep_gemm1/2` → `ep_gemm1_kernel` / `ep_gemm2_kernel` | `ep_gemm1/2` |
+| `ep_small` | `compile_ep_small` → `ep_small_kernel` | `ep_moe_small` |
+| `ep_mega` | `compile_ep_mega` → `ep_mega_kernel` | `megamoe.MegaMoeEpA8W4` |
+| `ep_mega_comm` | `compile_quant/prep/plan/finish` → `mega_quant/prep/plan/finish_kernel` | 同上 |
+
+其他调用方：`isa_snapshot.py`（megamoe 只编译不启动）、`bench/dist.py`（`compile_ep_mega`）；`experiments/` 里 6 个脚本 import `_run_compiled`，`20261115_mega_bcm/sweep.py` 调 `compile_ep_mega`。
+
+**规则**：
+
+- kernel 对象叫 `<文件名>_kernel`（用户 2026-11-16 定）；`ep_mega_comm` 的 4 个叫 `mega_<名>_kernel`。
+- builder 函数体不改。`@flyc.kernel` 的名字不改，ISA、rocprof trace、perf 日志都对得上。编译 key 的参数名（`D_HIDDEN`、`BM` 等）也不改，留给 Q21。
+- launch 的参数顺序不改。op 里直接传 tensor（`None` 表示空指针），去掉 `.data_ptr()` 和 stream；op 的签名不改（公开 API）。
+- 默认值和 builder 的 keyword 默认值保持原样，不搬进 `heuristics`。省略某个 key 和显式传默认值会得到两个 variant，但它们是同一个二进制。
+- `channel_exp` 的 `rows` 仍在 key 里：它只在准备权重时调用，每个模型一个形状。改成运行时参数会改 ISA，不在本迭代做。
+- 常驻对象（megamoe）在 `__init__` 里用 `kern.get(**key)` 绑定一次，热路径直接调用。
+- `_run_compiled` 搬到 `experiments/_launch.py`，实验脚本只改 import；调用 `compile_x(...)` 的地方改成 `x_kernel.builder(...)`（用户 2026-11-16 定）。
+- 无用的 kernel 参数（`tp_gemm1` 的 `tbl` / `rank` / `epoch` / `tiles`，`tp_gemm2` 的 `dbg` / `tbl` / `rank` / `epoch`，`tp_fmoe` 的 `dbg`）最后一步单独删。会改 kernarg 布局，ISA 的差异要逐个解释。
+
+**任务**（每步一个提交；每步都跑 ISA 快照、API 测试和单卡 pytest，并用 `PYHIP_FLYDSL_CHECK=1` 跑一次 pytest，检查参数顺序、dtype 和对齐）：
+
+- [ ] 第 1 步（试点）：`row_quant`、`channel_exp`。
+- [ ] 第 2 步：TP，即 `tp_prep`、`tp_gemm1`、`tp_gemm2`、`tp_fmoe`、`tp_fmoe_q`。
+- [ ] 第 3 步：EP，即 `ep_prep`、`ep_gemm`、`ep_small`。
+- [ ] 第 4 步：megamoe，即 `ep_mega`、`ep_mega_comm`、`megamoe.py`、`isa_snapshot.py`、`bench/dist.py`；多卡 pytest。
+- [ ] 第 5 步：删除 `kernels/_launch.py`；新建 `experiments/_launch.py`，改实验脚本的 import 和 `.builder(...)`。
+- [ ] 第 6 步：删无用的 kernel 参数，ISA 的差异逐个解释。
+- [ ] 文档：README、本文件。
+- **验收**：第 1–5 步 ISA IDENTICAL；第 6 步只有 kernarg 相关的差异；API 测试；单卡和多卡 pytest；`grep -rn "_run_compiled\|current_stream()\|functools.cache\|@cache" kernels/ megamoe.py` 没有结果。
+
+### 3.2 I4：kernel 文件之间不再互相 import（已完成）
 
 **现状**（I3 之后）：kernel 文件之间的引用都是模块属性调用（`G1.x`、`EP.x`、`PR.x`、`F.x`），这些 helper 不进 FlyDSL 缓存 key；还有逐字节相同的重复定义：
 
@@ -134,7 +175,7 @@
 - [x] 文档：README 的目录结构（新共享模块、kernel 文件之间不互相 import）、`_make_core` 的位置、9.2 节硬件常量（`_hw.py`）、12 节来源表；`flydsl-gfx942-pitfalls` skill 指向 `_hw.py`；`_fp8x4_pack` 的 docstring 写明 NaN 靠 scale 传播；本文件。
 - **验收**：ISA IDENTICAL（第 4 步除外）；API 测试；单卡 pytest；`grep "from \. import\|from \.[a-z]" kernels/*.py` 只剩共享模块（`_` 开头）和 `ep_gemm` 的 `ep_prep`。全部满足。
 
-### 3.2 I3：精简 `_vendor`，迁到 `kernels/` 的共享模块（已完成）
+### 3.3 I3：精简 `_vendor`，迁到 `kernels/` 的共享模块（已完成）
 
 **背景**：`_vendor/` 是为了不依赖 aiter，从 aiter 原样复制来的 9 个文件（2268 行）。用 AST 从包内所有调用点（含 `experiments/`）做可达性分析，约 1170 行走不到：
 
@@ -175,7 +216,7 @@
 - 第 1 步删 `get_element_ptr` 的 `elem_type` 参数时漏了 `_gep1` 的调用点，ISA 快照的编译失败直接暴露了问题：快照每次用新的 `FLYDSL_RUNTIME_CACHE_DIR`，结论可信。
 - 引入 `host_launch` 后，导入 a8w4 会加载 pyhip 的这个模块（多约 0.03 s）。`kernels/_launch.py` 是包内唯一的 pyhip 绝对导入，README 的“复制到其他工程”已写明。
 
-### 3.3 I2：删除 EP kernel 的调试开关和 a16w4 路径（已完成）
+### 3.4 I2：删除 EP kernel 的调试开关和 a16w4 路径（已完成）
 
 **范围**（a16w4 依据 Q11：以后要上线时作为独立的族加回来）：
 
@@ -207,7 +248,7 @@
 - `experiments/20261114_splitk_gemm1/ep_gemm_sk.py` 是独立的副本，`SKG.*` 调用照旧带 `adt`，不要跟着改。
 - `ep_small` 的 gemm1 中间结果本来就是 bf16（两种模式都是），`_bf16x2_rne` 仍在用，不属于 a16w4。
 
-### 3.4 I1b：删除 TP kernel 里调用方不用的模式取值（已完成）
+### 3.5 I1b：删除 TP kernel 里调用方不用的模式取值（已完成）
 
 **规则**：
 
@@ -240,7 +281,7 @@
 - 折叠掉的选项在 kernel 名字里的标签，直接写成字符串常量，并加注释说明“这些选项现在恒开”。
 - 只服务于被删路径的 buffer、copy atom 等，删掉后 ISA 不变（本来就会被 DCE）。
 
-### 3.5 I1：删除 TP kernel 里走不到的代码（已完成）
+### 3.6 I1：删除 TP kernel 里走不到的代码（已完成）
 
 host 端（`moe._run_tp2k`，G1/G2 唯一的调用方）只用到 gemm1 的 `epilog="q8s"`（`moe.py:170`），以及 gemm2 的 `lds` 和 `epilog="direct64"`（`moe.py:178`）；megamoe 只用到 `G1.situ_args`。
 
@@ -268,7 +309,7 @@ host 端（`moe._run_tp2k`，G1/G2 唯一的调用方）只用到 gemm1 的 `epi
 - `experiments/` 里的脚本也会调用 kernel 的 host 函数，ISA 快照和 pytest 覆盖不到。删 host 参数后要 grep 这些脚本（`20261114_tp_prep/run.py` 原来给 gemm1 传了 `topk=`，已改）。
 - README 9.5 节原来列着这些实验选项，已经同步改了。
 
-当时列出的 I1b 候选（`fast_dec=0/1`、`flush_tiny`、`A_GROUP=0`、`ROW_VGPR=False`、`dyn_rows=False`、gemm1 的 `epilog="bf16"` 和 `pipeline`），用户决定删，已在 I1b 完成（见 3.4 节）。`dyn_m=False` 和 `xcd_swizzle` 按规则保留。
+当时列出的 I1b 候选（`fast_dec=0/1`、`flush_tiny`、`A_GROUP=0`、`ROW_VGPR=False`、`dyn_rows=False`、gemm1 的 `epilog="bf16"` 和 `pipeline`），用户决定删，已在 I1b 完成（见 3.5 节）。`dyn_m=False` 和 `xcd_swizzle` 按规则保留。
 
 ## 4. 迭代记录
 
