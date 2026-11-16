@@ -16,7 +16,8 @@ deleted unless ``--keep-raw`` (they reach ~60 MB). Profile a short CMD: everythi
 launches is counted (filter with ``--kernel``).
 isa-snapshot / isa-diff: the ISA of every kernel variant the package compiles, normalized
 (kernel names masked), and a set comparison of two snapshots; a structural refactor step
-must leave it identical. See ``isa_snapshot.py``:
+must leave it identical; isa-cover: kernels a command compiles that a snapshot lacks. See
+``isa_snapshot.py``:
 
     python -m pyhip.contrib.flydsl.a8w4.prof isa-snapshot --out /tmp/a8w4_isa/base
     python -m pyhip.contrib.flydsl.a8w4.prof isa-diff /tmp/a8w4_isa/base /tmp/a8w4_isa/new
@@ -191,6 +192,12 @@ def isa_diff(argv):
     diff(argv)
 
 
+def isa_cover(argv):
+    from .isa_snapshot import cover
+
+    cover(argv)
+
+
 def isa_worker(argv):
     from .isa_snapshot import worker
 
@@ -199,7 +206,7 @@ def isa_worker(argv):
 
 def main():
     tools = {"counters": counters, "isa": isa, "isa-snapshot": isa_snapshot,
-             "isa-diff": isa_diff, "isa-worker": isa_worker}
+             "isa-diff": isa_diff, "isa-cover": isa_cover, "isa-worker": isa_worker}
     if len(sys.argv) < 2 or sys.argv[1] not in tools:
         print(__doc__)
         sys.exit(0 if sys.argv[1:2] in ([], ["-h"], ["--help"]) else 2)

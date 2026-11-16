@@ -26,6 +26,13 @@ Every compiled kernel module's final ISA is normalized (kernel symbol names ->
 ``OUT/isa/<sha>.s`` and recorded in ``OUT/jobs/<job>.jsonl`` with the matrix item that
 first compiled it. isa-diff compares the two sets of normalized ISA hashes: equal sets
 mean byte-identical code generation up to kernel names. Exit status 1 on any difference.
+
+isa-cover checks the matrix against a real workload: it runs CMD (and every Python
+process it spawns, through a ``sitecustomize`` hook) with the same capture and lists
+the kernels CMD compiled that the snapshot lacks:
+
+    python -m pyhip.contrib.flydsl.a8w4.prof isa-cover /tmp/a8w4_isa/base -- \
+        python -m pytest -q a8w4/tests/test_a8w4_moe.py
 """
 
 import argparse
@@ -456,6 +463,66 @@ def snapshot(argv):
           f"{sum('error' in r for r in recs)} errors, {meta['seconds']} s -> {out}")
     if not all(d["complete"] for d in done):
         sys.exit(1)
+
+
+# =============================================================================
+# coverage of a command
+# =============================================================================
+
+_SITE = """import os
+
+if os.environ.get("A8W4_ISA_OUT"):
+    import atexit
+
+    from {pkg} import isa_snapshot as S
+
+    _rec = S._Recorder(os.environ["A8W4_ISA_OUT"], "proc-%d" % os.getpid(),
+                       os.path.join(os.environ["FLYDSL_DUMP_DIR"], str(os.getpid())))
+    S._install_hooks(_rec)
+    _rec.item = "cmd"
+    atexit.register(lambda: _rec.write(dict(job=_rec.job, done=True,
+                                            compiles=_rec.started, recorded=_rec.seq)))
+"""
+
+
+def cover(argv):
+    if "--" not in argv:
+        raise SystemExit("usage: prof isa-cover SNAPSHOT [--out DIR] -- CMD ...")
+    i = argv.index("--")
+    ap = argparse.ArgumentParser(prog="prof isa-cover")
+    ap.add_argument("snapshot")
+    ap.add_argument("--out", default=None, help="capture directory (default: a temp dir)")
+    a = ap.parse_args(argv[:i])
+    cmd = argv[i + 1:]
+    out = Path(a.out or tempfile.mkdtemp(prefix="a8w4_isa_cover_"))
+    scratch = Path(tempfile.mkdtemp(prefix="a8w4_isa_"))
+    (scratch / "cache").mkdir()
+    (scratch / "site").mkdir()
+    (scratch / "site" / "sitecustomize.py").write_text(_SITE.format(pkg=PKG))
+    pp = os.environ.get("PYTHONPATH")
+    env = dict(os.environ, A8W4_ISA_OUT=str(out), FLYDSL_DUMP_IR="1",
+               FLYDSL_DUMP_DIR=str(scratch), FLYDSL_RUNTIME_CACHE_DIR=str(scratch / "cache"),
+               PYTHONPATH=str(scratch / "site") + (os.pathsep + pp if pp else ""))
+    try:
+        rc = subprocess.run(cmd, env=env, stdout=None, stderr=subprocess.STDOUT).returncode
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    base = {r["full"] for r in load(a.snapshot) if "full" in r}
+    recs = load(out)
+    got = [r for r in recs if "full" in r]
+    lost = [r for r in recs if r.get("done") and r["compiles"] != r["recorded"]]
+    miss = {}
+    for r in got:
+        if r["full"] not in base:
+            miss.setdefault(r["full"], r)
+    print(f"CMD exit status {rc}; {len(got)} compiles in {len({r['job'] for r in recs})} "
+          f"processes, {len({r['full'] for r in got})} distinct ISAs, {len(miss)} not in "
+          f"{a.snapshot}")
+    for h, r in miss.items():
+        print(f"  {','.join(r['kernels'])} {h}")
+    if lost:
+        print(f"compiles without a captured ISA: {lost}")
+    sys.exit(1 if rc or miss or lost or not got else 0)
 
 
 # =============================================================================
