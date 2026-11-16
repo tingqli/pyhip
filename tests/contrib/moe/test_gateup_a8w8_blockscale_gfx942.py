@@ -113,8 +113,19 @@ def make_inputs(tokens, inter_dim, hidden_dim, topk, experts, routing="random", 
     }
 
 
-def silu_mul_fp32(inputs):
-    """FP32 SiLU(gate) * up [tokens, topk, I] of every route and the routed [tokens, topk] mask."""
+def act_ref(gate, up, act="silu", situ=None):
+    """FP32 act(gate, up): SiLU(gate) * up, or SiTUv2 as pyhip.contrib.flydsl.a8w4.ref.act_ref (clamp first)."""
+    if act == "silu":
+        return torch.nn.functional.silu(gate) * up
+    situ = situ or {}
+    beta, linear_beta = situ.get("situ_beta", 1.0), situ.get("situ_linear_beta", 1.0)
+    limit = situ.get("swiglu_limit", float("inf"))
+    gate, up = gate.clamp(max=limit), up.clamp(min=-limit, max=limit)
+    return beta * torch.tanh(gate / beta) * torch.sigmoid(gate) * linear_beta * torch.tanh(up / linear_beta)
+
+
+def act_mul_fp32(inputs, act="silu", situ=None):
+    """FP32 act(gate, up) [tokens, topk, I] of every route and the routed [tokens, topk] mask."""
     tokens, inter_dim, hidden_dim, topk, experts = inputs["shape"]
     kb = hidden_dim // 128
     a_dequant = (inputs["a"].float().view(tokens, kb, 128) * inputs["a_scale_t"].t()[:, :, None]).view(tokens, hidden_dim)
@@ -130,22 +141,22 @@ def silu_mul_fp32(inputs):
             * inputs["w1_scale"][e][:, None, :, None]
         ).view(2 * inter_dim, hidden_dim)
         gate, up = (a_dequant[token[rows]] @ b_dequant.t()).split(inter_dim, dim=-1)
-        values[token[rows], slot[rows]] = torch.nn.functional.silu(gate) * up
+        values[token[rows], slot[rows]] = act_ref(gate, up, act, situ)
         routed[token[rows], slot[rows]] = True
     return values, routed
 
 
-def reference(inputs):
-    values, routed = silu_mul_fp32(inputs)
+def reference(inputs, act="silu", situ=None):
+    values, routed = act_mul_fp32(inputs, act, situ)
     out = values.to(torch.bfloat16)
     out[~routed] = float("nan")
     return out
 
 
-def sorted_fp8_reference(inputs):
-    """FP32 SiLU(gate) * up at sorted rows [0, num_valid) (zeros at padding) and its scales amax / 240 per 128 columns."""
+def sorted_fp8_reference(inputs, act="silu", situ=None):
+    """FP32 act(gate, up) at sorted rows [0, num_valid) (zeros at padding) and its scales amax / 240 per 128 columns."""
     tokens, inter_dim, hidden_dim, topk, experts = inputs["shape"]
-    values, _ = silu_mul_fp32(inputs)
+    values, _ = act_mul_fp32(inputs, act, situ)
     num_valid = int(inputs["num_valid_ids"][0])
     ids = inputs["sorted_ids"][:num_valid].long()
     token, slot = ids & 0xFFFFFF, ids >> 24 & 0xFF
@@ -186,8 +197,8 @@ def check(inputs, out, expected):
     return diff
 
 
-def check_fp8_sorted(inputs, a2, a2_scale_t, sentinel):
-    rows, scale = sorted_fp8_reference(inputs)
+def check_fp8_sorted(inputs, a2, a2_scale_t, sentinel, act="silu", situ=None):
+    rows, scale = sorted_fp8_reference(inputs, act, situ)
     num_valid = rows.shape[0]
     kernel_scale = a2_scale_t.t()[:num_valid]
     torch.testing.assert_close(kernel_scale, scale, rtol=1e-4, atol=0)
@@ -280,6 +291,57 @@ def test_gateup_fp8_sorted(tokens, inter_dim, hidden_dim, topk, experts, routing
         if previous is not None:
             assert torch.equal(a2, previous[0]) and torch.equal(a2_scale_t.view(torch.int32), previous[1].view(torch.int32))
         previous = a2.clone(), a2_scale_t.clone()
+
+
+# SiTUv2 parameters. "clamp": on these inputs it clamps 16-37% of the gates and 32-74% of the ups, changing the
+# result by calc_diff 0.05-0.16. "aiter": aiter's reference defaults, without clamp.
+SITU = {
+    "clamp": dict(situ_beta=1.0, situ_linear_beta=2.0, swiglu_limit=1.5),
+    "aiter": dict(situ_beta=4.0, situ_linear_beta=25.0),
+}
+
+
+@pytest.mark.parametrize(
+    "tokens,inter_dim,hidden_dim,topk,experts,routing",
+    [(300, 256, 512, 2, 3, "random"), (2048, 2048, 4096, 8, 32, "ep8")],
+)
+@pytest.mark.parametrize("layout", ["2x4_pf1", "4x2_pf1"])
+@pytest.mark.parametrize("fp8_out", [False, True], ids=["bf16", "fp8"])
+@pytest.mark.parametrize("situ", list(SITU))
+def test_gateup_situv2(tokens, inter_dim, hidden_dim, topk, experts, routing, layout, fp8_out, situ):
+    if not is_gfx942():
+        pytest.skip("gfx942 kernel")
+    inputs = make_inputs(tokens, inter_dim, hidden_dim, topk, experts, routing, extra_blocks=1)
+    act = dict(act="situv2", situ=SITU[situ])
+    if fp8_out:
+        capacity = inputs["expert_ids"].numel() * SORT_BLOCK_M
+        a2 = torch.full((capacity, inter_dim), 0x55, device="cuda", dtype=torch.uint8)
+        a2_scale_t = torch.full((inter_dim // 128, capacity), float("nan"), device="cuda")
+        run_kernel(inputs, a2.view(dtypes.fp8), layout, out_scale_t=a2_scale_t, topk=topk, **act)
+        torch.cuda.synchronize()
+        check_fp8_sorted(inputs, a2.view(dtypes.fp8), a2_scale_t, 0x55, **act)
+    else:
+        out = torch.full((tokens, topk, inter_dim), float("nan"), device="cuda", dtype=torch.bfloat16)
+        run_kernel(inputs, out, layout, **act)
+        torch.cuda.synchronize()
+        check(inputs, out, reference(inputs, **act))
+
+
+@pytest.mark.parametrize(
+    "act,situ",
+    [
+        ("gelu", None),
+        ("situv2", dict(situ_beta=0.0)),
+        ("situv2", dict(situ_linear_beta=float("inf"))),
+        ("situv2", dict(swiglu_limit=-1.0)),
+        ("situv2", dict(beta=4.0)),
+    ],
+)
+def test_activation_rejected(act, situ):
+    from pyhip.contrib.flydsl.moe_gateup_a8w8_blockscale_gfx942_lds import activation_args
+
+    with pytest.raises(ValueError):
+        activation_args(act, situ)
 
 
 def sustained(fn, flops, seconds):

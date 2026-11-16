@@ -4,11 +4,13 @@ GateUp + Down (pyhip.contrib.flydsl.moe_a8w8_blockscale_gfx942) instead of the 1
 Covers how SGLang calls fused_moe: EP with expert_mask and BF16 activations quantized inside fused_moe; MORI
 all-to-all with FP8 activations, token-major a1_scale, num_local_tokens below the receive-buffer rows and an output
 buffer; and no EP. Needs an aiter with the hook (luocheng25/aiter tq/moe_gemm_blockscale) and pyhip importable.
+The hook passes SiLU only; SiTUv2 is checked by calling pyhip's fused entry the way the hook does.
 
 perf: HIP_VISIBLE_DEVICES=0 python test_aiter_fused_moe_flydsl_gfx942.py --tokens 32768
 """
 
 import argparse
+import functools
 import os
 import statistics
 from unittest import mock
@@ -25,6 +27,7 @@ from test_fmoe_a8w8_blockscale_asm_gfx942 import (
     make_inputs,
     reference,
 )
+from test_gateup_a8w8_blockscale_gfx942 import SITU, act_ref
 
 ENV = "AITER_FMOE_FP8_BLOCKSCALE_FLYDSL"
 
@@ -132,6 +135,39 @@ def test_no_ep(flydsl):
     inputs = make_inputs(1000, 512, 1024, 4, 8, 1, "random")
     x, quantized = requantized(inputs)
     check(quantized, call(inputs, x), reference(quantized))
+
+
+def call_pyhip(inputs, hidden_states, a1_scale, topk_ids, topk_weights, num_local_tokens, output, **act):
+    """pyhip's fused entry as aiter's hook calls it, plus act / situ, which the hook does not pass."""
+    from pyhip.contrib.flydsl.moe_a8w8_blockscale_gfx942 import SORT_BLOCK_M, fused_moe_a8w8_blockscale_gfx942
+
+    _, _, hidden_dim, topk, experts, ep = inputs["shape"]
+    sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, _ = fm.moe_sorting(
+        topk_ids, topk_weights, experts * ep, hidden_dim, dtypes.bf16, SORT_BLOCK_M, inputs["expert_mask"],
+        num_local_tokens, output=torch.empty((0, 0), dtype=dtypes.bf16, device="cuda"),
+    )
+    return fused_moe_a8w8_blockscale_gfx942(
+        hidden_states, a1_scale.t().contiguous(), inputs["w1"], inputs["w1_scale"], inputs["w2"], inputs["w2_scale"],
+        sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, output, topk, num_rows=num_local_tokens, **act,
+    )
+
+
+@pytest.mark.parametrize("tokens,inter_dim,hidden_dim,topk,experts,ep,routing", SHAPES)
+@pytest.mark.parametrize("situ", list(SITU))
+def test_a2a_fp8_input_situv2(tokens, inter_dim, hidden_dim, topk, experts, ep, routing, situ):
+    received, buffers = a2a_inputs(make_inputs(tokens, inter_dim, hidden_dim, topk, experts, ep, routing), tokens)
+    n = received["shape"][0]
+    output = torch.full((tokens, hidden_dim), float("nan"), device="cuda", dtype=torch.bfloat16)
+    act = dict(act="situv2", situ=SITU[situ])
+    out = call_pyhip(received, buffers["a"], buffers["a1_scale"], buffers["topk_ids"], buffers["topk_weights"],
+                     buffers["num_local_tokens"], output, **act)
+    check(received, out[:n], reference(received, functools.partial(act_ref, **act)))
+    assert out[n:].isnan().all(), "rows past num_local_tokens were written"
+    written = out.view(torch.int16).clone()
+    with pytest.raises(ValueError):
+        call_pyhip(received, buffers["a"], buffers["a1_scale"], buffers["topk_ids"], buffers["topk_weights"],
+                   buffers["num_local_tokens"], output, act="situv2", situ=dict(situ_beta=-1.0))
+    assert torch.equal(out.view(torch.int16), written), "a rejected activation touched the output"
 
 
 def time_calls(fn, clones, iters, warmup):

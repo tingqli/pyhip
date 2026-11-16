@@ -3,7 +3,8 @@
 
 """gfx942 FP8 block-scale MoE GateUp (BM256) on 2x4 / 4x2 wave grids, A and B both staged through LDS.
 
-out[token, slot] = BF16(SiLU(gate) * up) for every route, gate and up from one FP8 GEMM. B is aiter
+out[token, slot] = BF16(act(gate, up)) for every route, gate and up from one FP8 GEMM; act is SiLU(gate) * up, or
+SiTUv2 with act="situv2" (see activation_args). B is aiter
 shuffle_weight(16,16) of [E, 2I, K] (gate rows, then up rows); scales are FP32: A [K/128, tokens], B
 [E, 2I/128, K/128]. Sorted IDs are (slot << 24) | token as from aiter moe_sorting(256); padding rows use an
 invalid token or slot, and blocks past ceil(num_valid_ids[0] / 256) are never read, so sort buffers may keep
@@ -16,13 +17,14 @@ written to LDS one stage after its load. A layout names the wave grid (M x N) an
   4x2_pf1: 4 waves along M (64 rows) x 2 along N (64 gate + 64 up columns); A is held, B streams.
 B rows are placed in LDS so that every wave's gate (and up) columns are contiguous. The B scales of all
 K blocks sit in one VGPR and are read with v_readlane, so the K loop issues no scalar loads.
-With fp8_out=True the output is the Down kernel's input instead: SiLU(gate) * up quantized
+With fp8_out=True the output is the Down kernel's input instead: act(gate, up) quantized
 to FP8 per (row, 128 columns) with FP32 scale amax / 240, at sorted row block * 256 + row of
 [blocks * 256, I] (scales [I/128, blocks * 256]). Row maxima meet in LDS across the waves along N, and the
 FP8 tile goes through LDS so that every dwordx4 store writes 8 full rows x 128 B.
 """
 
 import functools
+import math
 from types import SimpleNamespace
 
 import flydsl.compiler as flyc
@@ -73,6 +75,33 @@ def validate_parameters(tokens, inter_dim, hidden_dim, topk, num_experts, fp8_ou
         raise ValueError("buffer byte extents too large: " + ", ".join(over))
 
 
+def activation_args(act="silu", situ=None):
+    """Compile arguments of an activation, as a8w4_moe takes it: act "silu" (default) or "situv2".
+
+    SiTUv2(g, u) = situ_beta * tanh(g / situ_beta) * sigmoid(g) * situ_linear_beta * tanh(u / situ_linear_beta),
+    after clamping g <= swiglu_limit and |u| <= swiglu_limit. situ = dict(situ_beta=1.0, situ_linear_beta=1.0,
+    swiglu_limit=inf); missing or None entries take these defaults, an infinite limit skips the clamp. The
+    `situ` is an optional dict[str, float | None]. Its keys are `situ_beta`, `situ_linear_beta`, and
+    `swiglu_limit`; omitted keys and None values use the defaults. Example:
+    `activation_args("situv2", {"situ_beta": 1.5, "situ_linear_beta": 0.8, "swiglu_limit": 5.0})`.
+    These parameters are compile-time constants. SiLU ignores situ and returns no arguments, so its kernels are unchanged.
+    """
+    if act == "silu":
+        return {}
+    if act != "situv2":
+        raise ValueError(f"act must be 'silu' or 'situv2', got {act!r}")
+    defaults = dict(situ_beta=1.0, situ_linear_beta=1.0, swiglu_limit=math.inf)
+    unknown = set(situ or {}) - set(defaults)
+    if unknown:
+        raise ValueError(f"unknown SiTUv2 parameters {sorted(unknown)}")
+    args = {key: float(default if (situ or {}).get(key) is None else situ[key]) for key, default in defaults.items()}
+    if not all(0 < args[key] < math.inf for key in ("situ_beta", "situ_linear_beta")):
+        raise ValueError(f"situ_beta and situ_linear_beta must be finite and > 0, got {args}")
+    if not args["swiglu_limit"] > 0:
+        raise ValueError(f"swiglu_limit must be > 0 (inf: no clamp), got {args['swiglu_limit']}")
+    return dict(act="situv2", **args)
+
+
 def _lds_dwords(row, column):
     # XOR swizzle of the 16B column keeps MFMA-pattern ds_read_b128 conflict free.
     return row * (TILE_K // 4) + ((row ^ column) & 7) * 4
@@ -80,14 +109,22 @@ def _lds_dwords(row, column):
 
 @functools.cache
 def compile_moe_gateup_a8w8_blockscale_gfx942_lds(
-    inter_dim, hidden_dim, topk, num_experts, layout="2x4_pf1", xcd_swizzle=True, pair_blocks=False, fp8_out=False
+    inter_dim, hidden_dim, topk, num_experts, layout="2x4_pf1", xcd_swizzle=True, pair_blocks=False, fp8_out=False,
+    act="silu", situ_beta=1.0, situ_linear_beta=1.0, swiglu_limit=math.inf,
 ):
     """pair_blocks: aligned block pairs of one expert run N-tile-major, so both blocks stream each B tile at the
     same time and share it in L2; other tasks keep the block-major order.
     fp8_out: sorted-row FP8 output with per (row, 128 columns) scales (see the module doc).
+    act, situ_beta, situ_linear_beta, swiglu_limit: the activation, as returned by activation_args.
     """
     validate_parameters(1, inter_dim, hidden_dim, topk, num_experts)
     assert layout in LAYOUTS, layout
+    assert act in ("silu", "situv2"), act
+    # SiTUv2 takes tanh(x) = 2 * sigmoid(2x) - 1: the exp2 scales of sigmoid(g), sigmoid(2g / beta) and
+    # sigmoid(2u / linear_beta).
+    situ_exp2_scales = (-LOG2E, -2.0 * LOG2E / situ_beta, -2.0 * LOG2E / situ_linear_beta)
+    situ_scale = situ_beta * situ_linear_beta
+    situ_clamp = math.isfinite(swiglu_limit)
     I, K = inter_dim, hidden_dim
     KB = K // TILE_K
     assert 2 * KB <= 64, "B scales of all K blocks must fit in one VGPR (hidden_dim <= 4096)"
@@ -498,6 +535,30 @@ def compile_moe_gateup_a8w8_blockscale_gfx942_lds(
                     result.append(gate * inverse * up_values[element])
                 return result
 
+            def situ_mul(gate_values, up_values):
+                # All 12 exp2 go out before the reciprocals, as the 4 of silu_mul do.
+                arguments = []
+                for element in range_constexpr(4):
+                    gate, up = gate_values[element], up_values[element]
+                    if const_expr(situ_clamp):
+                        gate = fx.min(gate, fx.Float32(swiglu_limit))
+                        up = fx.max(fx.min(up, fx.Float32(swiglu_limit)), fx.Float32(-swiglu_limit))
+                    arguments += [gate * situ_exp2_scales[0], gate * situ_exp2_scales[1], up * situ_exp2_scales[2]]
+                exponents = [fx.Float32(rocdl.exp2(T.f32, argument.ir_value())) for argument in arguments]
+                sigmoids = [fx.Float32(rocdl.rcp(T.f32, (exponent + 1.0).ir_value())) for exponent in exponents]
+                result = []
+                for element in range_constexpr(4):
+                    sigmoid_gate, sigmoid_tanh_gate, sigmoid_tanh_up = sigmoids[3 * element : 3 * element + 3]
+                    tanh_gate = sigmoid_tanh_gate * 2.0 - 1.0
+                    tanh_up = sigmoid_tanh_up * 2.0 - 1.0
+                    result.append(tanh_gate * sigmoid_gate * (tanh_up * situ_scale))
+                return result
+
+            if const_expr(act == "situv2"):
+                act_mul = situ_mul
+            else:
+                act_mul = silu_mul
+
             def output_lanes():
                 out_lane = tid % 64
                 lane_group = out_lane // 16
@@ -520,7 +581,7 @@ def compile_moe_gateup_a8w8_blockscale_gfx942_lds(
                 """16 B per lane: 8 consecutive BF16 columns of gate slice `gate` (even lane groups) or gate + 1."""
                 halves = [
                     pack_bf16x2_rne(
-                        silu_mul(
+                        act_mul(
                             Vec(accum[None, acc_index(m_slice, gate + side)].load()),
                             Vec(accum[None, acc_index(m_slice, gate_slices + gate + side)].load()),
                         )
@@ -544,7 +605,7 @@ def compile_moe_gateup_a8w8_blockscale_gfx942_lds(
                 )
 
             def slice_words(lanes, j):
-                """SiLU(gate) * up of M slice j as BF16: the dwords of each of its stores."""
+                """act(gate, up) of M slice j as BF16: the dwords of each of its stores."""
                 if const_expr(gate_slices == 2):
                     return [column_pair(lanes, j, 0)]
                 # Rows r < 8 and r ^ 8 trade halves of two column pairs: each store is 8 rows x 128 B.
@@ -584,7 +645,7 @@ def compile_moe_gateup_a8w8_blockscale_gfx942_lds(
                 finish_k_loop()
                 values = [
                     [
-                        silu_mul(
+                        act_mul(
                             Vec(accum[None, acc_index(m_slice, gate)].load()),
                             Vec(accum[None, acc_index(m_slice, gate_slices + gate)].load()),
                         )
@@ -695,16 +756,19 @@ def compile_moe_gateup_a8w8_blockscale_gfx942_lds(
 
 def moe_gateup_a8w8_blockscale_gfx942_lds(
     a, w1, a_scale_t, w1_scale, sorted_ids, expert_ids, num_valid_ids, out, layout="2x4_pf1", xcd_swizzle=True,
-    pair_blocks=False, out_scale_t=None, topk=None,
+    pair_blocks=False, out_scale_t=None, topk=None, act="silu", situ=None,
 ):
     """a[T,K] fp8, w1[E,2I,K] fp8 shuffle_weight(16,16), a_scale_t[K/128,T], w1_scale[E,2I/128,K/128] fp32.
 
     sorted_ids[blocks*256] / expert_ids[blocks] / num_valid_ids[>=1] int32 as from aiter moe_sorting(256);
-    out[T,topk,I] bf16 receives SiLU(gate) * up for every valid route. layout is "2x4_pf1" or "4x2_pf1".
+    out[T,topk,I] bf16 receives act(gate, up) for every valid route. layout is "2x4_pf1" or "4x2_pf1".
     pair_blocks=True orders tasks so that consecutive blocks share each B tile in L2.
     With out_scale_t (pass topk too): out is the Down kernel's sorted-row FP8 input [blocks * 256, I] and
     out_scale_t its FP32 scales [I/128, blocks * 256].
+    act="silu" (default) gives SiLU(gate) * up; act="situv2" gives SiTUv2 with situ=dict(situ_beta,
+    situ_linear_beta, swiglu_limit), as a8w4_moe (see activation_args).
     """
+    act_args = activation_args(act, situ)
     tokens, hidden_dim = a.shape
     num_experts, two_inter, _ = w1.shape
     inter_dim = two_inter // 2
@@ -721,7 +785,7 @@ def moe_gateup_a8w8_blockscale_gfx942_lds(
     validate_parameters(tokens, inter_dim, hidden_dim, topk, num_experts, fp8_out)
     assert sorted_ids.numel() >= num_blocks * SORT_BLOCK_M
     launch = compile_moe_gateup_a8w8_blockscale_gfx942_lds(
-        inter_dim, hidden_dim, topk, num_experts, layout, bool(xcd_swizzle), bool(pair_blocks), fp8_out
+        inter_dim, hidden_dim, topk, num_experts, layout, bool(xcd_swizzle), bool(pair_blocks), fp8_out, **act_args
     )
     run_compiled(
         launch,

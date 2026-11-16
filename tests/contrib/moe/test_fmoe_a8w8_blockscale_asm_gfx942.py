@@ -163,7 +163,8 @@ def dequant_blocks(weight, scale):
     return (weight.float().view(n // BLK, BLK, k // BLK, BLK) * scale[:, None, :, None]).view(n, k)
 
 
-def reference(inputs):
+def reference(inputs, act_mul=None):
+    """FP32 MoE output; act_mul(gate, up) is the activation, SiLU(gate) * up by default."""
     tokens, inter_dim, hidden_dim, topk, experts, ep = inputs["shape"]
     fp8, fp8_max = dtypes.fp8, torch.finfo(dtypes.fp8).max
     a = (inputs["a"].float().view(tokens, -1, BLK) * inputs["a_scale_t"].t()[:, :, None]).view(tokens, hidden_dim)
@@ -177,8 +178,8 @@ def reference(inputs):
         w1 = dequant_blocks(inputs["w1_raw"][e], inputs["w1_scale"][e])
         w2 = dequant_blocks(inputs["w2_raw"][e], inputs["w2_scale"][e])
         gate, up = (a[token[rows]] @ w1.t()).split(inter_dim, dim=-1)
-        # The kernel feeds Down with the SiLU output re-quantized to FP8 per (row, 128).
-        act = (F.silu(gate) * up).view(rows.numel(), -1, BLK)
+        # The kernel feeds Down with the activation output re-quantized to FP8 per (row, 128).
+        act = (F.silu(gate) * up if act_mul is None else act_mul(gate, up)).view(rows.numel(), -1, BLK)
         act_scale = act.abs().amax(dim=-1, keepdim=True).clamp_min(1e-10) / fp8_max
         act = ((act / act_scale).to(fp8).float() * act_scale).view(rows.numel(), inter_dim)
         out.index_add_(0, token[rows], act @ w2.t() * weight[rows, None])
