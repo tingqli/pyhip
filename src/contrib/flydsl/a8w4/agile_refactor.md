@@ -13,12 +13,13 @@
 
 ### 0.1 当前状态（每次停下来前更新）
 
-- **迭代**：I1（删除 TP kernel 里走不到的代码）已完成，等用户 review。待用户决定：先做 I1b（见第 3 节末尾），还是直接进入 I2。
+- **迭代**：I1、I1b 已完成（I1b 见 3.1 节），等用户 review。下一个是 I2。
 - **分支**：`/sgl-workspace/pyhip` 的 `refactor/a8w4`。
 - **已有提交**：
   - 迭代 0，安全网：`64ce77c`、`d17f502`（ISA 基线在这个提交上生成）、`4e256d9`。
   - 设计文档：`1383e41`、`0c50a56`、`ab05750`、`6e2c2ac`（本文件）。
   - I1：`0b0e3c9`、`725209f`、`51817b1`、`f9d75f3`、`cb2e8f0`（收尾：文档和实验脚本）。
+  - I1b：`aa91396`、`2b2efaa`、`4f478b4`，加一个文档收尾提交。
 - **用户的文件**：未跟踪的 `refactory2.md` 属于用户，不要改，也不要提交。
 
 ### 0.2 工作方式
@@ -47,6 +48,7 @@
 | # | 内容 | 来源 | 验收 |
 |---|---|---|---|
 | I1 | 删除 TP kernel（`tp_gemm1`、`tp_gemm2`、`tp_fmoe`、`tp_fmoe_q`）里走不到的选项和冻结常量 | Q4，Phase 1 | ISA IDENTICAL；API 测试；单卡 pytest |
+| I1b | 删除 TP kernel 里调用方不用的模式取值（fast_dec 0/1、gemm1 的 bf16 epilogue 等，规则见 3.1 节） | 用户在 I1 review 时决定 | 同上 |
 | I2 | 删除 EP kernel 里走不到的选项（`TL` 等）和 a16w4 路径，包括 bench 的 `adt=bf16` 覆盖 | Q4，Q11 | 同上 |
 | I3 | `_vendor/tensor_shim.py` 里的 3 个环境变量开关：查清影响后，冻结成常量或删除 | Phase 1 | ISA IDENTICAL |
 | I4 | device 共享库：`_vendor` 用到的部分并入 `kernels/_*.py`；kernel 文件之间不再互相 import；`_fp4x8_to_fp8x8` 只留一份；硬件常量集中定义 | Q12，Q14，Phase 2 | ISA IDENTICAL |
@@ -78,7 +80,42 @@
 - bench 的 variant 覆盖只作用于 ep3k：`g1.*` 和 `g2.*` 会作为 `ep_gemm1` / `ep_gemm2` 的参数传入，此外还有 `bm`、`rowv`、`sched`、`sst`、`adt`（见 `bench/core.py` 约 160 到 260 行）。TP kernel 的选项只能经 `moe.py`、`tune`、megamoe 走到。
 - 删完后，剩下的 kernel 的 ISA 必须完全不变。不在快照矩阵里的配置，本来就走不到。
 
-## 3. 当前迭代：I1，删除 TP kernel 里走不到的代码（已完成）
+## 3. 当前迭代
+
+### 3.1 I1b：删除 TP kernel 里调用方不用的模式取值（已完成）
+
+**规则**：
+
+- **删**：模式开关里调用方不用的取值，也就是另一种实现方式，连同只为它们存在的辅助函数和参数。
+- **留**：数值型调优参数，比如 tile 尺寸、`BM`、`b_cache_mod`、`xcd_swizzle`、`waves_per_eu`、`NTILE`、`ksplit`、`n_ctas`。即使调用方只用一个值也留着。
+- **留**：调用方确实会走到的取值。gemm1 的 `dyn_m=False` 对应调优表里的 bm32；`pipeline` 的自动规则（`rows <= 32`）两条路径都会走到，只删手动覆盖的参数。
+- **kernel 名字不变**：被折叠的标签（`_ftz`、`_fd2`、`_q8s` 等）写成常量，方便对照 perf 日志、rocprof trace 和 ISA 基线。
+
+**任务**：
+
+- [x] `kernels/tp_gemm1.py`（`aa91396`，1044 行减到 915 行）：
+  - `epilog` 只留 `"q8s"`，删掉 bf16 epilogue（连同 `_body` 的 `arg_cumsum` 参数）；
+  - `fast_dec` 只留 2，删掉 `_fp8_lut`、`_fp4x8_to_fp8x8`、`_fp8_lut_fast`；
+  - 删掉 `flush_tiny` 参数和 `pipeline` 覆盖参数（现在固定为 `rows <= 32 and K_TILES > 1`）；
+  - `prep_w1_fast(w, s, exp)` 只做 fd2，去掉 `fast_dec` 参数；
+  - host 的 `inter_dim` 改成必填。
+- [x] `kernels/tp_gemm2.py`（`2b2efaa`，1225 行减到 1034 行）：
+  - `fast_dec` 只留 2，删掉 `flush_tiny`；
+  - `A_GROUP` 只留 128，`dyn_rows` 只留 True；
+  - `epilog` 由 `NTILE` 决定，删掉这个参数；NTILE 时 `ROW_VGPR` 恒为真，LDS 里放行数据的那条路径删掉了。
+- [x] `kernels/tp_fmoe.py`（`4f478b4`）：`dyn_rows`、`xcd` 恒为真。
+- [x] 同步修改调用方：`moe.py`、`weights.py`，以及 `experiments/20261114_tp_prep/run.py`、`experiments/20261114_splitk_gemm1/run_tp.py`（`order.py` 没传这些参数）。
+- **验收结果**：
+  - 每个提交都是 ISA IDENTICAL（558 次编译，177 份 ISA）；kernel 名字逐字不变；
+  - API 测试 23 passed；
+  - 单卡 pytest：见第 4 节。
+
+**经验**：
+
+- 折叠掉的选项在 kernel 名字里的标签，直接写成字符串常量，并加注释说明“这些选项现在恒开”。
+- 只服务于被删路径的 buffer、copy atom 等，删掉后 ISA 不变（本来就会被 DCE）。
+
+### 3.2 I1：删除 TP kernel 里走不到的代码（已完成）
 
 host 端（`moe._run_tp2k`，G1/G2 唯一的调用方）只用到 gemm1 的 `epilog="q8s"`（`moe.py:170`），以及 gemm2 的 `lds` 和 `epilog="direct64"`（`moe.py:178`）；megamoe 只用到 `G1.situ_args`。
 
@@ -106,13 +143,7 @@ host 端（`moe._run_tp2k`，G1/G2 唯一的调用方）只用到 gemm1 的 `epi
 - `experiments/` 里的脚本也会调用 kernel 的 host 函数，ISA 快照和 pytest 覆盖不到。删 host 参数后要 grep 这些脚本（`20261114_tp_prep/run.py` 原来给 gemm1 传了 `topk=`，已改）。
 - README 9.5 节原来列着这些实验选项，已经同步改了。
 
-**I1b 候选，等用户决定**。下面这些是“取值”层面走不到的分支：调用方从来不传这些值，但它们属于正常的调优参数，不算实验代码。
-
-- 两个 gemm 的 `fast_dec=0/1`（调用方只用 2）、`flush_tiny=False`；
-- `tp_gemm2`：`A_GROUP=0`；NTILE 时的 `ROW_VGPR=False`；`dyn_rows=False`；
-- `tp_gemm1`：`epilog="bf16"`（已确认调用方只传 `"q8s"`）、`pipeline`、`dyn_m=False`、`xcd_swizzle=0`。
-
-删掉能让代码再短不少，但也会失去以后调优时的选项。
+当时列出的 I1b 候选（`fast_dec=0/1`、`flush_tiny`、`A_GROUP=0`、`ROW_VGPR=False`、`dyn_rows=False`、gemm1 的 `epilog="bf16"` 和 `pipeline`），用户决定删，已在 I1b 完成（见 3.1 节）。`dyn_m=False` 和 `xcd_swizzle` 按规则保留。
 
 ## 4. 迭代记录
 

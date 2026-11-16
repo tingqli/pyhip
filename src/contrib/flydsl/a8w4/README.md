@@ -270,24 +270,24 @@ gemm2：A2·W2ᵀ（按 128-K 组的 scale 重标定）× 通道因子 × 路由
 
 ### 5.3 tp2k：gemm1（q8s）+ gemm2（base / nt4）
 
-**gemm1**（`tp_gemm1.a8w4_gemm1`，`epilog="q8s"`，`fast_dec=2`）
+**gemm1**（`tp_gemm1.a8w4_gemm1`，q8s epilogue，fd2 权重）
 
 - **tile 划分**：grid = sorted block 数 × (I/128)。每个 WG 有 4 个 wave，按列分 tile_n=128 列 inter（W 的 gate、up 各 128 行）。K-tile 为 256，A 按 token gather 后放进 XOR swizzle 的 LDS。
-- **`pipeline`**（BM ≤ 32 时默认打开）：在计算当前 K-tile 时预取下一个 K-tile 的 A 和 W，A-LDS 双缓冲。BM ≥ 64 时 VGPR 不够（> 168），不开。
+- **pipeline**（BM ≤ 32 且 K-tile 多于 1 个时自动打开）：在计算当前 K-tile 时预取下一个 K-tile 的 A 和 W，A-LDS 双缓冲。BM ≥ 64 时 VGPR 不够（> 168），不开。
 - **`dyn_m`**（bm64）：运行时检查本 block 第 32 行是否已是填充行，是的话只算前 32 行。两种行数变体都编译进同一个 kernel。
 - **`xcd_swizzle=1`**：每个 XCD 拿到一段连续的 m-block，同一专家的 W 能在 XCD 的 L2 里复用。
 - **`b_cache_mod`**（配置名里的 g1bcm）：读 W 的 cache 策略，2 表示 nt。
-- **q8s epilogue**：累加结果 × xs × 通道因子 → act → bf16 暂存在 LDS → 每（行, 128 列）求 amax → fp8 + f32 scale，按 sorted 行写出。输出就是 gemm2 `a_group=128` 要读的格式，不再需要单独的量化 kernel。
+- **q8s epilogue**：累加结果 × xs × 通道因子 → act → bf16 暂存在 LDS → 每（行, 128 列）求 amax → fp8 + f32 scale，按 sorted 行写出。输出就是 gemm2 的 A 输入格式（每 128-K 组一个 scale），不再需要单独的量化 kernel。
 - **行数是运行时参数**：输出行数 `rows` 作为 launch 参数传入，所以不会按 token 数重新编译。
 
-**gemm2**（`tp_gemm2.a8w4_gemm2`，`a_group=128`，`fast_dec=2`）
+**gemm2**（`tp_gemm2.a8w4_gemm2`，A 每 128-K 组一个 scale，fd2 权重）
 
 - **`g2base`**：
   - 每个 WG 负责一个（m-block, 128 输出列），K = I，按 256 切 K-tile；
   - 每个 128-K 组的 A 有自己的累加器，dequant 时乘各自的 scale 再相加；
-  - `dyn_rows`：跳过全是填充行的 16 行子块；
+  - 运行时跳过全是填充行的 16 行子块（各行数变体都编进同一个 kernel）；
   - epilogue：乘路由权重后转 bf16，暂存在 LDS，每行以 128 B 连续的 bf16x2 atomic 写出。
-- **`g2nt4`**（`n_tiles=4, epilog="direct64", row_vgpr=True`）：
+- **`g2nt4`**（`n_tiles=4`，direct64 epilogue）：
   - 一个 CTA 负责同一 m-block 的 4 个相邻 n-tile（grid 缩小为 1/4）：A 只 stage 一次；计算 tile t 时预取 tile t+1 的 W；
   - 每行的静态数据（两组 A scale 的比值、s × 路由权重、token id）放在 VGPR 里；只用一组累加器，在组边界重标定；
   - epilogue 不经过 LDS，每行写 64 B 段。
@@ -806,9 +806,9 @@ python a8w4/tests/test_a8w4_mori_tp8.py --allreduce aiter --act silu situv2 \
 
 ### 9.5 kernel 文件里保留的实验选项
 
-TP kernel（`tp_gemm1`、`tp_gemm2`、`tp_fmoe`、`tp_fmoe_q`）里走不到的实验选项和冻结常量已经删掉（见 [agile_refactor.md](agile_refactor.md) 的 I1），剩下的 ISA 与删之前逐位相同。还留着的有：
+TP kernel（`tp_gemm1`、`tp_gemm2`、`tp_fmoe`、`tp_fmoe_q`）里走不到的实验选项、冻结常量，以及调用方不用的模式取值（`fast_dec=0/1`、`flush_tiny`、gemm1 的 bf16 epilogue 和 `pipeline` 覆盖、gemm2 的 `a_group`/`dyn_rows`/`epilog`/`row_vgpr`、fmoe 的 `dyn_rows`/`xcd`）都已删掉（见 [agile_refactor.md](agile_refactor.md) 的 I1、I1b），剩下的 ISA 与删之前逐位相同；kernel 名字里这些选项的标签照旧保留。还留着的有：
 
-- **调优参数中调用方不用的取值**：比如 `fast_dec=0/1`、gemm1 的 `pipeline` 开关和 `epilog="bf16"`。它们是正常的编译选项，调优时可以用。
+- **数值型调优参数**：tile 尺寸、`BM`、`b_cache_mod`、`xcd_swizzle`、`waves_per_eu`、`dyn_m`、`n_tiles`、`ksplit`、`n_ctas` 等，即使调用方只用一个值，调优时也可以用。
 - **没用的 kernel 参数**：`tp_gemm1` 的 `tbl`、`rank`、`epoch`、`tiles`，`tp_gemm2` 的 `dbg`、`tbl`、`rank`、`epoch`，`tp_fmoe` 的 `dbg`。代码里标了 `# unused`，host 端传 0。删掉会改变 kernarg 偏移从而改变 ISA，所以留到 host 封装重写时一起删。
 - **EP kernel 的冻结常量**：`ep_gemm` 的 `TL`（per-tile 时间线）。
 

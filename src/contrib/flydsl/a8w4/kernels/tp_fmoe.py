@@ -628,8 +628,8 @@ def a8w4_fmoe_bm64(x_fp8, x_scale, weights, sorted_ids, sorted_weights,
                    sorted_expert_ids, num_valid_ids, out, *, topk=8, b_cache_mod=1,
                    waves_per_eu=2, ksplit=1, act="silu",
                    situ_beta=1.0, situ_linear_beta=1.0, swiglu_limit=float("inf")):
-    """Fused stage1 + stage2. ``weights``: ``a8w4_prepare_weights(..., fast_dec=2)``
-    (doc-mimo/kernels/test_flydsl_moe_a16wfp4.py); sorting block_m 64; ``out`` bf16
+    """Fused stage1 + stage2. ``weights``: ``prepare_weights`` output (fd2);
+    sorting block_m 64; ``out`` bf16
     [tokens, model_dim] zeroed (moe_sorting's moe_buf). ``ksplit``: CTAs per expert
     block (each takes inter_dim / ksplit columns; more CTAs for small batches)."""
     assert weights["w1_fast_dec"] == 2 and weights["w2_fast_dec"] == 2
