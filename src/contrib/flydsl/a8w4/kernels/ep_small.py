@@ -13,14 +13,14 @@ ramps (first W bytes arrive several us after launch) plus the prep kernel itself
   order (deterministic, so all WGs agree): row k of e = the k-th set bit of e's
   masks; m-blocks of BM rows, padded per expert (same layout as moe_sorting).
 * Setup (each WG a share, write-through stores + a two-level counter): zero
-  ``out`` and (a8w4) quantize x rows to fp8 (bit-identical to quantize_rows).
-  Only a8w4 gemm1 items (x8) and gemm2 items (zeroed out) wait for it.
+  ``out`` and quantize x rows to fp8 (bit-identical to quantize_rows). Only gemm1
+  items (x8) and gemm2 items (zeroed out) wait for it.
 * Items, static round robin over the grid, all gemm1 items first:
   gemm1 item = (m-block, 16*C1*NW inter cols) -> act(gate)*up (SiLU / SiTUv2) as
   **bf16** rows of ``inter`` (deterministic position = sorted row);
   gemm2 item = (m-block, 16*C2*NW out cols): waits for the m-block's gemm1 counter,
-  stages the bf16 rows (a8w4: quantized per (row, 128) on the fly, the 3-launch
-  path's intermediate quant: ``_make_core(AQ8=True)``) and adds the routed result
+  stages the bf16 rows (quantized per (row, 128) on the fly, the 3-launch path's
+  intermediate quant: ``_make_core(AQ8=True)``) and adds the routed result
   with bf16x2 atomics.
 Every item issues its W prefetch before any wait. The last WG resets the counters.
 """
@@ -134,10 +134,8 @@ def _signal2(arg_ctr, top, sub0, bx, grid, tx):
 
 
 @functools.cache
-def compile_ep_small(*, H, I, EL, TOPK, ADT, BM, NW, C1, C2, PF, ROWV, MAXM, SCH=3,
+def compile_ep_small(*, H, I, EL, TOPK, BM, NW, C1, C2, PF, ROWV, MAXM, SCH=3,
                      ACT="silu"):
-    FP8 = ADT == "fp8"
-    assert ADT in ("fp8", "bf16")
     assert ACT in ("silu", "situv2"), ACT
     assert EL <= 32 and TOPK == 8
     NT = 64 * NW
@@ -145,13 +143,13 @@ def compile_ep_small(*, H, I, EL, TOPK, ADT, BM, NW, C1, C2, PF, ROWV, MAXM, SCH
     NB1 = I // NI1
     NO2 = 16 * C2 * NW  # gemm2 output cols per item
     NB2 = H // NO2
-    ARB1 = 128 if FP8 else 256
-    ARB2 = 128 if FP8 else 256
+    ARB1 = 128
+    ARB2 = 128
     CAP = MAXM * TOPK + EL * BM  # sorted rows incl. padding (worst case)
     MW = -(-MAXM // 64)  # 64-token words
     assert ROWV[-1] == BM and all(r % 16 == 0 for r in ROWV)
     assert MAXM <= NUM_CU * NW  # setup x quant: <= 1 row per wave at >= 1 WG/CU
-    LDS_A = max(2 * BM * ARB1, 2 * BM * ARB2 + (3 * BM * 4 if FP8 else 0))
+    LDS_A = max(2 * BM * ARB1, 2 * BM * ARB2 + 3 * BM * 4)
     # LDS after the A region (i32 index): masks [EL][MW][2], cum [EL][MW+1] (set bits
     # before word w), off [EL+1] (padded row offsets), tok8 [MAXM][2] (local expert
     # id per topk slot, 0xFF = not local)
@@ -161,7 +159,7 @@ def compile_ep_small(*, H, I, EL, TOPK, ADT, BM, NW, C1, C2, PF, ROWV, MAXM, SCH
     L_TOK8 = L_OFF + EL + 1
     LDS_BYTES = (L_TOK8 + MAXM * 2) * 4
     assert LDS_BYTES <= 32768, LDS_BYTES  # 2 WGs per CU
-    kname = (f"ep_small_{ADT}_h{H}_i{I}_e{EL}_bm{BM}_nw{NW}_c{C1}x{C2}_pf{PF}"
+    kname = (f"ep_small_fp8_h{H}_i{I}_e{EL}_bm{BM}_nw{NW}_c{C1}x{C2}_pf{PF}"
              f"_r{'x'.join(map(str, ROWV))}_m{MAXM}_s{SCH}_d0"  # _d0: no debug mode (name unchanged)
              + ("" if ACT == "silu" else f"_{ACT}"))
 
@@ -322,11 +320,10 @@ def compile_ep_small(*, H, I, EL, TOPK, ADT, BM, NW, C1, C2, PF, ROWV, MAXM, SCH
 
     @flyc.jit
     def _setup(a, bx, lane, wave, tx):
-        """this WG's share: zero ``out`` (+ a8w4 x quant), released write-through,
-        counted with the two-level counter at C_PHA."""
+        """this WG's share: zero ``out`` + x quant, released write-through, counted
+        with the two-level counter at C_PHA."""
         _zero_slice_wt(a["out"], a["m"] * fx.Int32(H * 2 // 16), bx, a["grid"], tx, NT)
-        if const_expr(FP8):
-            _quant_row(a["x"], a["x8"], a["xs"], bx * fx.Int32(NW) + wave, a["m"], lane)
+        _quant_row(a["x"], a["x8"], a["xs"], bx * fx.Int32(NW) + wave, a["m"], lane)
         _fence_release()
         _signal2(a["ctr"], fx.Int32(C_PHA), C_SUBA, bx, a["grid"], tx)
 
@@ -356,31 +353,28 @@ def compile_ep_small(*, H, I, EL, TOPK, ADT, BM, NW, C1, C2, PF, ROWV, MAXM, SCH
             a["w1e"], e * fx.Int32(2 * I) + fx.Int32(gu * I) + col0 + fx.Int32(c * 16)
             + lane_div_16 * fx.Int32(4) + fx.Int32(v)))
             for gu in range(2) for c in range(C1) for v in range(4)}
-        AB = 1 if FP8 else 2
         core = EP._make_core(
-            FP8=FP8, K=H, W_ROWS=EL * 2 * I, BM=BM, PF=PF, bcm=2, cols=cols, lds_ptr=lds_ptr,
+            K=H, W_ROWS=EL * 2 * I, BM=BM, PF=PF, bcm=2, cols=cols, lds_ptr=lds_ptr,
             LDS_BYTES=LDS_A, lane=lane, tx=tx, NT=NT, arg_w=a["w1"], arg_ws=a["w1s"],
-            arg_a=a["x8"] if FP8 else a["x"],
-            a_num_bytes=fx.Int64(a["m"]) * fx.Int64(H * AB), ARB=ARB1,
-            acm=CM_COH if FP8 else 2, SCH=SCH, TR=True)
+            arg_a=a["x8"],
+            a_num_bytes=fx.Int64(a["m"]) * fx.Int64(H), ARB=ARB1,
+            acm=CM_COH, SCH=SCH, TR=True)
 
         def row_base16(row):
-            return _row_token(lds, e, k0 + row, cnt, a["m"]) * fx.Int32(H * AB // 16)
+            return _row_token(lds, e, k0 + row, cnt, a["m"]) * fx.Int32(H // 16)
 
         def run_rows(R):
-            def pre_a():
-                if const_expr(FP8):  # x8 rows come from the setup phase
-                    _setup_if(a, first, lane, wave, tx)
-                    _wait_setup(a, tx)
+            def pre_a():  # x8 rows come from the setup phase
+                _setup_if(a, first, lane, wave, tx)
+                _wait_setup(a, tx)
 
             acc = core(R, row_base16, pre_a=pre_a)
             MR = R // 16
             fac = {k: G1._channel_factor(v) for k, v in exps.items()}
             rows = [fx.Int32(mi * 16) + lane_mod_16 for mi in range(MR)]
-            if const_expr(FP8):
-                rs = [_gload_sys(a["xs"], fx.min(_row_token(lds, e, k0 + r, cnt, a["m"]),
-                                                 a["m"] - fx.Int32(1))).bitcast(fx.Float32)
-                      for r in rows]
+            rs = [_gload_sys(a["xs"], fx.min(_row_token(lds, e, k0 + r, cnt, a["m"]),
+                                             a["m"] - fx.Int32(1))).bitcast(fx.Float32)
+                  for r in rows]
             out_rsrc = buffer_ops.create_buffer_resource_from_addr(
                 _raw(fx.Int64(a["inter"])), num_records_bytes=_raw(
                     fx.Int64(bx_m + fx.Int32(BM)) * fx.Int64(I * 2)))
@@ -392,12 +386,8 @@ def compile_ep_small(*, H, I, EL, TOPK, ADT, BM, NW, C1, C2, PF, ROWV, MAXM, SCH
                 for c in range_constexpr(C1):
                     g4 = Vec(fx.memref_load_vec(acc[0, c][mi]))
                     u4 = Vec(fx.memref_load_vec(acc[1, c][mi]))
-                    if const_expr(FP8):
-                        gv = [fx.Float32(g4[v]) * (rs[mi] * fac[0, c, v]) for v in range(4)]
-                        uv = [fx.Float32(u4[v]) * (rs[mi] * fac[1, c, v]) for v in range(4)]
-                    else:
-                        gv = [fx.Float32(g4[v]) * fac[0, c, v] for v in range(4)]
-                        uv = [fx.Float32(u4[v]) * fac[1, c, v] for v in range(4)]
+                    gv = [fx.Float32(g4[v]) * (rs[mi] * fac[0, c, v]) for v in range(4)]
+                    uv = [fx.Float32(u4[v]) * (rs[mi] * fac[1, c, v]) for v in range(4)]
                     y = gate_up_act(ACT, gv, uv, situ)
                     w2 = Vec.from_elements([EP._bf16x2_rne(y[0], y[1]),
                                             EP._bf16x2_rne(y[2], y[3])], fx.Int32)
@@ -405,8 +395,6 @@ def compile_ep_small(*, H, I, EL, TOPK, ADT, BM, NW, C1, C2, PF, ROWV, MAXM, SCH
                         w2, out_rsrc,
                         ((bx_m + rows[mi]) * fx.Int32(I) + ccol + fx.Int32(c * 16)) // fx.Int32(2),
                         mask=rows[mi] < nv, cache_modifier=CM_COH)
-            if const_expr(not FP8):  # a16w4: the setup share runs after the first item
-                _setup_if(a, first, lane, wave, tx)
             _fence_release()
             _signal(a["ctr"], fx.Int32(C_G1) + mb * fx.Int32(STRIDE), tx)
 
@@ -427,10 +415,10 @@ def compile_ep_small(*, H, I, EL, TOPK, ADT, BM, NW, C1, C2, PF, ROWV, MAXM, SCH
                                          + lane_div_16 * fx.Int32(4) + fx.Int32(v)))
                  for v in range(4)] for c in range(C2)]
         core = EP._make_core(
-            FP8=FP8, K=I, W_ROWS=EL * H, BM=BM, PF=PF, bcm=2, cols=cols, lds_ptr=lds_ptr,
+            K=I, W_ROWS=EL * H, BM=BM, PF=PF, bcm=2, cols=cols, lds_ptr=lds_ptr,
             LDS_BYTES=LDS_A, lane=lane, tx=tx, NT=NT, arg_w=a["w2"], arg_ws=a["w2s"],
             arg_a=a["inter"], a_num_bytes=fx.Int64(CAP) * fx.Int64(I * 2), ARB=ARB2,
-            acm=CM_COH, SCH=SCH, TR=True, AQ8=FP8)
+            acm=CM_COH, SCH=SCH, TR=True, AQ8=True)
         RQ = 2 * BM * ARB2 // 4  # AQ8 ratio slots [2][BM], fin [BM]
 
         def row_base16(row):
@@ -453,7 +441,7 @@ def compile_ep_small(*, H, I, EL, TOPK, ADT, BM, NW, C1, C2, PF, ROWV, MAXM, SCH
                 _wait_ge(a["ctr"], fx.Int32(C_G1) + mb * fx.Int32(STRIDE), fx.Int32(NB1), tx)
                 _wait_setup(a, tx)  # out zeroed before the atomics
 
-            acc = core(R, row_base16, hook if FP8 else None, pre_a=pre_a)
+            acc = core(R, row_base16, hook, pre_a=pre_a)
             MR = R // 16
             fac = [[G1._channel_factor(x) for x in xs4] for xs4 in exps]
             wts = global_typed_ptr(a["wts"], T.f32)
@@ -463,8 +451,7 @@ def compile_ep_small(*, H, I, EL, TOPK, ADT, BM, NW, C1, C2, PF, ROWV, MAXM, SCH
                 ok = (r < nv) & (tok < a["m"])
                 tokc = ok.select(tok, fx.Int32(0))
                 wt = fx.Float32(wts[tokc * fx.Int32(TOPK) + _slot_of(lds, tokc, e)])
-                if const_expr(FP8):
-                    wt = wt * lds_f32[fx.Int32(RQ + 2 * BM) + r]
+                wt = wt * lds_f32[fx.Int32(RQ + 2 * BM) + r]
                 for c in range_constexpr(C2):
                     a4 = Vec(acc[0, c][mi].load())
                     v4 = [a4[v] * (wt * fac[c][v]) for v in range(4)]
@@ -563,8 +550,8 @@ def compile_ep_small(*, H, I, EL, TOPK, ADT, BM, NW, C1, C2, PF, ROWV, MAXM, SCH
 _BUF = {}
 
 
-def _scratch(dev, adt, maxm, H, I, cap, nmbmax):
-    key = (dev, adt, maxm, H, I, cap)
+def _scratch(dev, maxm, H, I, cap, nmbmax):
+    key = (dev, maxm, H, I, cap)
     if key not in _BUF:
         _BUF[key] = dict(
             x8=torch.empty((maxm, H), dtype=torch.uint8, device=dev),
@@ -578,7 +565,7 @@ def _scratch(dev, adt, maxm, H, I, cap, nmbmax):
 SMALL_CFG = dict(bm=32, nw=2, c1=1, c2=4, pf=4, rowv=(16, 32), wpc=2)
 
 
-def ep_moe_small(x, W, topk_weights, topk_ids, *, e0, adt="fp8", maxm=512, cfg=None,
+def ep_moe_small(x, W, topk_weights, topk_ids, *, e0, maxm=512, cfg=None,
                  act="silu", **situ):
     """Fused small-batch EP8 MoE (one launch): bf16 x [M, H] -> bf16 [M, H]; same
     contract as ``ep_gemm.ep_moe`` (incl. ``act`` / ``situ``). ``M <= maxm``
@@ -590,10 +577,10 @@ def ep_moe_small(x, W, topk_weights, topk_ids, *, e0, adt="fp8", maxm=512, cfg=N
     K = topk_ids.shape[1]
     assert M <= maxm
     launch, info = compile_ep_small(
-        H=H, I=I, EL=E, TOPK=K, ADT=adt, BM=cfg["bm"], NW=cfg["nw"], C1=cfg["c1"],
+        H=H, I=I, EL=E, TOPK=K, BM=cfg["bm"], NW=cfg["nw"], C1=cfg["c1"],
         C2=cfg["c2"], PF=cfg["pf"], ROWV=tuple(cfg["rowv"]), MAXM=maxm,
         SCH=cfg.get("sch", 3), ACT=act)
-    s = _scratch(x.device, adt, maxm, H, I, info["CAP"], info["NMBMAX"])
+    s = _scratch(x.device, maxm, H, I, info["CAP"], info["NMBMAX"])
     out = torch.empty((M, H), dtype=torch.bfloat16, device=x.device)
     grid = NUM_CU * cfg["wpc"]
     _run_compiled(

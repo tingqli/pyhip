@@ -196,11 +196,11 @@ def _run_tp1kq(cfg, x, W, tw, ti, shape, e0, akw):
 
 
 def _run_ep3k(cfg, x, W, tw, ti, shape, e0, akw):
-    return EG.ep_moe(x, W, tw, ti, e0=e0, adt="fp8", cfg=EG.CFGS[cfg["cfg"]], **akw)
+    return EG.ep_moe(x, W, tw, ti, e0=e0, cfg=EG.CFGS[cfg["cfg"]], **akw)
 
 
 def _run_ep1k(cfg, x, W, tw, ti, shape, e0, akw):
-    return ES.ep_moe_small(x, W, tw, ti, e0=e0, adt="fp8", maxm=cfg["maxm"], **akw)
+    return ES.ep_moe_small(x, W, tw, ti, e0=e0, maxm=cfg["maxm"], **akw)
 
 
 RUNNERS = dict(tp2k=_run_tp2k, tp1k=_run_tp1k, tp1kq=_run_tp1kq, ep3k=_run_ep3k,

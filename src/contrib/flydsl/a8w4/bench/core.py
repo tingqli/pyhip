@@ -165,12 +165,12 @@ variant spec: [label=]<base>[:<override>,...]  or  [label=]py:<module | file.py>
             "ep3k l128"; a bare ep_gemm.CFGS name ("l128" = "ep3k l128"); "@table" (the
             tuned table's pick at each token count) or "@auto" (the untuned default)
   override  ep3k only: g1.<k>=v / g2.<k>=v (ep_gemm1 / ep_gemm2 kwargs: pf, bcm, acm, sch,
-            st, prio, nw, ni / no, arb, tr, wpe), <k>=v (bm, rowv=32/64/128, sched, sst),
-            adt=bf16 (the a16w4 path); v "-" drops the key (kernel default)
+            st, prio, nw, ni / no, arb, tr, wpe), <k>=v (bm, rowv=32/64/128, sched, sst);
+            v "-" drops the key (kernel default)
   py        func(x, W, topk_weights, topk_ids, *, expert_offset, num_experts, act, situ)
             -> bf16 [M, H]: any pipeline, e.g. an experiment's kernel copy
   label     the name in the tables (default: the spec)
-examples: "ep3k m64"  "pf1=m64:g2.pf=1"  "c=l128:g1.bcm=0,g2.bcm=0"  "a16=t16:adt=bf16"
+examples: "ep3k m64"  "pf1=m64:g2.pf=1"  "c=l128:g1.bcm=0,g2.bcm=0"
 """
 
 _DROP = "-"
@@ -182,7 +182,6 @@ class Variant:
     spec: str
     base: str = ""
     overrides: dict = dataclasses.field(default_factory=dict)
-    adt: str = "fp8"
     func: object = None
 
 
@@ -245,11 +244,8 @@ def parse_variant(text):
         k, eq2, val = item.partition("=")
         if not eq2:
             raise SystemExit(f"variant {text!r}: override {item!r} is not key=value")
-        if k.strip() == "adt":
-            v.adt = val.strip()
-        else:
-            v.overrides[k.strip()] = _value(val)
-    if (v.overrides or v.adt != "fp8") and not base.startswith("ep3k"):
+        v.overrides[k.strip()] = _value(val)
+    if v.overrides and not base.startswith("ep3k"):
         raise SystemExit(f"variant {text!r}: overrides apply to ep3k configs only")
     return v
 
@@ -304,7 +300,6 @@ class Resolved:
     cfg: object = None  # the config dict (None: py variant)
     bm: object = None
     cached: object = None  # cached W / A loads (None: unknown)
-    adt: str = "fp8"
 
 
 def resolve(v, case, tokens):
@@ -324,13 +319,12 @@ def resolve(v, case, tokens):
     name = config_name(cfg)
     if not supported(cfg, case.shape, act=act, tokens=tokens):
         return f"{name}: not supported at this shape / act / token count"
-    if v.overrides or v.adt != "fp8":
+    if v.overrides:
         c = ep_cfg(cfg["cfg"], v.overrides)
-        tail = ",".join([f"{k}={val}" for k, val in v.overrides.items()]
-                        + ([f"adt={v.adt}"] if v.adt != "fp8" else []))
+        tail = ",".join(f"{k}={val}" for k, val in v.overrides.items())
         return Resolved(v.label, v.spec, f"{name}:{tail}", lambda x, W, tw, ti: EG.ep_moe(
-            x, W, tw, ti, e0=e0, adt=v.adt, cfg=c, act=act, **(situ or {})),
-            cfg=cfg, bm=c["bm"], cached=_ep_cached(c), adt=v.adt)
+            x, W, tw, ti, e0=e0, cfg=c, act=act, **(situ or {})),
+            cfg=cfg, bm=c["bm"], cached=_ep_cached(c))
     return Resolved(v.label, v.spec, name, lambda x, W, tw, ti: run_config(
         cfg, x, W, tw, ti, expert_offset=e0, num_experts=EGl, act=act, situ=situ),
         cfg=cfg, bm=block_m(cfg), cached=cached_loads(cfg))

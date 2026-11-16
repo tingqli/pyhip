@@ -372,7 +372,7 @@ def compile_ep_mega(*, H, I, TOPK, token_shift, producers=16, lag=2, ROWV=(32, 6
                 for gu in range(2) for c in range(NC1) for v in range(4)
             }
             core = EP._make_core(
-                FP8=True, K=H, W_ROWS=E_LOCAL * N2, BM=BM, PF=PF, bcm=BCM1, cols=cols,
+                K=H, W_ROWS=E_LOCAL * N2, BM=BM, PF=PF, bcm=BCM1, cols=cols,
                 lds_ptr=lds_ptr, LDS_BYTES=LDS_BYTES, lane=lane, tx=tx, NT=NT, arg_w=a["w1"],
                 arg_ws=a["w1s"], arg_a=a["ra"], a_num_bytes=fx.Int64(rows_cap) * fx.Int64(H),
                 ARB=ARB, acm=2, SCH=3, TR=True)
@@ -502,7 +502,7 @@ def compile_ep_mega(*, H, I, TOPK, token_shift, producers=16, lag=2, ROWV=(32, 6
             exps = [fx.Int32(_global_i32_at(a["w2e"], e * fx.Int32(H) + col0 + fx.Int32(c * 16)
                                             + lane_mod_16)) for c in range(NC2)]
             core = EP._make_core(
-                FP8=True, K=I, W_ROWS=E_LOCAL * H, BM=BM, PF=PF, bcm=BCM2, cols=cols,
+                K=I, W_ROWS=E_LOCAL * H, BM=BM, PF=PF, bcm=BCM2, cols=cols,
                 lds_ptr=lds_ptr, LDS_BYTES=LDS_BYTES, lane=lane, tx=tx, NT=NT, arg_w=a["w2"],
                 arg_ws=a["w2s"], arg_a=a["a2"], a_num_bytes=fx.Int64(rows_cap) * fx.Int64(I),
                 ARB=ARB, acm=2, SCH=3, TR=False)
