@@ -22,8 +22,6 @@ per block = launch epoch (no reset); queue counters are double-buffered by epoch
 parity and the other parity is zeroed for the next launch.
 """
 
-import functools
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
@@ -31,6 +29,8 @@ from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
+
+from pyhip.contrib.flydsl.host_launch import flydsl_kernel
 
 from ._act import gate_up_act, situ_args, situ_params
 from ._atomic import _atomics_mi
@@ -43,7 +43,6 @@ from ._cvt import (
     _rnu_hi,
 )
 from ._hw import CM_SC1, DPP_QUAD_SWAP, NUM_XCD
-from ._launch import _run_compiled
 from ._mem import (
     _global_base_ptr1,
     _global_i32_at,
@@ -75,8 +74,8 @@ def _getreg(simm16):
                                         [_raw(fx.Int32(simm16))], [], []))
 
 
-@functools.cache
-def compile_a8w4_fmoe_bm64q(*, D_HIDDEN, D_INTER, NE, TOPK=8, b_cache_mod=1, n_ctas=608,
+@flydsl_kernel
+def tp_fmoe_q_kernel(*, D_HIDDEN, D_INTER, NE, TOPK=8, b_cache_mod=1, n_ctas=608,
                             act="silu"):
     H, INTER = D_HIDDEN, D_INTER
     assert act in ("silu", "situv2"), act
@@ -631,17 +630,13 @@ def a8w4_fmoe_bm64q(x_fp8, x_scale, weights, sorted_ids, sorted_weights,
     if n_ctas is None:
         n_ctas = 2 * torch.cuda.get_device_properties(out.device).multi_processor_count
     ws = _workspace(sorted_expert_ids.numel(), out.device)
-    launch = compile_a8w4_fmoe_bm64q(
+    tp_fmoe_q_kernel(
+        x_fp8, x_scale, weights["w1"], weights["w1_scale"], weights["w1_exp"], weights["w2"],
+        weights["w2_scale"], sorted_expert_ids, num_valid_ids, sorted_ids, sorted_weights,
+        out, tokens, ws["a2"], ws["sc"], ws["ctl"], ws["epoch"],
+        *situ_args(situ_beta, situ_linear_beta, swiglu_limit),
         D_HIDDEN=model_dim, D_INTER=weights["w1"].shape[1] // 2, NE=E, TOPK=topk,
         b_cache_mod=b_cache_mod, n_ctas=n_ctas, act=act)
-    _run_compiled(
-        launch, x_fp8.data_ptr(), x_scale.data_ptr(), weights["w1"].data_ptr(),
-        weights["w1_scale"].data_ptr(), weights["w1_exp"].data_ptr(),
-        weights["w2"].data_ptr(), weights["w2_scale"].data_ptr(),
-        sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), sorted_ids.data_ptr(),
-        sorted_weights.data_ptr(), out.data_ptr(), int(tokens), ws["a2"].data_ptr(),
-        ws["sc"].data_ptr(), ws["ctl"].data_ptr(), ws["epoch"],
-        *situ_args(situ_beta, situ_linear_beta, swiglu_limit), torch.cuda.current_stream())
     return out
 
 

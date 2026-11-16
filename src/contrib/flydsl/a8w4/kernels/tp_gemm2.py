@@ -20,19 +20,17 @@ with only the configuration the tuned A8W4 build actually runs
     ``[tokens, model_dim]``; NTILE: straight from the accumulators (``direct64``)
 """
 
-import functools
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-import torch
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
+from pyhip.contrib.flydsl.host_launch import flydsl_kernel
+
 from ._cvt import _channel_factor, _fp4x8_to_fp8x8_fast, _fp8_lut_predelta, _perm_u32
 from ._hw import NUM_XCD
-from ._launch import _run_compiled
 from ._mem import (
     _buffer_i32_scalar_read,
     _global_base_ptr1,
@@ -203,8 +201,8 @@ def _direct64_scatter_tile(accm, ids, arg_out, col_w, lane, i32_M, N_OUT):
 # =============================================================================
 
 
-@functools.cache
-def compile_a8w4_gemm2(
+@flydsl_kernel
+def tp_gemm2_kernel(
     *,
     D_HIDDEN,
     D_INTER,
@@ -933,11 +931,27 @@ def a8w4_gemm2(
     into (atomics), so the caller zeroes it (moe_sorting's moe_buf already is).
     ``a_scale`` is f32 [sorted_size, inter_dim/128] (gemm1's q8s output);
     ``w2`` / ``w2_scale`` are fd2 weights (``prepare_weights``).
-    ``n_tiles``: n-blocks per CTA (``NTILE`` of ``compile_a8w4_gemm2``; 0 = off,
+    ``n_tiles``: n-blocks per CTA (``NTILE`` of ``tp_gemm2_kernel``; 0 = off,
     lds epilogue; > 0: direct64 epilogue)."""
     tokens, model_dim = out.shape
     inter_dim = a_fp8.shape[1]
-    launch = compile_a8w4_gemm2(
+    grid = sorted_expert_ids.numel() * (model_dim // tile_n) // max(n_tiles, 1)
+    tp_gemm2_kernel(
+        a_fp8,
+        a_scale,
+        w2,
+        w2_scale,
+        sorted_expert_ids,
+        num_valid_ids,
+        sorted_ids,
+        sorted_weights,
+        out,
+        tokens,
+        0,  # dbg, tbl, rank, epoch: unused kernel args
+        0,
+        0,
+        0,
+        grid,
         D_HIDDEN=model_dim,
         D_INTER=inter_dim,
         NE=num_experts,
@@ -948,26 +962,6 @@ def a8w4_gemm2(
         xcd_swizzle=xcd_swizzle,
         waves_per_eu=waves_per_eu,
         NTILE=n_tiles,
-    )
-    grid = sorted_expert_ids.numel() * (model_dim // tile_n) // max(n_tiles, 1)
-    _run_compiled(
-        launch,
-        a_fp8.data_ptr(),
-        a_scale.data_ptr(),
-        w2.data_ptr(),
-        w2_scale.data_ptr(),
-        sorted_expert_ids.data_ptr(),
-        num_valid_ids.data_ptr(),
-        sorted_ids.data_ptr(),
-        sorted_weights.data_ptr(),
-        out.data_ptr(),
-        int(tokens),
-        0,  # dbg, tbl, rank, epoch: unused kernel args
-        0,
-        0,
-        0,
-        int(grid),
-        torch.cuda.current_stream(),
     )
     return out
 

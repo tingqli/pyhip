@@ -26,14 +26,13 @@ so each XCD gets a contiguous range of (m-block, split) work items.
 LDS: A tile / bf16 staging 16 KB + fp8 half 8 KB + scales 0.5 KB = 24.5 KB.
 """
 
-import functools
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-import torch
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
+
+from pyhip.contrib.flydsl.host_launch import flydsl_kernel
 
 from ._act import gate_up_act, situ_args, situ_params
 from ._atomic import _atomics_mi
@@ -46,7 +45,6 @@ from ._cvt import (
     _rnu_hi,
 )
 from ._hw import DPP_QUAD_SWAP, NUM_XCD
-from ._launch import _run_compiled
 from ._mem import (
     _global_i32_at,
     _raw,
@@ -74,8 +72,8 @@ LDS_H = BM * 128  # 8 KB: one quantized fp8 half
 LDS_BYTES = LDS_A + LDS_H + BM * 2 * 4
 
 
-@functools.cache
-def compile_a8w4_fmoe_bm64(*, D_HIDDEN, D_INTER, NE, TOPK=8, b_cache_mod=2,
+@flydsl_kernel
+def tp_fmoe_kernel(*, D_HIDDEN, D_INTER, NE, TOPK=8, b_cache_mod=2,
                            waves_per_eu=2, ksplit=1, act="silu"):
     H, INTER = D_HIDDEN, D_INTER
     assert act in ("silu", "situv2"), act
@@ -587,16 +585,13 @@ def a8w4_fmoe_bm64(x_fp8, x_scale, weights, sorted_ids, sorted_weights,
     assert weights["w1_fast_dec"] == 2 and weights["w2_fast_dec"] == 2
     tokens, model_dim = out.shape
     E, _, _ = weights["w2"].shape
-    launch = compile_a8w4_fmoe_bm64(
-        D_HIDDEN=model_dim, D_INTER=weights["w1"].shape[1] // 2, NE=E, TOPK=topk,
-        b_cache_mod=b_cache_mod, waves_per_eu=waves_per_eu, ksplit=ksplit, act=act)
-    _run_compiled(
-        launch, x_fp8.data_ptr(), x_scale.data_ptr(), weights["w1"].data_ptr(),
-        weights["w1_scale"].data_ptr(), weights["w1_exp"].data_ptr(),
-        weights["w2"].data_ptr(), weights["w2_scale"].data_ptr(),
-        sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), sorted_ids.data_ptr(),
-        sorted_weights.data_ptr(), out.data_ptr(), int(tokens),
+    tp_fmoe_kernel(
+        x_fp8, x_scale, weights["w1"], weights["w1_scale"], weights["w1_exp"], weights["w2"],
+        weights["w2_scale"], sorted_expert_ids, num_valid_ids, sorted_ids, sorted_weights,
+        out, tokens,
         0,  # dbg: unused kernel arg
         *situ_args(situ_beta, situ_linear_beta, swiglu_limit),
-        int(sorted_expert_ids.numel()) * ksplit, torch.cuda.current_stream())
+        sorted_expert_ids.numel() * ksplit,
+        D_HIDDEN=model_dim, D_INTER=weights["w1"].shape[1] // 2, NE=E, TOPK=topk,
+        b_cache_mod=b_cache_mod, waves_per_eu=waves_per_eu, ksplit=ksplit, act=act)
     return out

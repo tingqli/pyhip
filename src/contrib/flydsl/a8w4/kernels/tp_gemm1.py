@@ -17,14 +17,14 @@ with only the configuration the tuned A8W4 build actually runs:
     position: gemm2's A operand
 """
 
-import functools
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
+
+from pyhip.contrib.flydsl.host_launch import flydsl_kernel
 
 from ._act import gate_up_act, situ_args, situ_params
 from ._cvt import (
@@ -35,7 +35,6 @@ from ._cvt import (
     _perm_u32,
 )
 from ._hw import NUM_XCD
-from ._launch import _run_compiled
 from ._mem import (
     _buffer_i32_scalar_read,
     _global_i32_at,
@@ -57,8 +56,8 @@ from ._mma import _mma_fp8
 # =============================================================================
 
 
-@functools.cache
-def compile_a8w4_gemm1(
+@flydsl_kernel
+def tp_gemm1_kernel(
     *,
     D_HIDDEN,
     D_INTER,
@@ -763,7 +762,27 @@ def a8w4_gemm1(
     then f32 [sorted_size, inter_dim / tile_n], sorted_size =
     ``sorted_expert_ids.numel() * tile_m``."""
     tokens, model_dim = x_fp8.shape
-    launch = compile_a8w4_gemm1(
+    grid = sorted_expert_ids.numel() * (inter_dim // tile_n)
+    # rows of the q8 plane (its scales follow it). A launch arg, not a compile
+    # constant: it changes with every batch size.
+    rows = sorted_expert_ids.numel() * tile_m
+    tp_gemm1_kernel(
+        x_fp8,
+        x_scale,
+        w1,
+        w1_scale,
+        w1_exp,
+        sorted_expert_ids,
+        num_valid_ids,
+        sorted_ids,
+        out,
+        tokens,
+        0,  # tbl, rank, epoch: unused kernel args
+        0,
+        0,
+        rows,
+        *situ_args(situ_beta, situ_linear_beta, swiglu_limit),
+        grid,
         D_HIDDEN=model_dim,
         D_INTER=inter_dim,
         NE=num_experts,
@@ -775,30 +794,6 @@ def a8w4_gemm1(
         waves_per_eu=waves_per_eu,
         dyn_m=dyn_m,
         act=act,
-    )
-    grid = sorted_expert_ids.numel() * (inter_dim // tile_n)
-    # rows of the q8 plane (its scales follow it). A launch arg, not a compile
-    # constant: it changes with every batch size.
-    rows = sorted_expert_ids.numel() * tile_m
-    _run_compiled(
-        launch,
-        x_fp8.data_ptr(),
-        x_scale.data_ptr(),
-        w1.data_ptr(),
-        w1_scale.data_ptr(),
-        w1_exp.data_ptr(),
-        sorted_expert_ids.data_ptr(),
-        num_valid_ids.data_ptr(),
-        sorted_ids.data_ptr(),
-        out.data_ptr(),
-        int(tokens),
-        0,  # tbl, rank, epoch: unused kernel args
-        0,
-        0,
-        int(rows),
-        *situ_args(situ_beta, situ_linear_beta, swiglu_limit),
-        int(grid),
-        torch.cuda.current_stream(),
     )
     return out
 

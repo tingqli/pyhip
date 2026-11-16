@@ -29,8 +29,6 @@ non-empty experts get blocks), else M*K // BM + E (as aiter / ep_prep).
 Outputs = moe_sorting's (sorted_ids, sorted_weights, sorted_expert_ids,
 num_valid_ids = [padded rows, M], zeroed out) + quantize_rows' (x8, xs).
 """
-import functools
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
@@ -38,10 +36,11 @@ from flydsl.expr import gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
+from pyhip.contrib.flydsl.host_launch import flydsl_kernel
+
 from ._atomic import _latomic_add
 from ._cvt import _fp8x4_pack
 from ._hw import NUM_CU
-from ._launch import _run_compiled
 from ._mem import (
     _raw,
     buffer_load,
@@ -60,8 +59,8 @@ def _uni(v):
     return fx.Int32(rocdl.readfirstlane(T.i32, _raw(v)))
 
 
-@functools.cache
-def compile_tp_prep(*, H, TOPK, E, BM, EPT, HU, ZERO):
+@flydsl_kernel
+def tp_prep_kernel(*, H, TOPK, E, BM, EPT, HU, ZERO):
     """EPT: own routes per sort thread (RNG = 256 * EPT per sort WG); HU: 16 B id loads
     per thread per histogram round trip."""
     assert H % 512 == 0 and 1 <= E <= NT and TOPK % 4 == 0
@@ -359,11 +358,7 @@ def tp_prep(topk_ids, topk_weights, x, *, block_m, num_experts, zero=True, rng=N
     out = torch.empty((M, H), dtype=torch.bfloat16, device=dev)
     n_sort = max(-(-(M * K) // rng), nsmin, 1)
     n_quant = min(4 * NUM_CU, -(-M // NW))
-    launch = compile_tp_prep(H=H, TOPK=K, E=E, BM=block_m, EPT=rng // NT,
-                             HU=hu or _hist_unroll(M * K), ZERO=zero)
-    _run_compiled(
-        launch, topk_ids.data_ptr(), topk_weights.data_ptr(), x.data_ptr(), x8.data_ptr(),
-        xs.data_ptr(), out.data_ptr(), sids.data_ptr(), sw.data_ptr(), seids.data_ptr(),
-        nv.data_ptr(), int(M), int(n_sort), int(n_sort + n_quant),
-        torch.cuda.current_stream())
+    tp_prep_kernel(topk_ids, topk_weights, x, x8, xs, out, sids, sw, seids, nv, M, n_sort,
+                   n_sort + n_quant, H=H, TOPK=K, E=E, BM=block_m, EPT=rng // NT,
+                   HU=hu or _hist_unroll(M * K), ZERO=zero)
     return sids, sw, seids, nv, x8, xs, out
