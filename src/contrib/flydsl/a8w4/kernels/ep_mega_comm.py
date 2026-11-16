@@ -41,7 +41,7 @@ from ._mem import (
     global_typed_ptr,
     lds_typed_ptr,
 )
-from .ep_mega import (
+from ._protocol import (
     ARRIVED,
     BLOCK_M,
     CFLAG,

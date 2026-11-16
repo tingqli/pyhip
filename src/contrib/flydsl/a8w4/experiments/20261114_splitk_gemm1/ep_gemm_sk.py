@@ -73,6 +73,7 @@ from a8w4.kernels._mem import (
     lds_typed_ptr,
     lds_vec_load,
 )
+from a8w4.kernels._protocol import SCHED_BORDER
 from a8w4.kernels import ep_prep as PR  # noqa: E402
 
 
@@ -297,7 +298,7 @@ def _bucket_bounds(arg_sched, bx, grid, NB):
 
 
 def _sched_tile(arg_sched, t, NB):
-    return (_sched_i32(arg_sched, fx.Int32(PR.SCHED_BORDER) + t // fx.Int32(NB)),
+    return (_sched_i32(arg_sched, fx.Int32(SCHED_BORDER) + t // fx.Int32(NB)),
             t % fx.Int32(NB))
 
 

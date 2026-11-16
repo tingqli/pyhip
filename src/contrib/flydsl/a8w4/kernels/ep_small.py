@@ -39,6 +39,7 @@ from ._act import gate_up_act, situ_args, situ_params
 from ._atomic import _atomic_bf16x4, _gatomic_add, _gatomic_xchg, _gload_sys
 from ._cvt import _bf16x2_rne, _channel_factor, _pack_activation
 from ._hw import CM_SYS, NUM_CU
+from ._kloop import _dispatch_rows, _make_core
 from ._launch import _run_compiled
 from ._mem import (
     _global_i32_at,
@@ -49,7 +50,6 @@ from ._mem import (
     global_typed_ptr,
     lds_typed_ptr,
 )
-from . import ep_gemm as EP  # noqa: E402
 
 
 # counter workspace (int32): phase-A done (top), exit (top), NSUB phase-A / exit
@@ -265,7 +265,7 @@ def compile_ep_small(*, H, I, EL, TOPK, BM, NW, C1, C2, PF, ROWV, MAXM, SCH=3,
         return e, nv, k0, cnt
 
     def _dispatch(nv, run_rows):
-        EP._dispatch_rows(ROWV, [nv <= fx.Int32(r) for r in ROWV[:-1]], run_rows)
+        _dispatch_rows(ROWV, [nv <= fx.Int32(r) for r in ROWV[:-1]], run_rows)
 
     # ---- setup share (zero out, x quant) -------------------------------------------
     @flyc.jit
@@ -337,7 +337,7 @@ def compile_ep_small(*, H, I, EL, TOPK, BM, NW, C1, C2, PF, ROWV, MAXM, SCH=3,
             a["w1e"], e * fx.Int32(2 * I) + fx.Int32(gu * I) + col0 + fx.Int32(c * 16)
             + lane_div_16 * fx.Int32(4) + fx.Int32(v)))
             for gu in range(2) for c in range(C1) for v in range(4)}
-        core = EP._make_core(
+        core = _make_core(
             K=H, W_ROWS=EL * 2 * I, BM=BM, PF=PF, bcm=2, cols=cols, lds_ptr=lds_ptr,
             LDS_BYTES=LDS_A, lane=lane, tx=tx, NT=NT, arg_w=a["w1"], arg_ws=a["w1s"],
             arg_a=a["x8"],
@@ -398,7 +398,7 @@ def compile_ep_small(*, H, I, EL, TOPK, BM, NW, C1, C2, PF, ROWV, MAXM, SCH=3,
         exps = [[fx.Int32(_global_i32_at(a["w2e"], e * fx.Int32(H) + col0 + fx.Int32(c * 16)
                                          + lane_div_16 * fx.Int32(4) + fx.Int32(v)))
                  for v in range(4)] for c in range(C2)]
-        core = EP._make_core(
+        core = _make_core(
             K=I, W_ROWS=EL * H, BM=BM, PF=PF, bcm=2, cols=cols, lds_ptr=lds_ptr,
             LDS_BYTES=LDS_A, lane=lane, tx=tx, NT=NT, arg_w=a["w2"], arg_ws=a["w2s"],
             arg_a=a["inter"], a_num_bytes=fx.Int64(CAP) * fx.Int64(I * 2), ARB=ARB2,

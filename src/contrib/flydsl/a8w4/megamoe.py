@@ -25,6 +25,7 @@ import torch
 
 from .kernels._act import situ_args
 from .kernels._launch import _run_compiled
+from .kernels._protocol import ARRIVED, BLOCK_M, E_LOCAL, NPES, QUEUES, ROW_BITS, SCHED_EXPECTED
 from .kernels import ep_mega as K
 from .kernels import ep_mega_comm as C
 
@@ -43,18 +44,18 @@ class MegaMoeEpA8W4:
         from mori.shmem import mori_shmem_create_tensor
 
         E, N2, _ = W["w1"].shape
-        assert world == K.NPES and E == K.E_LOCAL, "EP8 x 32 local experts"
-        assert topk in (1, 2, 4, 8) and producers % K.QUEUES == 0
+        assert world == NPES and E == E_LOCAL, "EP8 x 32 local experts"
+        assert topk in (1, 2, 4, 8) and producers % QUEUES == 0
         self.W, self.rank, self.topk = W, rank, topk
         self.H, self.I = W["w2"].shape[1], N2 // 2
         self.producers, self.lag, self.act = producers, lag, act
         self.situ = situ_args(**(situ or {}))
         self.token_shift = max(int(max_tokens - 1).bit_length(), 1)
         self.tcap = 1 << self.token_shift
-        bm = K.BLOCK_M
-        s_cap = s_cap or 2 * self.tcap * topk + K.E_LOCAL * bm
+        bm = BLOCK_M
+        s_cap = s_cap or 2 * self.tcap * topk + E_LOCAL * bm
         self.s_cap = -(-s_cap // bm) * bm
-        assert self.s_cap < 1 << K.ROW_BITS
+        assert self.s_cap < 1 << ROW_BITS
         self.nblk = self.s_cap // bm
         H, I, S = self.H, self.I, self.s_cap
         dev = torch.device("cuda", torch.cuda.current_device())
@@ -68,7 +69,7 @@ class MegaMoeEpA8W4:
         self.recv_scale = sym((S, H // 128), torch.float32)
         self.down_ids = sym((S,), torch.int32)
         self.recv_w = sym((S,), torch.float32)
-        self.ws = sym((K.ARRIVED + self.nblk,), torch.int32)
+        self.ws = sym((ARRIVED + self.nblk,), torch.int32)
         self.out = sym((self.tcap, H), torch.bfloat16)
         torch.cuda.synchronize()
         ms.shmem_barrier_all()
@@ -84,7 +85,7 @@ class MegaMoeEpA8W4:
         self.status = torch.zeros(8, **i32)
         self.plan = torch.empty(C.PLAN_INTS, **i32)
         self.expert_ids = torch.zeros(self.nblk, **i32)
-        self.sched = torch.zeros(K.SCHED_EXPECTED + 2 * self.nblk, **i32)
+        self.sched = torch.zeros(SCHED_EXPECTED + 2 * self.nblk, **i32)
         # ep_plan: one workgroup per producer wave, each sorting up to 1024 routes
         self.slices = producers * 8
         assert self.tcap * topk <= self.slices * 1024, "too many routes per ep_plan slice"
@@ -103,7 +104,7 @@ class MegaMoeEpA8W4:
                   lag=lag, ACT=act)
         self.launch = K.compile_ep_mega(**kw)
         self.launch_big = K.compile_ep_mega(**kw, BCM1=0, BCM2=1)
-        self.big_tokens = K.BLOCK_M * K.E_LOCAL // topk
+        self.big_tokens = BLOCK_M * E_LOCAL // topk
         self.quant_k, self.prep_k = C.compile_quant(H), C.compile_prep()
         self.plan_k, self.finish_k = C.compile_plan(), C.compile_finish()
         self.epoch = 0

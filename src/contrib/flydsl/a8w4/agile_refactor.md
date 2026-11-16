@@ -115,7 +115,7 @@
 
 - [x] 第 1 步：TP 的重复 helper → `_cvt`、`_mma`；`situ_args` → `_act`。改 `tp_gemm1/2`、`tp_fmoe(_q)`、`ep_gemm`、`ep_mega`、`ep_small`、`megamoe.py`。
 - [x] 第 2 步：`_hw`、`_atomic`、`_mem` 的新增；改 `ep_prep`、`tp_prep`、`ep_small`、`tp_fmoe(_q)`、`ep_mega(_comm)`、`tp_gemm1/2`（`NXCD`）。`_getreg` 只有 `tp_fmoe_q` 用，搬到那里；`CM_COH` / `_CM_SYS` 合成 `CM_SYS`，`ep_mega` 的 `P2P_AUX` / `WT_AUX` 和 `tp_fmoe_q` 的 `CM_SC1` 改用 `CM_*` 位；`ep_prep` 的 `NX`、`ep_gemm` 的 XCD 轮转里的字面量 8 改成 `NUM_XCD`；`experiments/20261114_tp_prep` 的 3 个副本跟着改 import。`prof.py` 的 65536 不改（它不导入 flydsl）。
-- [ ] 第 3 步：`_kloop`、`_protocol`；`ep_mega`、`ep_small`、`ep_mega_comm` 不再 import 别的 kernel 文件，`ep_gemm` 只剩 host 端的 `ep_prep`。
+- [x] 第 3 步：`_kloop`、`_protocol`；`ep_mega`、`ep_small`、`ep_mega_comm` 不再 import 别的 kernel 文件，`ep_gemm` 只剩 host 端的 `ep_prep`。`megamoe.py` 的 `K.NPES` 这类常量改成从 `_protocol` 按名字导入；`experiments/20261114_splitk_gemm1/ep_gemm_sk.py` 跟着改 import。改写工具误报过两次（元组赋值里定义的名字、从非 kernel 模块导入的同名常量），已修。
 - [ ] 第 4 步：比较 `_fp8x4_pack` 和 `_pack_activation` 的 ISA，相同就合并。
 - [ ] 文档：README 目录结构；`agile_refactor.md`。
 - **验收**：ISA IDENTICAL；API 测试；单卡 pytest；`grep "from \. import\|from \.[a-z]" kernels/*.py` 只剩共享模块（`_` 开头）和 `ep_gemm` 的 `ep_prep`。

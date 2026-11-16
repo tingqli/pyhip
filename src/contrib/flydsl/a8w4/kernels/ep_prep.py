@@ -55,12 +55,10 @@ from ._mem import (
     global_typed_ptr,
     lds_typed_ptr,
 )
+from ._protocol import SCHED_BORDER
 
 
 NT = 256
-# GEMM tile schedule (i32, right after the cap // BM block expert ids): [0, 9): XCD
-# bucket starts (m-block slots); [SCHED_BORDER, + nblk): the m-block order.
-SCHED_BORDER = 16
 # sorted id flag: the token has exactly one local route (see _scatter)
 SID_SINGLE = -(1 << 31)
 

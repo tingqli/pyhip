@@ -6,7 +6,7 @@ into its source rank's output with BF16 atomics (the combine).
 
 Design: pyhip luwei/942-fp8-megamoe (``ep_moe_mega_gfx942.py``,
 docs/megamoe_ep8_942/mega_moe_ep8_design.md) with the FP8 block-scale GEMMs replaced by
-the a8w4 ep3k l128 tiles (``ep_gemm._make_core``: fd2 mxfp4 W streamed into VGPRs, fp8 A
+the a8w4 ep3k l128 tiles (``_kloop._make_core``: fd2 mxfp4 W streamed into VGPRs, fp8 A
 through LDS). ``ep_mega_comm.py`` (quant, prep, plan, finish) runs around it.
 
 Rows: every rank receives its routes sorted by local expert, each expert padded to
@@ -46,6 +46,7 @@ from flydsl.expr.typing import Vector as Vec
 from ._act import gate_up_act, situ_params
 from ._cvt import _channel_factor, _fp8x4_pack
 from ._hw import CM_NT, CM_SC1, CM_SYS, LDS_BYTES_MAX, _opaque_tx, _u
+from ._kloop import _dispatch_rows, _make_core
 from ._mem import (
     _buffer_i32_scalar_read,
     _global_base_ptr1,
@@ -62,19 +63,8 @@ from ._mem import (
     lds_typed_ptr,
     lds_vec_load,
 )
-from . import ep_gemm as EP
+from ._protocol import ARRIVED, BLOCK_M, E_LOCAL, NPES, QSTRIDE, QUEUES, ROW_BITS, SCHED_EXPECTED
 
-# Must match ep_mega_comm.py.
-NPES, E_LOCAL = 8, 32
-E_GLOBAL = NPES * E_LOCAL
-CFLAG = NPES * E_GLOBAL
-FFLAG = CFLAG + NPES
-ARRIVED = FFLAG + NPES
-QUEUES = 8
-QSTRIDE = 16  # i32 between two ticket counters (separate cache lines)
-SCHED_EXPECTED = QUEUES * QSTRIDE
-ROW_BITS = 18
-BLOCK_M = 128
 
 CHUNK = 8  # routes per producer wave between two signals
 P2P_AUX = CM_SYS | CM_NT  # stores written through to the destination (vmcnt covers visibility)
@@ -356,7 +346,7 @@ def compile_ep_mega(*, H, I, TOPK, token_shift, producers=16, lag=2, ROWV=(32, 6
                     + lane_div_16 * fx.Int32(4) + fx.Int32(v)))
                 for gu in range(2) for c in range(NC1) for v in range(4)
             }
-            core = EP._make_core(
+            core = _make_core(
                 K=H, W_ROWS=E_LOCAL * N2, BM=BM, PF=PF, bcm=BCM1, cols=cols,
                 lds_ptr=lds_ptr, LDS_BYTES=LDS_BYTES, lane=lane, tx=tx, NT=NT, arg_w=a["w1"],
                 arg_ws=a["w1s"], arg_a=a["ra"], a_num_bytes=fx.Int64(rows_cap) * fx.Int64(H),
@@ -471,7 +461,7 @@ def compile_ep_mega(*, H, I, TOPK, token_shift, producers=16, lag=2, ROWV=(32, 6
                     lane0_add(a["sched"] + fx.Int64((fx.Int32(SCHED_EXPECTED) + a["nblk"] + block)
                                                     * fx.Int32(4)), 1)
 
-            EP._dispatch_rows(ROWV, [n_valid <= fx.Int32(r) for r in ROWV[:-1]], run_rows)
+            _dispatch_rows(ROWV, [n_valid <= fx.Int32(r) for r in ROWV[:-1]], run_rows)
 
         # ------------------------------------------------------------------ gemm2
         def gemm2_task(a, block, nb, tx, lane, wave):
@@ -486,7 +476,7 @@ def compile_ep_mega(*, H, I, TOPK, token_shift, producers=16, lag=2, ROWV=(32, 6
                     for c in range(NC2)]
             exps = [fx.Int32(_global_i32_at(a["w2e"], e * fx.Int32(H) + col0 + fx.Int32(c * 16)
                                             + lane_mod_16)) for c in range(NC2)]
-            core = EP._make_core(
+            core = _make_core(
                 K=I, W_ROWS=E_LOCAL * H, BM=BM, PF=PF, bcm=BCM2, cols=cols,
                 lds_ptr=lds_ptr, LDS_BYTES=LDS_BYTES, lane=lane, tx=tx, NT=NT, arg_w=a["w2"],
                 arg_ws=a["w2s"], arg_a=a["a2"], a_num_bytes=fx.Int64(rows_cap) * fx.Int64(I),
@@ -598,7 +588,7 @@ def compile_ep_mega(*, H, I, TOPK, token_shift, producers=16, lag=2, ROWV=(32, 6
                 acc = core(R, row_base16, hook, pre_a=pre_a)
                 epilogue(R, acc)
 
-            EP._dispatch_rows(ROWV, [n_valid <= fx.Int32(r) for r in ROWV[:-1]], run_rows)
+            _dispatch_rows(ROWV, [n_valid <= fx.Int32(r) for r in ROWV[:-1]], run_rows)
 
         # ------------------------------------------------------------------ tasks
         def run_task(a, queue, ticket):
