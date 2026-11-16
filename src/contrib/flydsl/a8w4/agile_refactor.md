@@ -1,0 +1,135 @@
+# a8w4 重构：敏捷执行计划
+
+从 2026-11-16 起，本文件是这次重构的执行依据。
+
+- **思维草图**：`refactory.md`（Q1–Q32）、`refactory2.md`（用户的新想法）和第 5–7 轮讨论（摘要见第 5 节）。它们只提供方向和事实，不是承诺。做到某一步时再从草图里取用，发现草图不对就改掉。
+- **原则**：
+  1. 越确定、越能立刻开始、越不会返工的事越先做。
+  2. 每个迭代要小而完整：能验证（ISA 不变或 pytest 通过）、能提交、能 review。
+  3. 做当前迭代时不为远处的设计预留结构。后面发现问题，就回头重构前面的工作。
+  4. 远处的目标只当作朦胧的方向，不提前细化。
+
+## 0. 续接：新 session 从这里开始
+
+### 0.1 当前状态（每次停下来前更新）
+
+- **迭代**：I1（删除 TP kernel 里走不到的代码）进行中。
+- **分支**：`/sgl-workspace/pyhip` 的 `refactor/a8w4`。
+- **已有提交**（迭代 0，安全网）：`64ce77c`、`d17f502`（ISA 基线在这个提交上生成）、`4e256d9`。设计文档相关的提交：`1383e41`、`0c50a56`、`ab05750`。
+- **用户的文件**：未跟踪的 `refactory2.md` 属于用户，不要改，也不要提交。
+
+### 0.2 工作方式
+
+- 和用户用中文交流。需要用户决定时，用 `ask_user` 一次问一个问题；不再用 grill 的方式一问一串。
+- **一个迭代的流程**：
+  1. 在第 3 节写清本迭代的任务和验收标准；
+  2. 实现，每个小步一个提交；
+  3. 验证；
+  4. 在第 4 节记一行，更新 0.1；
+  5. 停下来等用户 review，用户同意后再开始下一个迭代。
+- 提交信息里写 ISA 对比结论，结尾加 `Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>`。
+- 环境、GPU 规矩、安全网命令、基线位置和重新生成方法，都沿用 `refactory.md` 的 §0.3 和 §0.4，内容仍然有效。
+
+### 0.3 不变量（每个迭代都要守住）
+
+- **纯结构性的改动**（删除走不到的分支、搬文件、改名、换 host 封装）：`prof isa-diff` 对基线必须输出 `ISA IDENTICAL`。kernel 名字可以变。
+- **中途不重新调优**：哪个改动需要重新调优，就说明它不是纯结构性的（Q6）。
+- **冻结的公开 API**：7 个函数和 `ref`（Q8、Q17），由 `tests/test_a8w4_api.py` 守护，不用 GPU，约 3 秒跑完。
+- **用 GPU 前**：先看 `rocm-smi --showuse`，再拿 `flock /tmp/gpu-N.lock`。卡被占用时停下来问用户（Q29）。
+
+## 1. Backlog（按确定程度分三档）
+
+### 1.1 近期：确定、可以立刻做（按顺序）
+
+| # | 内容 | 来源 | 验收 |
+|---|---|---|---|
+| I1 | 删除 TP kernel（`tp_gemm1`、`tp_gemm2`、`tp_fmoe`、`tp_fmoe_q`）里走不到的选项和冻结常量 | Q4，Phase 1 | ISA IDENTICAL；API 测试；单卡 pytest |
+| I2 | 删除 EP kernel 里走不到的选项（`TL` 等）和 a16w4 路径，包括 bench 的 `adt=bf16` 覆盖 | Q4，Q11 | 同上 |
+| I3 | `_vendor/tensor_shim.py` 里的 3 个环境变量开关：查清影响后，冻结成常量或删除 | Phase 1 | ISA IDENTICAL |
+| I4 | device 共享库：`_vendor` 用到的部分并入 `kernels/_*.py`；kernel 文件之间不再互相 import；`_fp4x8_to_fp8x8` 只留一份；硬件常量集中定义 | Q12，Q14，Phase 2 | ISA IDENTICAL |
+| I5 | host 封装改用 `@flydsl_kernel`，替代 `_run_compiled` 和 `functools.cache`；每个 kernel 文件一个公开入口。到时按文件再拆成几个迭代 | Q13，Phase 3 | ISA IDENTICAL（元数据变化要逐个解释）；pytest |
+| I6 | 新建 `workspace.py`，统一管理每张卡一份的缓冲区 | Q19 | ISA IDENTICAL；pytest |
+
+### 1.2 中期：方向清楚，细节做到时再定
+
+- kernel 内部按术语表改名，长函数拆成按阶段命名的函数（Q20、Q21）。可以在碰到某个文件时顺手做。
+- `table.py`：把调优表 CSV 的读、写、合并收拢到一处，供 dispatch 和 tune 共用。配置字符串的 parse / format 加往返测试（Q10）。
+- 族模块加注册表，目标是“加一个族只改一处”（Q1a、Q9、Q18）。接口形状可以参考第 5 节的 Op/Impl 草图，但只按 a8w4 当时的实际需要来定。
+- 统一命令行入口，去掉 `sys.path` hack（Q7）；工具搬进 `dev/`（Q16、Q25）。
+- 测试整理（Q22）、文档拆分（Q24）。
+- megamoe 套用同样的分层（Q15）。
+
+### 1.3 远期：朦胧目标，不提前计划
+
+- 与具体 kernel 无关的公共工具层，比如 `pyhip.kit`，包含 isa、timing、tune、bench 等（refactory2 §1）。
+- 把“功能”和“实现”分开：共享测试、预先算好 dispatch 计划、离线 autotune（refactory2 §2）。
+- 一条命令尝试一个优化思路（refactory2 §3）：
+  - 用 tune 和基线比较，先过精度门；
+  - 结果好就更新调优表里相关的行，并在 `perf_log.md` 里加一行。
+- 降低 host 开销：现在每次调用约 75 µs。
+- 已知问题，只记录不处理：`ep3k l128_v1` 配合 fp8 每 128 列一个 scale 的输入时 LDS 超限，`supported()` 没有拒绝这种组合。
+
+## 2. 删除规则（I1–I3 共用）
+
+- 一个选项只有在 `a8w4_moe`、`a8w4_moe_dyn`、`MegaMoeEpA8W4`、`tune`、`bench` 都走不到时才能删。
+- bench 的 variant 覆盖只作用于 ep3k：`g1.*` 和 `g2.*` 会作为 `ep_gemm1` / `ep_gemm2` 的参数传入，此外还有 `bm`、`rowv`、`sched`、`sst`、`adt`（见 `bench/core.py` 约 160 到 260 行）。TP kernel 的选项只能经 `moe.py`、`tune`、megamoe 走到。
+- 删完后，剩下的 kernel 的 ISA 必须完全不变。不在快照矩阵里的配置，本来就走不到。
+
+## 3. 当前迭代：I1，删除 TP kernel 里走不到的代码
+
+host 端只用到 `epilog="q8s"`、`"bf16"`（`moe.py:170`）和 `epilog="direct64"`（`moe.py:178`，属于 `tp_gemm2`）；megamoe 只用到 `G1.situ_args`。
+
+- [ ] `kernels/tp_gemm1.py`：
+  - 删除 `epilog` 的 `"q8"`、`"q8push"`、`"q8pushs"`，以及只服务于它们的参数和代码（`tbl`、`rank`、`epoch`、`npes`、`SCALE_RUN` 等）；
+  - 删除 `w_layout="tile"`；
+  - 删除 `PUSH_VAR`。
+- [ ] `kernels/tp_gemm2.py`：
+  - 删除 `TILE_ORDER`、`PROBE`、`AR`、`AR_SEP`；
+  - 把冻结常量 `EPI_DRAIN`、`BF16_FAST`、`WPERM`、`PERSIST`、`AR_HOOK` 折叠掉；
+  - 删除走不到的 `epilog` 分支。
+- [ ] `kernels/tp_fmoe.py`：把冻结常量 `ABL`、`LDS_PAD`、`DELAY`、`G1_SPREAD`、`PROBE` 折叠掉。
+- [ ] `kernels/tp_fmoe_q.py`：把 `DBG` 折叠掉。
+- **验收**：
+  - 每个文件一个提交，每次都跑 `isa-snapshot` 加 `isa-diff`，要求 IDENTICAL；
+  - 每次都跑 `test_a8w4_api.py`；
+  - 迭代结束时跑一次单卡 pytest，基线是 94 passed、1 skipped。
+
+## 4. 迭代记录
+
+| 日期 | 迭代 | 结果 | 提交 |
+|---|---|---|---|
+| 2026-11-15 | 0 安全网 | `prof isa-snapshot` / `isa-diff` / `isa-cover`；API 契约测试和 CSV 往返测试；ISA 和 pytest 基线 | `64ce77c` `d17f502` `4e256d9` |
+
+## 5. 草图摘要：第 5–7 轮讨论（远期目标的素材，不是承诺）
+
+- **公共工具层**：
+  - 只放 host 端代码，kernel 不 import 它，所以不影响 FlyDSL 缓存 key 和 ISA；
+  - 只在内部使用，不承诺 API 稳定。
+- **Op / Impl 草图**：
+  - `Impl` 提供：`name`、`Config`（frozen dataclass）、`graph_safe`、`candidates(p)`、`supports(p, cfg, capturing) -> 原因或 None`、`max_tokens`、`bind(p, cfg) -> 热路径函数`。
+  - `Op` 提供：`Problem`、`cases`、`make_inputs`、`reference`、`check`、`fallbacks`、`default`。
+  - 按问题和是否在 capture 预先算好 Plan，热路径目标 ≤ 1 µs。用穷举把 Plan 和旧的 `lookup_config` 对比，作为正确性证据。
+  - 只做离线 autotune。
+- **实测的 host 开销**：
+  - `lookup_config` 每次 3.7 到 4.6 µs；
+  - `a8w4_moe` 每次调用的 host 时间：强制指定配置约 75 µs，查表约 86 到 90 µs。主要花在约 10 次 launch、8 次 `torch.empty` 和 3 次 `current_stream` 上。
+- **基线版本和新版本可以在同一个进程里加载**，做法是：
+  - 用 `spec_from_file_location(别名, dir/__init__.py, submodule_search_locations=[dir])` 加载 worktree 里的目录；
+  - 在 `exec_module` 之前把模块放进 `sys.modules[别名]`。
+
+  原因是 a8w4 只用相对 import；FlyDSL 0.3.2 的缓存 key 是源码文本，源码相同的 kernel 两边共用缓存。
+- **topk=8 的输出不确定**：同一版本跑两次，结果会差 1 个 bf16 ULP（原子加的顺序不同）。所以逐位比较只适用于 topk=1。
+- **运行时可以取到 ISA 指纹**：
+  - `CompiledArtifact._ir_text` 里嵌着 HSACO；
+  - 处理流程：反转义 → `llvm-objdump` → 规范化 → sha256；
+  - 一个配置的 5 个 kernel 约 0.18 秒，缓存命中时也能用。
+- **调优和计时的事实**：
+  - FlyDSL 缓存是热的时候，一个 tune 任务组约 1 分钟，全部 5 组约 3 分钟；新配置每个要编译 5 到 13 秒；
+  - 大 batch 下不同 run 之间相差 ±5% 到 8%，所以只能在同一个 run 里交错比较；
+  - `tables.compare` 用“旧赢家在新表里的耗时”来算提升，但原地修改 kernel 时看不出差异；
+  - `time_cold` 用 GPU sleep 排除 host 开销。
+- **“一条命令尝试优化思路”的草案**：`a8w4 tune try NAME -m 说明`。
+  - 选定的 job 跑完整 tune，并把 `@base`（基线 rev 的公开 API）和 `@base#2`（噪声参照）作为额外候选交错计时。
+  - 每个点和 `@base` 比，判为 win、持平或 loss；BAD/FAIL 一票否决。
+  - 结果被接受时：只替换 win 点在调优表里的行，在 `perf_log.md` 加一行，再写报告目录和 `experiments/index.csv`。
+  - 退出码：0 接受，1 拒绝，2 精度失败。
