@@ -14,6 +14,13 @@ list) runs CMD once. The summary is the mean per dispatch of every counter, per 
 (the names carry the compile options, e.g. bcm, so variants stay apart); the raw CSVs are
 deleted unless ``--keep-raw`` (they reach ~60 MB). Profile a short CMD: everything it
 launches is counted (filter with ``--kernel``).
+isa-snapshot / isa-diff: the ISA of every kernel variant the package compiles, normalized
+(kernel names masked), and a set comparison of two snapshots; a structural refactor step
+must leave it identical. See ``isa_snapshot.py``:
+
+    python -m pyhip.contrib.flydsl.a8w4.prof isa-snapshot --out /tmp/a8w4_isa/base
+    python -m pyhip.contrib.flydsl.a8w4.prof isa-diff /tmp/a8w4_isa/base /tmp/a8w4_isa/new
+
 isa: runs CMD with a fresh, empty FlyDSL cache (a cached kernel is not compiled, so not
 dumped) and the IR / ISA dump on, then reads every ``*/21_final_isa.s``. waves/SIMD: the
 VGPR limit (512 per SIMD lane, allocated in 8s, VGPRs + AGPRs). LDS > 64 KB raises nowhere:
@@ -172,8 +179,27 @@ def isa(argv):
         print("no kernel was compiled: did CMD launch any FlyDSL kernel?")
 
 
+def isa_snapshot(argv):
+    from .isa_snapshot import snapshot
+
+    snapshot(argv)
+
+
+def isa_diff(argv):
+    from .isa_snapshot import diff
+
+    diff(argv)
+
+
+def isa_worker(argv):
+    from .isa_snapshot import worker
+
+    worker(argv)
+
+
 def main():
-    tools = {"counters": counters, "isa": isa}
+    tools = {"counters": counters, "isa": isa, "isa-snapshot": isa_snapshot,
+             "isa-diff": isa_diff, "isa-worker": isa_worker}
     if len(sys.argv) < 2 or sys.argv[1] not in tools:
         print(__doc__)
         sys.exit(0 if sys.argv[1:2] in ([], ["-h"], ["--help"]) else 2)
