@@ -13,7 +13,7 @@
 
 ### 0.1 当前状态（每次停下来前更新）
 
-- **迭代**：I1、I1b、I2、I3 已完成。I3 的范围是用户看过 I2 后改的（见 3.1 节）：`_vendor` 只留真正用到的代码，迁到 `kernels/` 下的共享模块，删掉 `_vendor/`。现在等用户 review I3，下一个是 I4。
+- **迭代**：I1、I1b、I2、I3 已完成。I3 的范围是用户看过 I2 后改的（见 3.2 节）：`_vendor` 只留真正用到的代码，迁到 `kernels/` 下的共享模块，删掉 `_vendor/`。用户看过 I3 后开始 I4（3.1 节），I4 进行中。
 - **分支**：`/sgl-workspace/pyhip` 的 `refactor/a8w4`。
 - **已有提交**：
   - 迭代 0，安全网：`64ce77c`、`d17f502`（ISA 基线在这个提交上生成）、`4e256d9`。
@@ -50,9 +50,9 @@
 | # | 内容 | 来源 | 验收 |
 |---|---|---|---|
 | I1 | 删除 TP kernel（`tp_gemm1`、`tp_gemm2`、`tp_fmoe`、`tp_fmoe_q`）里走不到的选项和冻结常量 | Q4，Phase 1 | ISA IDENTICAL；API 测试；单卡 pytest |
-| I1b | 删除 TP kernel 里调用方不用的模式取值（fast_dec 0/1、gemm1 的 bf16 epilogue 等，规则见 3.3 节） | 用户在 I1 review 时决定 | 同上 |
+| I1b | 删除 TP kernel 里调用方不用的模式取值（fast_dec 0/1、gemm1 的 bf16 epilogue 等，规则见 3.4 节） | 用户在 I1 review 时决定 | 同上 |
 | I2 | 删除 EP kernel 里走不到的选项（`TL` 等）和 a16w4 路径，包括 bench 的 `adt=bf16` 覆盖 | Q4，Q11 | 同上 |
-| I3 | 精简 `_vendor`：没人读的环境变量、类、函数、参数直接删；剩下的迁到 `kernels/` 下按主题分的共享模块；删除 `_vendor/`（规则见 3.1 节） | 原 I3 + 原 I4 前半；用户 2026-11-16 | ISA IDENTICAL；API 测试；单卡 pytest |
+| I3 | 精简 `_vendor`：没人读的环境变量、类、函数、参数直接删；剩下的迁到 `kernels/` 下按主题分的共享模块；删除 `_vendor/`（规则见 3.2 节） | 原 I3 + 原 I4 前半；用户 2026-11-16 | ISA IDENTICAL；API 测试；单卡 pytest |
 | I4 | kernel 文件之间不再互相 import（共享的 device helper 搬进 I3 建的模块，按名字导入；现在的 `G1.x`、`EP.x` 这类模块属性调用不进 FlyDSL 缓存 key）；`_fp4x8_to_fp8x8`、`_fp8x4_pack` / `_pack_activation` 只留一份；硬件常量集中定义 | Q12，Q14，Phase 2 | ISA IDENTICAL |
 | I5 | host 封装改用 `@flydsl_kernel`，替代 `_run_compiled` 和 `functools.cache`；每个 kernel 文件一个公开入口；同时删掉 I1 留下的无用 kernel 参数（标了 `# unused` 的那些）。到时按文件再拆成几个迭代 | Q13，Phase 3 | ISA IDENTICAL（kernarg 偏移变化要逐个解释）；pytest |
 | I6 | 新建 `workspace.py`，统一管理每张卡一份的缓冲区 | Q19 | ISA IDENTICAL；pytest |
@@ -84,7 +84,43 @@
 
 ## 3. 当前迭代
 
-### 3.1 I3：精简 `_vendor`，迁到 `kernels/` 的共享模块（已完成，等 review）
+### 3.1 I4：kernel 文件之间不再互相 import（进行中）
+
+**现状**（I3 之后）：kernel 文件之间的引用都是模块属性调用（`G1.x`、`EP.x`、`PR.x`、`F.x`），这些 helper 不进 FlyDSL 缓存 key；还有逐字节相同的重复定义：
+
+- `tp_gemm1` 和 `tp_gemm2` 各有一份 `_perm_u32`、`_fp8_lut_predelta`、`_fp4x8_to_fp8x8_fast`、`_channel_factor`、`_fp8_frag8`、`_mma_fp8`；`tp_fmoe`、`tp_fmoe_q`、`ep_gemm`、`ep_mega`、`ep_small` 经 `G1.` 用 `tp_gemm1` 的那份；
+- `ep_mega`、`ep_small` 经 `EP.` 用 `ep_gemm` 的 K 循环 `_make_core` 和几个小 helper；`tp_fmoe_q` 经 `F.` 用 `tp_fmoe` 的 helper；`ep_small`、`tp_prep`、`ep_mega_comm` 从 `ep_prep` 拿原子操作和 `NUM_CU`；`ep_mega_comm` 从 `ep_mega` 拿 flag 布局常量；
+- `_rsrc` 有 3 个版本（`tp_fmoe`、`ep_small` 的相同，`ep_mega` 的多一个 `nbytes`）；`NUM_CU = 304` 定义了 2 次，`NXCD = 8` 3 次，LDS 上限 65536 写了 4 次，cache 策略位 17（sc0|sc1）有两个名字。
+
+**范围**：只动 device 代码。host 端的组合（`ep_gemm.ep_moe` 调 `ep_prep`）留给 I5。规则：
+
+- 被两个以上 kernel 文件用到的 helper 和常量，搬进共享模块，按名字导入（这样也进缓存 key）；只有一个文件用的留在原处。
+- 函数体不改，名字不改；逐字节相同的重复定义只留一份。实现不同的（`_fp8x4_pack` 和 `_pack_activation`）先比 ISA，相同才合并。
+- 顺手删掉没用的模块级名字（`ep_gemm`、`ep_small` 的 `HERE`）。
+
+**目标布局**（新模块都在 `kernels/`）：
+
+| 模块 | 搬进来的内容 |
+|---|---|
+| `_cvt.py` | `_perm_u32`、`_fp8_lut_predelta`、`_fp4x8_to_fp8x8_fast`、`_channel_factor`（`tp_gemm1/2`）；`_bf16x2_rne`、`_fp8x4_pack`（`ep_gemm`）；`_rnu_hi`（`tp_fmoe`） |
+| `_mma.py`（新） | `_fp8_frag8`、`_mma_fp8`（`tp_gemm1/2`） |
+| `_act.py` | `situ_args`（host 端，`tp_gemm1`） |
+| `_hw.py`（新） | `NUM_CU`、`NUM_XCD`、LDS 上限、cache 策略位、`DPP_QUAD_SWAP`、`_getreg`、`_u`（readfirstlane）、`_opaque_tx` |
+| `_atomic.py`（新） | `_gatomic_add`、`_gatomic_xchg`、`_gload_sys`、`_latomic_add`（`ep_prep`）；`_atomic_bf16x4`（`ep_gemm`）；`_atomics4_saddr`、`_atomics_mi`（`tp_fmoe`） |
+| `_mem.py` | `_rsrc`（3 个版本合一，`nbytes` 可选）、`_ld`、`_store`（`ep_mega`）、`_lds_f32_store_masked`（`ep_gemm`） |
+| `_kloop.py`（新） | `_make_core`（流式读 W 的 K 循环，ep3k / ep1k / megamoe 共用）、`_frag`、`_masked_lds_store`、`_dispatch_rows` |
+| `_protocol.py`（新） | 一个 kernel 写、另一个 kernel 读的 buffer 格式：EP 调度表的 `SCHED_BORDER`（`ep_prep` → `ep_gemm`）；megamoe 的 flag / 队列布局（`ep_mega` ↔ `ep_mega_comm`） |
+
+**任务**（每步一个提交，每步都跑 ISA 快照）：
+
+- [ ] 第 1 步：TP 的重复 helper → `_cvt`、`_mma`；`situ_args` → `_act`。改 `tp_gemm1/2`、`tp_fmoe(_q)`、`ep_gemm`、`ep_mega`、`ep_small`、`megamoe.py`。
+- [ ] 第 2 步：`_hw`、`_atomic`、`_mem` 的新增；改 `ep_prep`、`tp_prep`、`ep_small`、`tp_fmoe(_q)`、`ep_mega(_comm)`、`tp_gemm1/2`（`NXCD`）。
+- [ ] 第 3 步：`_kloop`、`_protocol`；`ep_mega`、`ep_small`、`ep_mega_comm` 不再 import 别的 kernel 文件，`ep_gemm` 只剩 host 端的 `ep_prep`。
+- [ ] 第 4 步：比较 `_fp8x4_pack` 和 `_pack_activation` 的 ISA，相同就合并。
+- [ ] 文档：README 目录结构；`agile_refactor.md`。
+- **验收**：ISA IDENTICAL；API 测试；单卡 pytest；`grep "from \. import\|from \.[a-z]" kernels/*.py` 只剩共享模块（`_` 开头）和 `ep_gemm` 的 `ep_prep`。
+
+### 3.2 I3：精简 `_vendor`，迁到 `kernels/` 的共享模块（已完成）
 
 **背景**：`_vendor/` 是为了不依赖 aiter，从 aiter 原样复制来的 9 个文件（2268 行）。用 AST 从包内所有调用点（含 `experiments/`）做可达性分析，约 1170 行走不到：
 
@@ -125,7 +161,7 @@
 - 第 1 步删 `get_element_ptr` 的 `elem_type` 参数时漏了 `_gep1` 的调用点，ISA 快照的编译失败直接暴露了问题：快照每次用新的 `FLYDSL_RUNTIME_CACHE_DIR`，结论可信。
 - 引入 `host_launch` 后，导入 a8w4 会加载 pyhip 的这个模块（多约 0.03 s）。`kernels/_launch.py` 是包内唯一的 pyhip 绝对导入，README 的“复制到其他工程”已写明。
 
-### 3.2 I2：删除 EP kernel 的调试开关和 a16w4 路径（已完成）
+### 3.3 I2：删除 EP kernel 的调试开关和 a16w4 路径（已完成）
 
 **范围**（a16w4 依据 Q11：以后要上线时作为独立的族加回来）：
 
@@ -157,7 +193,7 @@
 - `experiments/20261114_splitk_gemm1/ep_gemm_sk.py` 是独立的副本，`SKG.*` 调用照旧带 `adt`，不要跟着改。
 - `ep_small` 的 gemm1 中间结果本来就是 bf16（两种模式都是），`_bf16x2_rne` 仍在用，不属于 a16w4。
 
-### 3.3 I1b：删除 TP kernel 里调用方不用的模式取值（已完成）
+### 3.4 I1b：删除 TP kernel 里调用方不用的模式取值（已完成）
 
 **规则**：
 
@@ -190,7 +226,7 @@
 - 折叠掉的选项在 kernel 名字里的标签，直接写成字符串常量，并加注释说明“这些选项现在恒开”。
 - 只服务于被删路径的 buffer、copy atom 等，删掉后 ISA 不变（本来就会被 DCE）。
 
-### 3.4 I1：删除 TP kernel 里走不到的代码（已完成）
+### 3.5 I1：删除 TP kernel 里走不到的代码（已完成）
 
 host 端（`moe._run_tp2k`，G1/G2 唯一的调用方）只用到 gemm1 的 `epilog="q8s"`（`moe.py:170`），以及 gemm2 的 `lds` 和 `epilog="direct64"`（`moe.py:178`）；megamoe 只用到 `G1.situ_args`。
 
@@ -218,7 +254,7 @@ host 端（`moe._run_tp2k`，G1/G2 唯一的调用方）只用到 gemm1 的 `epi
 - `experiments/` 里的脚本也会调用 kernel 的 host 函数，ISA 快照和 pytest 覆盖不到。删 host 参数后要 grep 这些脚本（`20261114_tp_prep/run.py` 原来给 gemm1 传了 `topk=`，已改）。
 - README 9.5 节原来列着这些实验选项，已经同步改了。
 
-当时列出的 I1b 候选（`fast_dec=0/1`、`flush_tiny`、`A_GROUP=0`、`ROW_VGPR=False`、`dyn_rows=False`、gemm1 的 `epilog="bf16"` 和 `pipeline`），用户决定删，已在 I1b 完成（见 3.3 节）。`dyn_m=False` 和 `xcd_swizzle` 按规则保留。
+当时列出的 I1b 候选（`fast_dec=0/1`、`flush_tiny`、`A_GROUP=0`、`ROW_VGPR=False`、`dyn_rows=False`、gemm1 的 `epilog="bf16"` 和 `pipeline`），用户决定删，已在 I1b 完成（见 3.4 节）。`dyn_m=False` 和 `xcd_swizzle` 按规则保留。
 
 ## 4. 迭代记录
 
