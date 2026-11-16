@@ -23,7 +23,7 @@ are FlyDSL (``kernels/ep_mega.py``, ``kernels/ep_mega_comm.py``).
 
 import torch
 
-from ._vendor.tensor_shim import _run_compiled
+from .kernels._launch import _run_compiled
 from .kernels import ep_mega as K
 from .kernels import ep_mega_comm as C
 from .kernels import tp_gemm1 as G1

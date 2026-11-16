@@ -1,23 +1,19 @@
-# Vendored from aiter/ops/flydsl/kernels (aiter 7cd70aca8) so the a8w4 package
-# does not depend on aiter's private FlyDSL helpers. Imports made relative.
-"""fp8 packing and the W channel-exponent scan from moe_2stage_a16wmix/a8w4.py."""
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# From aiter 7cd70aca8 aiter/ops/flydsl/kernels/moe_2stage_a16wmix/a8w4.py.
+"""W channel exponents: per output channel (row of W), the largest e8m0 scale code over K,
+read from the preshuffled scales. ``prepare_weights`` (``weights.py``) returns them as
+``w*_exp`` and stores the fd2 group scales relative to them."""
 
 from functools import cache
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl.expr import gpu, range_constexpr, rocdl
-from flydsl.expr.typing import T
+from flydsl.expr import gpu, range_constexpr
 
-from .tensor_shim import _run_compiled
-
-
-def _pointer(address, dtype, alignment=16):
-    return fx.inttoptr(
-        fx.PointerType.get(dtype.ir_type, fx.AddressSpace.Global, alignment),
-        fx.Int64(address),
-    )
+from ._launch import _run_compiled
+from ._mem import _pointer
 
 
 def _scale_index(row, group, groups):
@@ -30,15 +26,6 @@ def _scale_index(row, group, groups):
         + ((group // 4) % 2) * 2
         + (row % 32) // 16
     )
-
-
-def _pack_activation(a, b, c, d):
-    values = [fx.max(fx.min(v, 240.0), -240.0) for v in (a, b, c, d)]
-    lo = rocdl.cvt_pk_fp8_f32(T.i32, values[0], values[1], fx.Int32(0), False)
-    packed = fx.Uint32(rocdl.cvt_pk_fp8_f32(T.i32, values[2], values[3], lo, True))
-    mag = packed & fx.Uint32(0x7F7F7F7F)
-    zero = (~(mag + fx.Uint32(0x7F7F7F7F))) & fx.Uint32(0x80808080)
-    return (packed & ~zero).bitcast(fx.Int32)
 
 
 @cache

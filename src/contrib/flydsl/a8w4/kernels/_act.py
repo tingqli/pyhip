@@ -1,13 +1,11 @@
-# Vendored from aiter/ops/flydsl/kernels (aiter 7cd70aca8) so the a8w4 package
-# does not depend on aiter's private FlyDSL helpers. Imports made relative.
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (C) 2025-2026 FlyDSL Project Contributors
+# Derived from aiter 7cd70aca8 aiter/ops/flydsl/kernels/act.py
+# (Copyright (C) 2025-2026 FlyDSL Project Contributors); silu and situv2 only.
+# Modifications Copyright (C) 2026 Advanced Micro Devices, Inc.
+"""Gate / up activation of the gemm1 epilogues: ``act(gate) * up`` on f32 registers.
 
-"""Shared device-side gate/up activation helpers for FlyDSL MoE kernels.
-
-Elementwise f32-register helpers (exp2/rcp-based sigmoid, sign-restored tanh, and the
-gate*up batch forms) usable by any FlyDSL gemm1 fused gate+up epilog, plus
-:func:`gate_up_act`, which picks between them so kernels carry no ``act`` branch.
+exp2 / rcp based sigmoid and sign-restored tanh, in batch forms that emit all exp2 before
+the reciprocals. :func:`gate_up_act` picks silu or situv2 so kernels carry no ``act`` branch.
 """
 
 from typing import NamedTuple
@@ -16,7 +14,7 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, rocdl
 from flydsl.expr.typing import T
 
-from .tensor_shim import _to_raw as _raw
+from ._mem import _raw
 
 LOG2E = 1.4426950408889634
 

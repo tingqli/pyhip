@@ -43,18 +43,21 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
-from .._vendor import buffer_ops
-from .._vendor.act import gate_up_act, situ_params
-from .._vendor.moe_utils import _global_i32_at
-from .._vendor.mxfp4_gemm_common import (
-    _gep1,
+from ._act import gate_up_act, situ_params
+from ._mem import (
+    _buffer_i32_scalar_read,
     _global_base_ptr1,
+    _global_i32_at,
     _global_i32_buffer_tiles,
+    _raw,
+    buffer_load,
+    buffer_store,
+    create_buffer_resource_from_addr,
+    get_element_ptr,
     global_typed_ptr,
     lds_typed_ptr,
     lds_vec_load,
 )
-from .._vendor.tensor_shim import _to_raw as _raw
 from . import ep_gemm as EP
 from . import tp_gemm1 as G1
 
@@ -82,13 +85,13 @@ def _u(v):
 
 
 def _rsrc(addr, nbytes):
-    return buffer_ops.create_buffer_resource_from_addr(
+    return create_buffer_resource_from_addr(
         _raw(fx.Int64(addr)), num_records_bytes=_raw(fx.Int64(nbytes)))
 
 
 def _ld(rsrc, idx, width=1, mask=None):
     """i32 (width 1) / i32 x width at i32 element ``idx`` (masked: 0)."""
-    return buffer_ops.buffer_load(rsrc, idx, vec_width=width, dtype=T.i32, mask=mask)
+    return buffer_load(rsrc, idx, vec_width=width, dtype=T.i32, mask=mask)
 
 
 def _atomic_add(addr, value, scope):
@@ -326,19 +329,19 @@ def compile_ep_mega(*, H, I, TOPK, token_shift, producers=16, lag=2, ROWV=(32, 6
                     dest = ok.select(inf >> fx.Int32(ROW_BITS + 5), fx.Int32(0))
                     a_dst = peer_rsrc(0, dest, fx.Int64(rows_cap) * fx.Int64(H))
                     for part in range_constexpr(H // 1024):
-                        buffer_ops.buffer_store(
+                        buffer_store(
                             data[part], a_dst, lane * fx.Int32(4) + fx.Int32(part * 256)
                             + row * fx.Int32(H // 4), mask=ok, cache_modifier=P2P_AUX)
-                    buffer_ops.buffer_store(
+                    buffer_store(
                         scales, peer_rsrc(1, dest, fx.Int64(rows_cap) * fx.Int64(SCALE_LANES * 16)),
                         lane * fx.Int32(4) + row * fx.Int32(SCALE_LANES * 4), mask=ok & scale_lane,
                         cache_modifier=P2P_AUX)
                     first = ok & (lane == fx.Int32(0))
                     down_id = ((a["me"] << fx.Int32(token_shift)) | token) \
                         | ((rt & fx.Int32(TOPK - 1)) << fx.Int32(24))
-                    buffer_ops.buffer_store(_raw(down_id), peer_rsrc(2, dest, fx.Int64(rows_cap) * fx.Int64(4)),
+                    buffer_store(_raw(down_id), peer_rsrc(2, dest, fx.Int64(rows_cap) * fx.Int64(4)),
                                             row, mask=first, cache_modifier=P2P_AUX)
-                    buffer_ops.buffer_store(weight, peer_rsrc(3, dest, fx.Int64(rows_cap) * fx.Int64(4)),
+                    buffer_store(weight, peer_rsrc(3, dest, fx.Int64(rows_cap) * fx.Int64(4)),
                                             row, mask=first, cache_modifier=P2P_AUX)
                 rocdl.s_waitcnt(vmcnt=0)
                 src = ((infos >> fx.Int32(ROW_BITS + 5)) & fx.Int32(NPES - 1)) * fx.Int32(4)
@@ -394,8 +397,8 @@ def compile_ep_mega(*, H, I, TOPK, token_shift, producers=16, lag=2, ROWV=(32, 6
                     ok = r < fx.Int32(R)
                     rr = ok.select(r, fx.Int32(0))
                     srow = (rr < n_valid).select((bx_m + rr) * fx.Int32(G1N), rows_cap * fx.Int32(G1N))
-                    cur = G1._buffer_i32_scalar_read(xs_tiles, srow + g, xs_atom).bitcast(fx.Float32)
-                    prv = G1._buffer_i32_scalar_read(
+                    cur = _buffer_i32_scalar_read(xs_tiles, srow + g, xs_atom).bitcast(fx.Float32)
+                    prv = _buffer_i32_scalar_read(
                         xs_tiles, srow + fx.max(g - fx.Int32(1), fx.Int32(0)), xs_atom
                     ).bitcast(fx.Float32)
                     cur = (cur == fx.Float32(0.0)).select(one, cur)
@@ -462,10 +465,10 @@ def compile_ep_mega(*, H, I, TOPK, token_shift, producers=16, lag=2, ROWV=(32, 6
                     srow = bx_m + rows[mi]
                     for c in range_constexpr(NC1):
                         q = EP._fp8x4_pack(*[ys[mi, c][v] * inv for v in range(4)])
-                        buffer_ops.buffer_store(
+                        buffer_store(
                             q, out_rs, (srow * fx.Int32(I) + col + fx.Int32(c * 16)) // fx.Int32(4),
                             mask=valid[mi], cache_modifier=WT_AUX)
-                    buffer_ops.buffer_store(
+                    buffer_store(
                         s, os_rs, srow * fx.Int32(G2N) + nb * fx.Int32(GPW) + grp,
                         mask=valid[mi] & (lane_div_16 == fx.Int32(0))
                         & (wave % fx.Int32(WPG) == fx.Int32(0)), cache_modifier=WT_AUX)
@@ -520,8 +523,8 @@ def compile_ep_mega(*, H, I, TOPK, token_shift, producers=16, lag=2, ROWV=(32, 6
                     ok = r < fx.Int32(R)
                     rr = ok.select(r, fx.Int32(0))
                     srow = (bx_m + rr) * fx.Int32(G2N)
-                    cur = G1._buffer_i32_scalar_read(as_tiles, srow + g, as_atom).bitcast(fx.Float32)
-                    prv = G1._buffer_i32_scalar_read(
+                    cur = _buffer_i32_scalar_read(as_tiles, srow + g, as_atom).bitcast(fx.Float32)
+                    prv = _buffer_i32_scalar_read(
                         as_tiles, srow + fx.max(g - fx.Int32(1), fx.Int32(0)), as_atom
                     ).bitcast(fx.Float32)
                     cur_ok = (cur == fx.Float32(0.0)).select(fx.Float32(1.0), cur)
@@ -571,7 +574,7 @@ def compile_ep_mega(*, H, I, TOPK, token_shift, producers=16, lag=2, ROWV=(32, 6
                                               fx.BFloat16, align=4)
                             llvm.AtomicRMWOp(
                                 llvm.AtomicBinOp.fadd,
-                                _gep1(_global_base_ptr1(row_addr), fx.Int32(s * 128)), _raw(pk),
+                                get_element_ptr(_global_base_ptr1(row_addr), fx.Int32(s * 128)), _raw(pk),
                                 llvm.AtomicOrdering.monotonic, syncscope="agent", alignment=4)
 
             def epilogue(R, acc):
@@ -584,7 +587,7 @@ def compile_ep_mega(*, H, I, TOPK, token_shift, producers=16, lag=2, ROWV=(32, 6
                 vals = {}
                 for mi in range_constexpr(MR):
                     rows4 = fx.Int32(mi * 16) + lane_div_16 * fx.Int32(4)
-                    wts = [G1._buffer_i32_scalar_read(sw_tiles, bx_m + rows4 + fx.Int32(v), sw_atom)
+                    wts = [_buffer_i32_scalar_read(sw_tiles, bx_m + rows4 + fx.Int32(v), sw_atom)
                            .bitcast(fx.Float32) for v in range(4)]
                     fin = ratio4(fx.Int32(RATIO // 4 + G2N * BM), mi)
                     wts = [wts[v] * fin[v] for v in range(4)]

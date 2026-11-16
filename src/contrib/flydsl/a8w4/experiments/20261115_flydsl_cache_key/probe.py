@@ -13,8 +13,8 @@ import torch
 from flydsl.expr import gpu
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "other"))
-from a8w4._vendor.a8w4_ops import _pointer  # noqa: E402
-from a8w4._vendor.tensor_shim import _run_compiled  # noqa: E402
+from a8w4.kernels._launch import _run_compiled  # noqa: E402
+from a8w4.kernels._mem import _pointer  # noqa: E402
 from helper_other import helper_other  # noqa: E402
 from helper_same import helper_same  # noqa: E402
 

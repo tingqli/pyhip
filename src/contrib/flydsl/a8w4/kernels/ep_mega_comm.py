@@ -28,9 +28,7 @@ from flydsl.expr import gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
-from .._vendor import buffer_ops
-from .._vendor.mxfp4_gemm_common import _global_base_ptr1, global_typed_ptr, lds_typed_ptr
-from .._vendor.tensor_shim import _to_raw as _raw
+from ._mem import _global_base_ptr1, _raw, buffer_store, global_typed_ptr, lds_typed_ptr
 from . import ep_gemm as EP
 from .ep_mega import (
     ARRIVED,
@@ -121,7 +119,7 @@ def compile_quant(H):
         c = w - t * fx.Int32(CH)
         if t < tokens:
             u16 = (t * fx.Int32(H) + c * fx.Int32(512)) // fx.Int32(8) + lane  # 16 B unit
-            buffer_ops.buffer_store(Vec.filled(4, 0, fx.Int32),
+            buffer_store(Vec.filled(4, 0, fx.Int32),
                                     _rsrc(out, fx.Int64(tokens) * fx.Int64(H * 2)),
                                     u16 * fx.Int32(4))
             if quant != fx.Int32(0):
@@ -137,9 +135,9 @@ def compile_quant(H):
                 q = Vec.from_elements(
                     [EP._fp8x4_pack(*[fx.Float32(f[4 * h + i]) * inv for i in range(4)])
                      for h in range(2)], fx.Int32)
-                buffer_ops.buffer_store(q, _rsrc(x8, fx.Int64(tokens) * fx.Int64(H)),
+                buffer_store(q, _rsrc(x8, fx.Int64(tokens) * fx.Int64(H)),
                                         u16 * fx.Int32(2))
-                buffer_ops.buffer_store(
+                buffer_store(
                     scale, _rsrc(xs, fx.Int64(tokens) * fx.Int64(G * 4)),
                     t * fx.Int32(G) + c * fx.Int32(4) + lane // fx.Int32(16),
                     mask=lane % fx.Int32(16) == fx.Int32(0))

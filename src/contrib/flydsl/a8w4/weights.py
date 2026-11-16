@@ -24,7 +24,7 @@ Bit-exact with decoding the original weights (``doc-mimo`` README section 7).
 
 import torch
 
-from ._vendor.a8w4_ops import channel_exponents
+from .kernels.channel_exp import channel_exponents
 from .kernels.tp_gemm1 import prep_w1_fast
 
 FAST_DEC = 2

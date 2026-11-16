@@ -26,37 +26,31 @@ Every item issues its W prefetch before any wait. The last WG resets the counter
 """
 
 import functools
-from functools import cache
 import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl._mlir.dialects import arith, llvm
+from flydsl._mlir.dialects import arith
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
-from .._vendor import buffer_ops
-from .._vendor import buffer_ops as bo
-from .._vendor.act import gate_up_act, situ_params
-from .._vendor.a8w4_ops import _pack_activation, _pointer, channel_exponents
-from .._vendor.moe_utils import _buffer_i32_scalar_read, _global_i32_at, _udiv, _umod
-from .._vendor.mxfp4_gemm_common import (
-    _gep1,
-    _global_base_ptr1,
-    _global_i32_buffer_tiles,
-    _global_i32_buffer_view,
-    _lds_ptr3,
+from ._act import gate_up_act, situ_params
+from ._cvt import _pack_activation
+from ._launch import _run_compiled
+from ._mem import (
+    _global_i32_at,
+    _raw,
+    buffer_load,
+    buffer_store,
+    create_buffer_resource_from_addr,
     global_typed_ptr,
     lds_typed_ptr,
-    lds_vec_load,
 )
-from .._vendor.tensor_shim import _run_compiled
-from .._vendor.tensor_shim import _to_raw as _raw
 from . import ep_gemm as EP  # noqa: E402
 from . import tp_gemm1 as G1  # noqa: E402
-from .ep_prep import _gatomic_add, _gatomic_xchg, _gload_sys, _latomic_add  # noqa: E402
+from .ep_prep import _gatomic_add, _gatomic_xchg, _gload_sys  # noqa: E402
 
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -83,21 +77,21 @@ def _fence_release():
 
 
 def _rsrc(addr):
-    return buffer_ops.create_buffer_resource_from_addr(_raw(fx.Int64(addr)))
+    return create_buffer_resource_from_addr(_raw(fx.Int64(addr)))
 
 
 @flyc.jit
 def _zero_slice_wt(arg_zero, i32_n16, bx, grid, tx, NT):
     """WG bx of ``grid`` zeroes its share of ``i32_n16`` 16 B units (write-through)."""
     if i32_n16 > fx.Int32(0):
-        rs = buffer_ops.create_buffer_resource_from_addr(
+        rs = create_buffer_resource_from_addr(
             _raw(fx.Int64(arg_zero)), num_records_bytes=_raw(fx.Int64(i32_n16) * fx.Int64(16)))
         per = (i32_n16 + grid - fx.Int32(1)) // grid
         z = Vec.filled(4, 0, fx.Int32)
         for i in range((per + fx.Int32(NT - 1)) // fx.Int32(NT)):
             u = fx.Int32(i) * fx.Int32(NT) + tx
             off = (u < per).select(bx * per + u, i32_n16)
-            buffer_ops.buffer_store(z, rs, off * fx.Int32(4), cache_modifier=CM_COH)
+            buffer_store(z, rs, off * fx.Int32(4), cache_modifier=CM_COH)
 
 
 @flyc.jit
@@ -288,10 +282,10 @@ def compile_ep_small(*, H, I, EL, TOPK, BM, NW, C1, C2, PF, ROWV, MAXM, SCH=3,
     def _quant_row(arg_x, arg_x8, arg_xs, t, i32_m, lane):
         """one wave: bf16 x row t -> fp8 + f32 scale (bit-identical to quantize_rows)."""
         if t < i32_m:
-            rs_x = buffer_ops.create_buffer_resource_from_addr(_raw(fx.Int64(arg_x)))
-            rs_x8 = buffer_ops.create_buffer_resource_from_addr(_raw(fx.Int64(arg_x8)))
+            rs_x = create_buffer_resource_from_addr(_raw(fx.Int64(arg_x)))
+            rs_x8 = create_buffer_resource_from_addr(_raw(fx.Int64(arg_x8)))
             CHL = H // 512
-            raw = [Vec(buffer_ops.buffer_load(
+            raw = [Vec(buffer_load(
                 rs_x, t * fx.Int32(H // 2) + (fx.Int32(j * 64) + lane) * fx.Int32(4),
                 vec_width=4, dtype=T.i32)) for j in range_constexpr(CHL)]
             vals = []
@@ -306,14 +300,14 @@ def compile_ep_small(*, H, I, EL, TOPK, BM, NW, C1, C2, PF, ROWV, MAXM, SCH=3,
             s = (amax == 0.0).select(fx.Float32(1.0), amax / 240.0)
             inv = 1.0 / s
             # masked buffer stores need a bounded resource (masked-off lanes go OOB)
-            rs_xs = buffer_ops.create_buffer_resource_from_addr(
+            rs_xs = create_buffer_resource_from_addr(
                 _raw(fx.Int64(arg_xs)), num_records_bytes=_raw(fx.Int64(i32_m) * fx.Int64(4)))
-            buffer_ops.buffer_store(s, rs_xs, t, mask=lane == fx.Int32(0), cache_modifier=CM_COH)
+            buffer_store(s, rs_xs, t, mask=lane == fx.Int32(0), cache_modifier=CM_COH)
             for j in range_constexpr(CHL):
                 v = vals[j]
                 p0 = _pack_activation(v[0] * inv, v[1] * inv, v[2] * inv, v[3] * inv)
                 p1 = _pack_activation(v[4] * inv, v[5] * inv, v[6] * inv, v[7] * inv)
-                buffer_ops.buffer_store(
+                buffer_store(
                     Vec.from_elements([p0, p1], fx.Int32), rs_x8,
                     t * fx.Int32(H // 4) + (fx.Int32(j * 64) + lane) * fx.Int32(2),
                     cache_modifier=CM_COH)
@@ -375,7 +369,7 @@ def compile_ep_small(*, H, I, EL, TOPK, BM, NW, C1, C2, PF, ROWV, MAXM, SCH=3,
             rs = [_gload_sys(a["xs"], fx.min(_row_token(lds, e, k0 + r, cnt, a["m"]),
                                              a["m"] - fx.Int32(1))).bitcast(fx.Float32)
                   for r in rows]
-            out_rsrc = buffer_ops.create_buffer_resource_from_addr(
+            out_rsrc = create_buffer_resource_from_addr(
                 _raw(fx.Int64(a["inter"])), num_records_bytes=_raw(
                     fx.Int64(bx_m + fx.Int32(BM)) * fx.Int64(I * 2)))
             ccol = col0 + lane_div_16 * fx.Int32(4)
@@ -391,7 +385,7 @@ def compile_ep_small(*, H, I, EL, TOPK, BM, NW, C1, C2, PF, ROWV, MAXM, SCH=3,
                     y = gate_up_act(ACT, gv, uv, situ)
                     w2 = Vec.from_elements([EP._bf16x2_rne(y[0], y[1]),
                                             EP._bf16x2_rne(y[2], y[3])], fx.Int32)
-                    buffer_ops.buffer_store(
+                    buffer_store(
                         w2, out_rsrc,
                         ((bx_m + rows[mi]) * fx.Int32(I) + ccol + fx.Int32(c * 16)) // fx.Int32(2),
                         mask=rows[mi] < nv, cache_modifier=CM_COH)

@@ -23,34 +23,31 @@ parity and the other parity is zeroed for the next launch.
 """
 
 import functools
-from functools import cache
-import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl._mlir.dialects import arith, llvm
+from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
-from .._vendor import buffer_ops
-from .._vendor import buffer_ops as bo
-from .._vendor.act import gate_up_act, silu_mul_batch, situ_params
-from .._vendor.a8w4_ops import _pack_activation, _pointer, channel_exponents
-from .._vendor.moe_utils import _buffer_i32_scalar_read, _global_i32_at, _udiv, _umod
-from .._vendor.mxfp4_gemm_common import (
-    _gep1,
+from ._act import gate_up_act, situ_params
+from ._cvt import _pack_activation
+from ._launch import _run_compiled
+from ._mem import (
     _global_base_ptr1,
-    _global_i32_buffer_tiles,
-    _global_i32_buffer_view,
-    _lds_ptr3,
-    global_typed_ptr,
+    _global_i32_at,
+    _raw,
+    _udiv,
+    _umod,
+    buffer_load,
+    buffer_store,
+    create_buffer_resource_from_addr,
+    get_element_ptr,
     lds_typed_ptr,
     lds_vec_load,
 )
-from .._vendor.tensor_shim import _run_compiled
-from .._vendor.tensor_shim import _to_raw as _raw
 from . import tp_fmoe as F  # noqa: E402
 from . import tp_gemm1 as G1  # noqa: E402
 
@@ -97,19 +94,19 @@ def compile_a8w4_fmoe_bm64q(*, D_HIDDEN, D_INTER, NE, TOPK=8, b_cache_mod=1, n_c
         mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, fx.Float8E4M3FNUZ))
         lds_i32 = fx.Int32(fx.ptrtoint(lds_ptr))
 
-        rs_x = bo.create_buffer_resource_from_addr(
+        rs_x = create_buffer_resource_from_addr(
             _raw(fx.Int64(arg_x)), num_records_bytes=_raw(fx.Int64(i32_M) * fx.Int64(H)))
-        rs_xs = bo.create_buffer_resource_from_addr(
+        rs_xs = create_buffer_resource_from_addr(
             _raw(fx.Int64(arg_xs)), num_records_bytes=_raw(fx.Int64(i32_M) * fx.Int64(4)))
         rs_w1, rs_ws1, rs_e1 = F._rsrc(arg_w1), F._rsrc(arg_ws1), F._rsrc(arg_exp1)
         rs_w2, rs_ws2 = F._rsrc(arg_w2), F._rsrc(arg_ws2)
-        rs_e2 = bo.create_buffer_resource_from_addr(
+        rs_e2 = create_buffer_resource_from_addr(
             _raw(fx.Int64(arg_ws2) + fx.Int64(WS2_BYTES)))
         rs_sw, rs_id = F._rsrc(arg_sw), F._rsrc(arg_stids)
         rs_a2, rs_sc, rs_ctl = F._rsrc(arg_a2), F._rsrc(arg_sc), F._rsrc(arg_ctl)
 
         def ld(rs, off_i32, n=1, cm=0):
-            v = bo.buffer_load(rs, off_i32, vec_width=n, dtype=T.i32, cache_modifier=cm)
+            v = buffer_load(rs, off_i32, vec_width=n, dtype=T.i32, cache_modifier=cm)
             return fx.Int32(v) if n == 1 else Vec(v)
 
         lds_flat = fx.make_view(fx.recast_iter(fx.Int32, lds_ptr), fx.make_layout(LDS_BYTES // 4, 1))
@@ -152,7 +149,7 @@ def compile_a8w4_fmoe_bm64q(*, D_HIDDEN, D_INTER, NE, TOPK=8, b_cache_mod=1, n_c
             a_regs = [fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Int32) for _ in range(A_LOADS)]
 
             def load_a_one(i, base_k):
-                a_regs[i].store(Vec(bo.buffer_load(
+                a_regs[i].store(Vec(buffer_load(
                     rs_x, a_src[i] + base_k // fx.Int32(4), vec_width=4, dtype=T.i32)))
 
             def store_a_lds():
@@ -198,7 +195,7 @@ def compile_a8w4_fmoe_bm64q(*, D_HIDDEN, D_INTER, NE, TOPK=8, b_cache_mod=1, n_c
 
                 def load_w_one(gu, ni, g, base_k):
                     idx = w1_base[gu, ni] + (base_k // fx.Int32(128) + fx.Int32(g)) * fx.Int32(64)
-                    w_regs[gu, ni, g].store(Vec(bo.buffer_load(
+                    w_regs[gu, ni, g].store(Vec(buffer_load(
                         rs_w1, idx * fx.Int32(4), vec_width=4, dtype=T.i32,
                         cache_modifier=b_cache_mod)))
 
@@ -306,9 +303,9 @@ def compile_a8w4_fmoe_bm64q(*, D_HIDDEN, D_INTER, NE, TOPK=8, b_cache_mod=1, n_c
                     # row-major [64, 256] fp8: dword offset
                     dst = m_block * fx.Int32(A2_BYTES // 4) + row * fx.Int32(64) \
                         + fx.Int32(nb * 32) + sub * fx.Int32(4)
-                    bo.buffer_store(_raw(packed), rs_a2, dst)
+                    buffer_store(_raw(packed), rs_a2, dst)
                     sc_i = m_block * fx.Int32(BM * 2) + row * fx.Int32(2) + fx.Int32(nb)
-                    bo.buffer_store(_raw(s.bitcast(fx.Int32)), rs_sc, sc_i)
+                    buffer_store(_raw(s.bitcast(fx.Int32)), rs_sc, sc_i)
                 if const_expr(nb == 0):
                     gpu.barrier()  # staging reads done before half 1's A stores
 
@@ -323,7 +320,7 @@ def compile_a8w4_fmoe_bm64q(*, D_HIDDEN, D_INTER, NE, TOPK=8, b_cache_mod=1, n_c
             # L2 (vmcnt(0) + barrier above), so a plain sc1 store of the flag is
             # enough -- no agent release (buffer_wbl2 would write back the L2)
             if wave == fx.Int32(0):  # whole wave stores the same value
-                bo.buffer_store(_raw(i32_epoch), rs_ctl, fx.Int32(CTL_FLAGS) + m_block,
+                buffer_store(_raw(i32_epoch), rs_ctl, fx.Int32(CTL_FLAGS) + m_block,
                                 cache_modifier=CM_SC1)
 
         # =============================== gemm2 task ===================================
@@ -395,7 +392,7 @@ def compile_a8w4_fmoe_bm64q(*, D_HIDDEN, D_INTER, NE, TOPK=8, b_cache_mod=1, n_c
                     wbase = ((n0 + fx.Int32(ni * 16)) // fx.Int32(16)) * fx.Int32(W2_K0 * 64) \
                         + lane_div_16 * fx.Int32(16) + lane_mod_16
                     for g in range_constexpr(K_GROUPS):
-                        wb[b]["raw"][ni, g].store(Vec(bo.buffer_load(
+                        wb[b]["raw"][ni, g].store(Vec(buffer_load(
                             rs_w2, (wbase + fx.Int32(g * 64)) * fx.Int32(4), vec_width=4,
                             dtype=T.i32, cache_modifier=b_cache_mod)))
                 scb = (n0 // fx.Int32(32)) * fx.Int32(SC2_STRIDE) + lane_div_16 * fx.Int32(16) \
@@ -520,7 +517,7 @@ def compile_a8w4_fmoe_bm64q(*, D_HIDDEN, D_INTER, NE, TOPK=8, b_cache_mod=1, n_c
             # structurizer inside the task loop): all of wave 0 adds, lane 0 adds 1
             gpu.barrier()  # previous task done with LDS / the slot
             if wave == fx.Int32(0):
-                ctr = bo.get_element_ptr(_global_base_ptr1(arg_ctl),
+                ctr = get_element_ptr(_global_base_ptr1(arg_ctl),
                                          byte_offset=_raw(ctr_idx * fx.Int32(4)))
                 inc = (lane == fx.Int32(0)).select(fx.Int32(1), fx.Int32(0))
                 old = fx.Int32(llvm.AtomicRMWOp(
@@ -535,7 +532,7 @@ def compile_a8w4_fmoe_bm64q(*, D_HIDDEN, D_INTER, NE, TOPK=8, b_cache_mod=1, n_c
             # zero the other parity's counters for the next launch
             if bx == fx.Int32(0):
                 if tx < fx.Int32(NXCD):
-                    bo.buffer_store(_raw(fx.Int32(0)), rs_ctl, (fx.Int32(1) - par) * fx.Int32(NXCD) + tx)
+                    buffer_store(_raw(fx.Int32(0)), rs_ctl, (fx.Int32(1) - par) * fx.Int32(NXCD) + tx)
 
         @flyc.jit
         def loop():

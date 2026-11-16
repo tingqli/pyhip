@@ -27,7 +27,6 @@ packages = [
     "pyhip.contrib.gluon",
     "pyhip.contrib.flydsl",
     "pyhip.contrib.flydsl.a8w4",
-    "pyhip.contrib.flydsl.a8w4._vendor",
     "pyhip.contrib.flydsl.a8w4.bench",
     "pyhip.contrib.flydsl.a8w4.kernels",
 ]

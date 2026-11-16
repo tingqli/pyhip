@@ -18,32 +18,30 @@ with only the configuration the tuned A8W4 build actually runs:
 """
 
 import functools
-from functools import cache
-import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl._mlir.dialects import arith
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
-from .._vendor import buffer_ops
-from .._vendor import buffer_ops as bo
-from .._vendor.act import gate_up_act, silu_mul_batch, situ_params
-from .._vendor.a8w4_ops import _pack_activation, _pointer, channel_exponents
-from .._vendor.moe_utils import _buffer_i32_scalar_read, _global_i32_at, _udiv, _umod
-from .._vendor.mxfp4_gemm_common import (
+from ._act import gate_up_act, situ_params
+from ._cvt import _pack_activation
+from ._launch import _run_compiled
+from ._mem import (
+    _buffer_i32_scalar_read,
+    _global_i32_at,
     _global_i32_buffer_tiles,
     _global_i32_buffer_view,
-    _lds_ptr3,
-    global_typed_ptr,  # noqa: F401  (used by tp_fmoe as G1.global_typed_ptr)
+    _raw,
+    _udiv,
+    _umod,
+    buffer_store,
+    create_buffer_resource_from_addr,
     lds_typed_ptr,
     lds_vec_load,
 )
-from .._vendor.tensor_shim import _run_compiled
-from .._vendor.tensor_shim import _to_raw as _raw
 
 
 # =============================================================================
@@ -543,7 +541,7 @@ def compile_a8w4_gemm1(
             # then [rows][NUM_N_BLOCKS] f32 scales (dword index ``s_base``).
             rows_i64 = fx.Int64(i32_rows)
             s_base = i32_rows * fx.Int32(INTER // 4)
-            dst = buffer_ops.create_buffer_resource_from_addr(
+            dst = create_buffer_resource_from_addr(
                 _raw(fx.Int64(arg_out)),
                 num_records_bytes=_raw(rows_i64 * fx.Int64(INTER + NUM_N_BLOCKS * 4)),
             )
@@ -586,8 +584,8 @@ def compile_a8w4_gemm1(
                 d_off = (dest_row * fx.Int32(INTER) + by_n + sub * fx.Int32(16)) // fx.Int32(4)
                 s_off = s_base + (dest_row * fx.Int32(NUM_N_BLOCKS) + n_block)
                 s_valid = (sub == fx.Int32(0)).select(token, i32_ntok) < i32_ntok
-                buffer_ops.buffer_store(packed, dst, d_off, mask=valid)
-                buffer_ops.buffer_store(s, dst, s_off, mask=s_valid)
+                buffer_store(packed, dst, d_off, mask=valid)
+                buffer_store(s, dst, s_off, mask=s_valid)
 
         # ---- row-variant dispatch ------------------------------------------------
         if const_expr(dyn_m):

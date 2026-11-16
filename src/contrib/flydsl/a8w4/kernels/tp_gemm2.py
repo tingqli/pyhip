@@ -21,34 +21,32 @@ with only the configuration the tuned A8W4 build actually runs
 """
 
 import functools
-from functools import cache
-import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl._mlir.dialects import arith, llvm
+from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
-from .._vendor import buffer_ops
-from .._vendor import buffer_ops as bo
-from .._vendor.act import gate_up_act, silu_mul_batch, situ_params
-from .._vendor.a8w4_ops import _pack_activation, _pointer, channel_exponents
-from .._vendor.moe_utils import _buffer_i32_scalar_read, _global_i32_at, _udiv, _umod
-from .._vendor.mxfp4_gemm_common import (
-    _gep1,
+from ._launch import _run_compiled
+from ._mem import (
+    _buffer_i32_scalar_read,
     _global_base_ptr1,
+    _global_i32_at,
     _global_i32_buffer_tiles,
     _global_i32_buffer_view,
-    _lds_ptr3,
+    _raw,
+    _udiv,
+    _umod,
+    buffer_load,
+    create_buffer_resource_from_addr,
+    get_element_ptr,
     global_typed_ptr,
     lds_typed_ptr,
     lds_vec_load,
 )
-from .._vendor.tensor_shim import _run_compiled
-from .._vendor.tensor_shim import _to_raw as _raw
 
 
 # =============================================================================
@@ -128,7 +126,7 @@ def _atomic_add_bf16x2(out_base, elem_off, lo, hi):
     pk = Vec.from_elements([lo, hi], fx.Float32).to(fx.BFloat16)
     llvm.AtomicRMWOp(
         llvm.AtomicBinOp.fadd,
-        _gep1(out_base, elem_off * fx.Int32(2)),
+        get_element_ptr(out_base, elem_off * fx.Int32(2)),
         _raw(pk),
         llvm.AtomicOrdering.monotonic,
         syncscope="agent",
@@ -222,7 +220,7 @@ def _atomic_bf16_epilog(
                 )
                 llvm.AtomicRMWOp(
                     llvm.AtomicBinOp.fadd,
-                    _gep1(out_base, (row_base_addr + fx.Int32(s * 64)) * fx.Int32(2)),
+                    get_element_ptr(out_base, (row_base_addr + fx.Int32(s * 64)) * fx.Int32(2)),
                     _raw(pk),
                     llvm.AtomicOrdering.monotonic,
                     syncscope="agent",
@@ -667,22 +665,22 @@ def compile_a8w4_gemm2(
             # only): lane L of every wave holds rows h*64 + L (h < BM/64); a
             # consumer fetches its row with one ds_bpermute (LDS crossbar, no LDS
             # space, ~3 VGPRs per 64 rows).
-            rs_as = buffer_ops.create_buffer_resource_from_addr(_raw(fx.Int64(arg_a_scale)))
-            rs_w = buffer_ops.create_buffer_resource_from_addr(_raw(fx.Int64(arg_sweights)))
-            rs_id = buffer_ops.create_buffer_resource_from_addr(_raw(fx.Int64(arg_stids)))
+            rs_as = create_buffer_resource_from_addr(_raw(fx.Int64(arg_a_scale)))
+            rs_w = create_buffer_resource_from_addr(_raw(fx.Int64(arg_sweights)))
+            rs_id = create_buffer_resource_from_addr(_raw(fx.Int64(arg_stids)))
             RH = -(-BM // 64)
             raw_s, raw_w, rid_h = [], [], []
             for h in range_constexpr(RH):
                 grow_h = m_row + fx.Int32(h * 64) + lane
                 if const_expr(A_GROUPS > 1):
-                    v = Vec(buffer_ops.buffer_load(
+                    v = Vec(buffer_load(
                         rs_as, grow_h * fx.Int32(A_GROUPS), vec_width=A_GROUPS, dtype=T.i32))
                     raw_s.append([fx.Int32(v[g]) for g in range(A_GROUPS)])
                 else:
-                    raw_s.append([fx.Int32(buffer_ops.buffer_load(
+                    raw_s.append([fx.Int32(buffer_load(
                         rs_as, grow_h, vec_width=1, dtype=T.i32))])
-                raw_w.append(fx.Int32(buffer_ops.buffer_load(rs_w, grow_h, vec_width=1, dtype=T.i32)))
-                rid_h.append(fx.Int32(buffer_ops.buffer_load(rs_id, grow_h, vec_width=1, dtype=T.i32)))
+                raw_w.append(fx.Int32(buffer_load(rs_w, grow_h, vec_width=1, dtype=T.i32)))
+                rid_h.append(fx.Int32(buffer_load(rs_id, grow_h, vec_width=1, dtype=T.i32)))
 
             for r, dst in a_regs:
                 fx.copy(lds_write_atom, r, fx.slice(lds_tiles16, (None, dst)))

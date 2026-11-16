@@ -30,11 +30,16 @@ from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../..")))
-from a8w4._vendor import buffer_ops  # noqa: E402
-from a8w4._vendor.a8w4_ops import _pack_activation  # noqa: E402
-from a8w4._vendor.mxfp4_gemm_common import global_typed_ptr, lds_typed_ptr  # noqa: E402
-from a8w4._vendor.tensor_shim import _run_compiled  # noqa: E402
-from a8w4._vendor.tensor_shim import _to_raw as _raw  # noqa: E402
+from a8w4.kernels._cvt import _pack_activation  # noqa: E402
+from a8w4.kernels._launch import _run_compiled  # noqa: E402
+from a8w4.kernels._mem import (  # noqa: E402
+    _raw,
+    buffer_load,
+    buffer_store,
+    create_buffer_resource_from_addr,
+    global_typed_ptr,
+    lds_typed_ptr,
+)
 from a8w4.kernels.ep_prep import (  # noqa: E402
     NUM_CU, _gatomic_add, _gatomic_xchg, _gload_sys, _latomic_add)
 
@@ -69,15 +74,15 @@ def compile_tp_prep(*, H, TOPK, E, BM, EPT, MULTI, ZERO):
     def _quant(arg_x, arg_x8, arg_xs, arg_out, i32_m, gw, tw, lane):
         """rows gw + i*tw of x (bf16 [M, H]) -> fp8 + f32 row scale (bit identical to
         quantize_rows); ZERO: the same rows of out (bf16 [M, H]) := 0."""
-        rs_x = buffer_ops.create_buffer_resource_from_addr(_raw(fx.Int64(arg_x)))
-        rs_x8 = buffer_ops.create_buffer_resource_from_addr(_raw(fx.Int64(arg_x8)))
-        rs_o = buffer_ops.create_buffer_resource_from_addr(_raw(fx.Int64(arg_out)))
+        rs_x = create_buffer_resource_from_addr(_raw(fx.Int64(arg_x)))
+        rs_x8 = create_buffer_resource_from_addr(_raw(fx.Int64(arg_x8)))
+        rs_o = create_buffer_resource_from_addr(_raw(fx.Int64(arg_out)))
         xs = global_typed_ptr(arg_xs, T.f32)
         z4 = Vec.filled(4, 0, fx.Int32)
         n_do = (gw < i32_m).select((i32_m - gw + tw - fx.Int32(1)) // tw, fx.Int32(0))
 
         def load_row(t):
-            return [Vec(buffer_ops.buffer_load(
+            return [Vec(buffer_load(
                 rs_x, t * fx.Int32(H // 2) + (fx.Int32(j * 64) + lane) * fx.Int32(4),
                 vec_width=4, dtype=T.i32)) for j in range_constexpr(CH)]
 
@@ -98,11 +103,11 @@ def compile_tp_prep(*, H, TOPK, E, BM, EPT, MULTI, ZERO):
                 v = vals[j]
                 p0 = _pack_activation(v[0] * inv, v[1] * inv, v[2] * inv, v[3] * inv)
                 p1 = _pack_activation(v[4] * inv, v[5] * inv, v[6] * inv, v[7] * inv)
-                buffer_ops.buffer_store(
+                buffer_store(
                     Vec.from_elements([p0, p1], fx.Int32), rs_x8,
                     t * fx.Int32(H // 4) + (fx.Int32(j * 64) + lane) * fx.Int32(2))
             for j in range_constexpr(CH if ZERO else 0):
-                buffer_ops.buffer_store(
+                buffer_store(
                     z4, rs_o, t * fx.Int32(H // 2) + (fx.Int32(j * 64) + lane) * fx.Int32(4))
 
         # two rows per iteration: row j+1's loads are in flight while row j is packed

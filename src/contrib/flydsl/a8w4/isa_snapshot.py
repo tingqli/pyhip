@@ -192,7 +192,7 @@ def _dummy_args(launch):
 
 def _mega_items(act):
     """The compiles of ``MegaMoeEpA8W4.__init__`` (ep8 shape, default producers / lag)."""
-    from ._vendor.tensor_shim import _preload_compiled
+    from .kernels._launch import _preload_compiled
     from .kernels import ep_mega as K
     from .kernels import ep_mega_comm as C
 

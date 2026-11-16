@@ -32,7 +32,6 @@ picks the config (``CFGS``) by token count (``AUTO``).
 """
 
 import functools
-from functools import cache
 import os
 
 import flydsl.compiler as flyc
@@ -43,23 +42,25 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
-from .._vendor import buffer_ops
-from .._vendor import buffer_ops as bo
-from .._vendor.act import gate_up_act, situ_params
-from .._vendor.a8w4_ops import _pack_activation, _pointer, channel_exponents
-from .._vendor.moe_utils import _buffer_i32_scalar_read, _global_i32_at, _udiv, _umod
-from .._vendor.mxfp4_gemm_common import (
-    _gep1,
+from ._act import gate_up_act, situ_params
+from ._cvt import _pack_activation
+from ._launch import _run_compiled
+from ._mem import (
+    _buffer_i32_scalar_read,
     _global_base_ptr1,
+    _global_i32_at,
     _global_i32_buffer_tiles,
     _global_i32_buffer_view,
-    _lds_ptr3,
+    _raw,
+    _udiv,
+    _umod,
+    buffer_store,
+    create_buffer_resource_from_addr,
+    get_element_ptr,
     global_typed_ptr,
     lds_typed_ptr,
     lds_vec_load,
 )
-from .._vendor.tensor_shim import _run_compiled
-from .._vendor.tensor_shim import _to_raw as _raw
 from . import ep_prep as PR  # noqa: E402
 from . import tp_gemm1 as G1  # noqa: E402
 
@@ -153,7 +154,7 @@ def _atomic_bf16x4(arg_out, base, v4, ok):
             pk = Vec.from_elements([v4[2 * h], v4[2 * h + 1]], fx.Float32).to(fx.BFloat16)
             llvm.AtomicRMWOp(
                 llvm.AtomicBinOp.fadd,
-                _gep1(_global_base_ptr1(arg_out), (base + fx.Int32(2 * h)) * fx.Int32(2)),
+                get_element_ptr(_global_base_ptr1(arg_out), (base + fx.Int32(2 * h)) * fx.Int32(2)),
                 _raw(pk), llvm.AtomicOrdering.monotonic, syncscope="agent", alignment=4)
 
 
@@ -161,7 +162,7 @@ def _atomic_bf16x4(arg_out, base, v4, ok):
 def _zero_slice(arg_zero, i32_n16, bx, grid, tx, NT):
     """WG bx of ``grid`` zeroes its share of ``i32_n16`` 16 B units at arg_zero."""
     if i32_n16 > fx.Int32(0):
-        rs = buffer_ops.create_buffer_resource_from_addr(
+        rs = create_buffer_resource_from_addr(
             _raw(fx.Int64(arg_zero)), num_records_bytes=_raw(fx.Int64(i32_n16) * fx.Int64(16)))
         per = (i32_n16 + grid - fx.Int32(1)) // grid
         z = Vec.filled(4, 0, fx.Int32)
@@ -169,7 +170,7 @@ def _zero_slice(arg_zero, i32_n16, bx, grid, tx, NT):
             u = fx.Int32(i) * fx.Int32(NT) + tx
             # out-of-range units (u >= per, or past the end) are dropped by the bound
             off = (u < per).select(bx * per + u, i32_n16)
-            buffer_ops.buffer_store(z, rs, off * fx.Int32(4))
+            buffer_store(z, rs, off * fx.Int32(4))
 
 
 def _zero_rc_pre(arg_rc, i32_n16, i32_m, ROW16, bx, grid):
@@ -189,20 +190,20 @@ def _zero_rc_post(arg_zero, i32_n16, ROW16, UPT, pre, bx, tx, NT):
     """part 2 (after the tile): zero the units whose row has != 1 local route (a
     single-route row is stored whole by gemm2)."""
     per, r0, rc0, rc1 = pre
-    rs = buffer_ops.create_buffer_resource_from_addr(
+    rs = create_buffer_resource_from_addr(
         _raw(fx.Int64(arg_zero)), num_records_bytes=_raw(fx.Int64(i32_n16) * fx.Int64(16)))
     z = Vec.filled(4, 0, fx.Int32)
     for k in range_constexpr(UPT):
         u = fx.Int32(k * NT) + tx
         off = (u < per).select(bx * per + u, i32_n16)  # past the end: dropped
         rcv = (off // fx.Int32(ROW16) == r0).select(rc0, rc1)
-        buffer_ops.buffer_store(z, rs, (rcv != fx.Int32(1)).select(off, i32_n16) * fx.Int32(4))
+        buffer_store(z, rs, (rcv != fx.Int32(1)).select(off, i32_n16) * fx.Int32(4))
 
 
 @flyc.jit
 def _st_or_add_bf16x2(arg_out, idx, pk, single):
     """out[idx .. idx+1] (bf16): plain store for a single-route row, else atomic add."""
-    ptr = _gep1(_global_base_ptr1(arg_out), idx * fx.Int32(2))
+    ptr = get_element_ptr(_global_base_ptr1(arg_out), idx * fx.Int32(2))
     if single:
         llvm.StoreOp(_raw(pk), ptr, alignment=4)
     else:
@@ -762,8 +763,8 @@ def compile_ep_gemm1(*, H, I, NE, BM, NI, ROWV, PF=2, bcm=2, wpe=None, NW=4, ARB
                 rr = ok.select(r, fx.Int32(0))
                 tok = fx.Int32(_global_i32_at(arg_sids, bx_m + rr)) & fx.Int32(0x00FFFFFF)
                 srow = tok * fx.Int32(G)
-                cur = G1._buffer_i32_scalar_read(xs_tiles, srow + g, xs_atom).bitcast(fx.Float32)
-                prv = G1._buffer_i32_scalar_read(
+                cur = _buffer_i32_scalar_read(xs_tiles, srow + g, xs_atom).bitcast(fx.Float32)
+                prv = _buffer_i32_scalar_read(
                     xs_tiles, srow + fx.max(g - fx.Int32(1), fx.Int32(0)), xs_atom
                 ).bitcast(fx.Float32)
                 cur = (cur == fx.Float32(0.0)).select(one, cur)
@@ -827,7 +828,7 @@ def compile_ep_gemm1(*, H, I, NE, BM, NI, ROWV, PF=2, bcm=2, wpe=None, NW=4, ARB
             else:
                 xs_tiles = _global_i32_buffer_tiles(arg_xs, fx.Int64(i32_m) * fx.Int64(4), 1)
                 xs_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Int32)
-                rs = [G1._buffer_i32_scalar_read(xs_tiles, t, xs_atom).bitcast(fx.Float32)
+                rs = [_buffer_i32_scalar_read(xs_tiles, t, xs_atom).bitcast(fx.Float32)
                       for t in toks]
             ys = {}
             for mi in range_constexpr(MR):
@@ -847,10 +848,10 @@ def compile_ep_gemm1(*, H, I, NE, BM, NI, ROWV, PF=2, bcm=2, wpe=None, NW=4, ARB
                 am = fx.maxnumf(am, am.shuffle_xor(32, 64))
                 lds_f32[rows[mi] * fx.Int32(NW) + wave] = am  # 4 lanes, same value
             gpu.barrier()
-            out_rsrc = buffer_ops.create_buffer_resource_from_addr(
+            out_rsrc = create_buffer_resource_from_addr(
                 _raw(fx.Int64(arg_out)), num_records_bytes=_raw(
                     fx.Int64(bx_m + fx.Int32(BM)) * fx.Int64(I)))
-            os_rsrc = buffer_ops.create_buffer_resource_from_addr(
+            os_rsrc = create_buffer_resource_from_addr(
                 _raw(fx.Int64(arg_outs)), num_records_bytes=_raw(
                     fx.Int64(bx_m + fx.Int32(BM)) * fx.Int64(I // QG1 * 4)))
             GPW = NI // QG1  # quant groups per WG row
@@ -868,10 +869,10 @@ def compile_ep_gemm1(*, H, I, NE, BM, NI, ROWV, PF=2, bcm=2, wpe=None, NW=4, ARB
                 srow = bx_m + rows[mi]
                 for c in range_constexpr(NC):
                     q = _fp8x4_pack(*[ys[mi, c][v] * inv for v in range(4)])
-                    buffer_ops.buffer_store(
+                    buffer_store(
                         q, out_rsrc, (srow * fx.Int32(I) + col + fx.Int32(c * 16))
                         // fx.Int32(4), mask=valid[mi])
-                buffer_ops.buffer_store(
+                buffer_store(
                     s, os_rsrc, srow * fx.Int32(I // QG1) + n_block * fx.Int32(GPW) + grp,
                     mask=valid[mi] & (lane_div_16 == fx.Int32(0))
                     & (wave % fx.Int32(WPG) == fx.Int32(0)))
@@ -892,7 +893,7 @@ def compile_ep_gemm1(*, H, I, NE, BM, NI, ROWV, PF=2, bcm=2, wpe=None, NW=4, ARB
                         rs = fin_of(rit)
                     else:
                         tok = fx.Int32(_global_i32_at(arg_sids, bx_m + rit)) & fx.Int32(0x00FFFFFF)
-                        rs = G1._buffer_i32_scalar_read(xs_tiles, tok, xs_atom).bitcast(fx.Float32)
+                        rs = _buffer_i32_scalar_read(xs_tiles, tok, xs_atom).bitcast(fx.Float32)
                     for c in range_constexpr(NC):
                         gv = fx.Float32(Vec(fx.memref_load_vec(acc[0, c][mi]))[v])
                         uv = fx.Float32(Vec(fx.memref_load_vec(acc[1, c][mi]))[v])
@@ -909,10 +910,10 @@ def compile_ep_gemm1(*, H, I, NE, BM, NI, ROWV, PF=2, bcm=2, wpe=None, NW=4, ARB
             TPR = QG1 // 16
             GPW = NI // QG1  # groups per WG row
             RPP = NT // TPR
-            out_rsrc = buffer_ops.create_buffer_resource_from_addr(
+            out_rsrc = create_buffer_resource_from_addr(
                 _raw(fx.Int64(arg_out)), num_records_bytes=_raw(
                     fx.Int64(bx_m + fx.Int32(BM)) * fx.Int64(I)))
-            os_rsrc = buffer_ops.create_buffer_resource_from_addr(
+            os_rsrc = create_buffer_resource_from_addr(
                 _raw(fx.Int64(arg_outs)), num_records_bytes=_raw(
                     fx.Int64(bx_m + fx.Int32(BM)) * fx.Int64(I // QG1 * 4)))
             rg_in = tx // fx.Int32(TPR)
@@ -942,11 +943,11 @@ def compile_ep_gemm1(*, H, I, NE, BM, NI, ROWV, PF=2, bcm=2, wpe=None, NW=4, ARB
                     [_pack_activation(*[vals[4 * q + k] * inv for k in range(4)])
                      for q in range(4)], fx.Int32)
                 srow = bx_m + rit
-                buffer_ops.buffer_store(
+                buffer_store(
                     packed, out_rsrc,
                     (srow * fx.Int32(I) + n_block * fx.Int32(NI) + ccol) // fx.Int32(4),
                     mask=valid)
-                buffer_ops.buffer_store(
+                buffer_store(
                     s, os_rsrc, srow * fx.Int32(I // QG1) + n_block * fx.Int32(GPW) + grp,
                     mask=valid & (sub == fx.Int32(0)))
 
@@ -968,7 +969,7 @@ def compile_ep_gemm1(*, H, I, NE, BM, NI, ROWV, PF=2, bcm=2, wpe=None, NW=4, ARB
             _global_i32_at(arg_cumsum, fx.Int32(1))))))
         rc = global_typed_ptr(arg_rc, T.i32)
         n16 = mv * fx.Int32(ZRC_ROW16)
-        rs = buffer_ops.create_buffer_resource_from_addr(
+        rs = create_buffer_resource_from_addr(
             _raw(fx.Int64(arg_zero)), num_records_bytes=_raw(fx.Int64(n16) * fx.Int64(16)))
         z = Vec.filled(4, 0, fx.Int32)
         r = bx
@@ -977,7 +978,7 @@ def compile_ep_gemm1(*, H, I, NE, BM, NI, ROWV, PF=2, bcm=2, wpe=None, NW=4, ARB
             for k in range_constexpr(ZRC_UPT):
                 u = fx.Int32(k * NT) + tx
                 ok = (u < fx.Int32(ZRC_ROW16)) & (rcv != fx.Int32(1))
-                buffer_ops.buffer_store(
+                buffer_store(
                     z, rs, ok.select(r * fx.Int32(ZRC_ROW16) + u, n16) * fx.Int32(4))
             r = r + grid
 
@@ -1195,8 +1196,8 @@ def compile_ep_gemm2(*, H, I, NE, BM, NO, ROWV, PF=2, bcm=2, wpe=None, NW=4, ARB
                 ok = r < fx.Int32(R)
                 rr = ok.select(r, fx.Int32(0))
                 srow = (bx_m + rr) * fx.Int32(G)
-                cur = G1._buffer_i32_scalar_read(as_tiles, srow + g, as_atom).bitcast(fx.Float32)
-                prv = G1._buffer_i32_scalar_read(
+                cur = _buffer_i32_scalar_read(as_tiles, srow + g, as_atom).bitcast(fx.Float32)
+                prv = _buffer_i32_scalar_read(
                     as_tiles, srow + fx.max(g - fx.Int32(1), fx.Int32(0)), as_atom
                 ).bitcast(fx.Float32)
                 cur_ok = (cur == fx.Float32(0.0)).select(fx.Float32(1.0), cur)
@@ -1251,7 +1252,7 @@ def compile_ep_gemm2(*, H, I, NE, BM, NO, ROWV, PF=2, bcm=2, wpe=None, NW=4, ARB
             for mi in range_constexpr(MR):
                 r = fx.Int32(mi * 16) + lane_mod_16
                 tok = fx.Int32(_global_i32_at(arg_sids, bx_m + r)) & fx.Int32(0x00FFFFFF)
-                wt = G1._buffer_i32_scalar_read(sw_tiles, bx_m + r, sw_atom).bitcast(fx.Float32)
+                wt = _buffer_i32_scalar_read(sw_tiles, bx_m + r, sw_atom).bitcast(fx.Float32)
                 wt = wt * lds_f32[fx.Int32(RATIO_OFF // 4 + G * BM) + r]
                 for c in range_constexpr(NC):
                     a4 = Vec(acc[0, c][mi].load())
@@ -1270,7 +1271,7 @@ def compile_ep_gemm2(*, H, I, NE, BM, NO, ROWV, PF=2, bcm=2, wpe=None, NW=4, ARB
             vals = {}
             for mi in range_constexpr(MR):
                 rows4 = fx.Int32(mi * 16) + lane_div_16 * fx.Int32(4)
-                wts = [G1._buffer_i32_scalar_read(sw_tiles, bx_m + rows4 + fx.Int32(v), sw_atom)
+                wts = [_buffer_i32_scalar_read(sw_tiles, bx_m + rows4 + fx.Int32(v), sw_atom)
                        .bitcast(fx.Float32) for v in range(4)]
                 fin = ratio4(fx.Int32(RATIO_OFF // 4 + G * BM), mi)
                 wts = [wts[v] * fin[v] for v in range(4)]
@@ -1302,7 +1303,7 @@ def compile_ep_gemm2(*, H, I, NE, BM, NO, ROWV, PF=2, bcm=2, wpe=None, NW=4, ARB
                     else:
                         llvm.AtomicRMWOp(
                             llvm.AtomicBinOp.fadd,
-                            _gep1(_global_base_ptr1(arg_out), (base + fx.Int32(s * 64)) * fx.Int32(2)),
+                            get_element_ptr(_global_base_ptr1(arg_out), (base + fx.Int32(s * 64)) * fx.Int32(2)),
                             _raw(pk), llvm.AtomicOrdering.monotonic, syncscope="agent",
                             alignment=4)
 

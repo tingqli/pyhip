@@ -181,7 +181,7 @@ def _compile_and_run(launch, args):
         _drop_ir_contexts()
         raise
     if cf is not None:
-        launch._cf = cf  # what a8w4 _vendor/tensor_shim._run_compiled looks for
+        launch._cf = cf  # what a8w4 kernels/_launch._run_compiled looks for
     return cf
 
 

@@ -27,8 +27,6 @@ LDS: A tile / bf16 staging 16 KB + fp8 half 8 KB + scales 0.5 KB = 24.5 KB.
 """
 
 import functools
-from functools import cache
-import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -38,28 +36,26 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
-from .._vendor import buffer_ops
-from .._vendor import buffer_ops as bo
-from .._vendor.act import gate_up_act, silu_mul_batch, situ_params
-from .._vendor.a8w4_ops import _pack_activation, _pointer, channel_exponents
-from .._vendor.moe_utils import _buffer_i32_scalar_read, _global_i32_at, _udiv, _umod
-from .._vendor.mxfp4_gemm_common import (
-    _gep1,
+from ._act import gate_up_act, situ_params
+from ._cvt import _pack_activation
+from ._launch import _run_compiled
+from ._mem import (
     _global_base_ptr1,
-    _global_i32_buffer_tiles,
-    _global_i32_buffer_view,
-    _lds_ptr3,
-    global_typed_ptr,
+    _global_i32_at,
+    _raw,
+    _udiv,
+    _umod,
+    buffer_load,
+    create_buffer_resource_from_addr,
+    get_element_ptr,
     lds_typed_ptr,
     lds_vec_load,
 )
-from .._vendor.tensor_shim import _run_compiled
-from .._vendor.tensor_shim import _to_raw as _raw
 from . import tp_gemm1 as G1  # noqa: E402
 
 
 def _rsrc(addr_i64):
-    return bo.create_buffer_resource_from_addr(_raw(fx.Int64(addr_i64)))
+    return create_buffer_resource_from_addr(_raw(fx.Int64(addr_i64)))
 
 DPP_QUAD_SWAP = 0xB1  # quad_perm [1, 0, 3, 2]: lane L <- lane L ^ 1
 
@@ -95,7 +91,7 @@ def _atomics4_saddr(datas, offs, out_i64):
     for k in range_constexpr(len(offs)):
         off64 = arith.ExtUIOp(T.i64, offs[k]).result
         pk = Vec.from_elements([fx.Int32(datas[k])], fx.Int32).bitcast(fx.BFloat16)
-        llvm.AtomicRMWOp(llvm.AtomicBinOp.fadd, bo.get_element_ptr(base, byte_offset=off64),
+        llvm.AtomicRMWOp(llvm.AtomicBinOp.fadd, get_element_ptr(base, byte_offset=off64),
                          _raw(pk), llvm.AtomicOrdering.monotonic, syncscope="agent",
                          alignment=4)
 
@@ -117,7 +113,7 @@ def _atomics_mi(datas, offs, col, out_i64, full, part):
                     off64 = arith.ExtUIOp(T.i64, _raw(off + col)).result
                     pk = Vec.from_elements([fx.Int32(datas[k])], fx.Int32).bitcast(fx.BFloat16)
                     llvm.AtomicRMWOp(llvm.AtomicBinOp.fadd,
-                                     bo.get_element_ptr(base, byte_offset=off64), _raw(pk),
+                                     get_element_ptr(base, byte_offset=off64), _raw(pk),
                                      llvm.AtomicOrdering.monotonic, syncscope="agent",
                                      alignment=4)
 
@@ -161,18 +157,18 @@ def compile_a8w4_fmoe_bm64(*, D_HIDDEN, D_INTER, NE, TOPK=8, b_cache_mod=2,
         mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, fx.Float8E4M3FNUZ))
         lds_i32 = fx.Int32(fx.ptrtoint(lds_ptr))
 
-        rs_x = bo.create_buffer_resource_from_addr(
+        rs_x = create_buffer_resource_from_addr(
             _raw(fx.Int64(arg_x)), num_records_bytes=_raw(fx.Int64(i32_M) * fx.Int64(H)))
-        rs_xs = bo.create_buffer_resource_from_addr(
+        rs_xs = create_buffer_resource_from_addr(
             _raw(fx.Int64(arg_xs)), num_records_bytes=_raw(fx.Int64(i32_M) * fx.Int64(4)))
         rs_w1, rs_ws1, rs_e1 = _rsrc(arg_w1), _rsrc(arg_ws1), _rsrc(arg_exp1)
         rs_w2, rs_ws2 = _rsrc(arg_w2), _rsrc(arg_ws2)
-        rs_e2 = bo.create_buffer_resource_from_addr(
+        rs_e2 = create_buffer_resource_from_addr(
             _raw(fx.Int64(arg_ws2) + fx.Int64(WS2_BYTES)))
         rs_sw, rs_id = _rsrc(arg_sw), _rsrc(arg_stids)
 
         def ld(rs, off_i32, n=1):
-            v = bo.buffer_load(rs, off_i32, vec_width=n, dtype=T.i32)
+            v = buffer_load(rs, off_i32, vec_width=n, dtype=T.i32)
             return fx.Int32(v) if n == 1 else Vec(v)
 
         def run(rows):
@@ -206,7 +202,7 @@ def compile_a8w4_fmoe_bm64(*, D_HIDDEN, D_INTER, NE, TOPK=8, b_cache_mod=2,
                     load_a_one(i, base_k)
 
             def load_a_one(i, base_k):
-                a_regs[i].store(Vec(bo.buffer_load(
+                a_regs[i].store(Vec(buffer_load(
                     rs_x, a_src[i] + base_k // fx.Int32(4), vec_width=4, dtype=T.i32)))
 
             def store_a_lds():
@@ -262,7 +258,7 @@ def compile_a8w4_fmoe_bm64(*, D_HIDDEN, D_INTER, NE, TOPK=8, b_cache_mod=2,
 
                 def load_w_one(gu, ni, g, base_k):
                     idx = w1_base[gu, ni] + (base_k // fx.Int32(128) + fx.Int32(g)) * fx.Int32(64)
-                    w_regs[gu, ni, g].store(Vec(bo.buffer_load(
+                    w_regs[gu, ni, g].store(Vec(buffer_load(
                         rs_w1, idx * fx.Int32(4), vec_width=4, dtype=T.i32,
                         cache_modifier=b_cache_mod)))
 
@@ -456,7 +452,7 @@ def compile_a8w4_fmoe_bm64(*, D_HIDDEN, D_INTER, NE, TOPK=8, b_cache_mod=2,
                     wbase = ((n0 + fx.Int32(ni * 16)) // fx.Int32(16)) * fx.Int32(W2_K0 * 64) \
                         + lane_div_16 * fx.Int32(16) + lane_mod_16
                     for g in range_constexpr(CH):
-                        wb[b]["raw"][ni, g].store(Vec(bo.buffer_load(
+                        wb[b]["raw"][ni, g].store(Vec(buffer_load(
                             rs_w2, (wbase + (c0 + fx.Int32(g)) * fx.Int32(64)) * fx.Int32(4),
                             vec_width=4, dtype=T.i32, cache_modifier=b_cache_mod)))
                 scb = (n0 // fx.Int32(32)) * fx.Int32(SC2_STRIDE) + lane_div_16 * fx.Int32(16) \

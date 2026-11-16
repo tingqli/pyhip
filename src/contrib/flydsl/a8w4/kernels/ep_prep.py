@@ -34,8 +34,6 @@ entries fit one WG.
 """
 
 import functools
-from functools import cache
-import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -45,23 +43,19 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
-from .._vendor import buffer_ops
-from .._vendor import buffer_ops as bo
-from .._vendor.act import gate_up_act, silu_mul_batch, situ_params
-from .._vendor.a8w4_ops import _pack_activation, _pointer, channel_exponents
-from .._vendor.moe_utils import _buffer_i32_scalar_read, _global_i32_at, _udiv, _umod
-from .._vendor.mxfp4_gemm_common import (
-    _gep1,
+from ._cvt import _pack_activation
+from ._launch import _run_compiled
+from ._mem import (
     _global_base_ptr1,
-    _global_i32_buffer_tiles,
-    _global_i32_buffer_view,
     _lds_ptr3,
+    _raw,
+    buffer_load,
+    buffer_store,
+    create_buffer_resource_from_addr,
+    get_element_ptr,
     global_typed_ptr,
     lds_typed_ptr,
-    lds_vec_load,
 )
-from .._vendor.tensor_shim import _run_compiled
-from .._vendor.tensor_shim import _to_raw as _raw
 
 
 NT = 256
@@ -76,14 +70,14 @@ NUM_CU = 304
 def _gatomic_add(addr_i64, idx, val):
     """old = atomic add, agent scope (device-coherent across the XCD L2s)."""
     return fx.Int32(llvm.AtomicRMWOp(
-        llvm.AtomicBinOp.add, _gep1(_global_base_ptr1(addr_i64), idx * fx.Int32(4)),
+        llvm.AtomicBinOp.add, get_element_ptr(_global_base_ptr1(addr_i64), idx * fx.Int32(4)),
         _raw(fx.Int32(val)), llvm.AtomicOrdering.monotonic, syncscope="agent",
         alignment=4).result)
 
 
 def _gatomic_xchg(addr_i64, idx, val):
     llvm.AtomicRMWOp(
-        llvm.AtomicBinOp.xchg, _gep1(_global_base_ptr1(addr_i64), idx * fx.Int32(4)),
+        llvm.AtomicBinOp.xchg, get_element_ptr(_global_base_ptr1(addr_i64), idx * fx.Int32(4)),
         _raw(fx.Int32(val)), llvm.AtomicOrdering.monotonic, syncscope="agent", alignment=4)
 
 
@@ -91,8 +85,8 @@ _CM_SYS = 17  # sc0|sc1: system-coherent load, bypasses the (non-coherent) XCD L
 
 
 def _gload_sys(addr_i64, idx):
-    rs = buffer_ops.create_buffer_resource_from_addr(_raw(fx.Int64(addr_i64)))
-    return fx.Int32(buffer_ops.buffer_load(rs, idx, vec_width=1, dtype=T.i32,
+    rs = create_buffer_resource_from_addr(_raw(fx.Int64(addr_i64)))
+    return fx.Int32(buffer_load(rs, idx, vec_width=1, dtype=T.i32,
                                            cache_modifier=_CM_SYS))
 
 
@@ -137,8 +131,8 @@ def compile_ep_prep(*, H, TOPK, EL, BM, EPT, QUANT, MULTI, MDYN=False):
                wave):
         """Rows gw + i*tw (i < 64) of x (bf16 [M, H]) -> fp8 + f32 row scale."""
         ids = global_typed_ptr(arg_ids, T.i32)
-        rs_x = buffer_ops.create_buffer_resource_from_addr(_raw(fx.Int64(arg_x)))
-        rs_x8 = buffer_ops.create_buffer_resource_from_addr(_raw(fx.Int64(arg_x8)))
+        rs_x = create_buffer_resource_from_addr(_raw(fx.Int64(arg_x)))
+        rs_x8 = create_buffer_resource_from_addr(_raw(fx.Int64(arg_x8)))
         xs = global_typed_ptr(arg_xs, T.f32)
         # lane i: does row gw + i*tw have a local expert? compact those rows in LDS
         my_t = gw + lane * tw
@@ -154,7 +148,7 @@ def compile_ep_prep(*, H, TOPK, EL, BM, EPT, QUANT, MULTI, MDYN=False):
         rows = fx.Int32(L_ROWS) + wave * fx.Int32(64)
 
         def load_row(t):
-            return [Vec(buffer_ops.buffer_load(
+            return [Vec(buffer_load(
                 rs_x, t * fx.Int32(H // 2) + (fx.Int32(j * 64) + lane) * fx.Int32(4),
                 vec_width=4, dtype=T.i32)) for j in range_constexpr(CH)]
 
@@ -175,7 +169,7 @@ def compile_ep_prep(*, H, TOPK, EL, BM, EPT, QUANT, MULTI, MDYN=False):
                 v = vals[j]
                 p0 = _pack_activation(v[0] * inv, v[1] * inv, v[2] * inv, v[3] * inv)
                 p1 = _pack_activation(v[4] * inv, v[5] * inv, v[6] * inv, v[7] * inv)
-                buffer_ops.buffer_store(
+                buffer_store(
                     Vec.from_elements([p0, p1], fx.Int32), rs_x8,
                     t * fx.Int32(H // 4) + (fx.Int32(j * 64) + lane) * fx.Int32(2))
 

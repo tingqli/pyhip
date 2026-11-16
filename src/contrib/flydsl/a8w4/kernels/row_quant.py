@@ -12,35 +12,16 @@ read from the device); ``rows`` and the grid are passed per call. Same math, sam
 output bits.
 """
 
-import functools
 from functools import cache
-import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl._mlir.dialects import arith, llvm
-from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
-from flydsl.expr.typing import T
-from flydsl.expr.typing import Vector as Vec
+from flydsl.expr import const_expr, gpu, range_constexpr
 
-from .._vendor import buffer_ops
-from .._vendor import buffer_ops as bo
-from .._vendor.act import gate_up_act, silu_mul_batch, situ_params
-from .._vendor.a8w4_ops import _pack_activation, _pointer, channel_exponents
-from .._vendor.moe_utils import _buffer_i32_scalar_read, _global_i32_at, _udiv, _umod
-from .._vendor.mxfp4_gemm_common import (
-    _gep1,
-    _global_base_ptr1,
-    _global_i32_buffer_tiles,
-    _global_i32_buffer_view,
-    _lds_ptr3,
-    global_typed_ptr,
-    lds_typed_ptr,
-    lds_vec_load,
-)
-from .._vendor.tensor_shim import _run_compiled
-from .._vendor.tensor_shim import _to_raw as _raw
+from ._cvt import _pack_activation
+from ._launch import _run_compiled
+from ._mem import _pointer
 
 
 @cache
