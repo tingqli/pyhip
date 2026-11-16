@@ -163,7 +163,7 @@ def compile_a8w4_gemm1(
     FNUZ with one f32 scale per (row, TILE_N columns), rows by SORTED position
     (``rows`` = sorted_size): ``out`` = ``[sorted_size, inter]`` fp8 then
     ``[sorted_size, inter/TILE_N]`` f32, i.e. gemm2's A + per-128-K-group scale
-    (``a8w4_gemm2(..., a_group=128)``); replaces a separate row-quant kernel.
+    (``a8w4_gemm2``'s A layout); replaces a separate row-quant kernel.
     """
     assert act in ("silu", "situv2"), act
     K = D_HIDDEN

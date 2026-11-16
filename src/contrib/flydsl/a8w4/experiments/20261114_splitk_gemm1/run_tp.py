@@ -58,11 +58,11 @@ def tp_sk(x, W, tw, ti, cfg, *, sk, pf, arb, nw, sk_tiles=0):
     SKG.ep_gemm1(x8, xs, W, sids, seids, nv, a2u, a2s, adt="fp8", block_m=bm, rowv=rowv,
                  zero=None, sched=None, ni=128, nw=nw, sch=3, pf=pf, arb=arb, sk=sk,
                  sk_tiles=sk_tiles)
-    kw = dict(tile_n=128, b_cache_mod=2, xcd_swizzle=0, dyn_rows=True)
+    kw = dict(tile_n=128, b_cache_mod=2, xcd_swizzle=0)
     if cfg["g2"] == "nt4":
-        kw.update(n_tiles=4, epilog="direct64", row_vgpr=True)
+        kw.update(n_tiles=4)
     G2.a8w4_gemm2(a2u.view(torch.float8_e4m3fnuz), a2s, W["w2"], W["w2_scale"], sids, sw,
-                  seids, nv, out, num_experts=E, tile_m=bm, a_group=128, fast_dec=2, **kw)
+                  seids, nv, out, num_experts=E, tile_m=bm, **kw)
     return out
 
 

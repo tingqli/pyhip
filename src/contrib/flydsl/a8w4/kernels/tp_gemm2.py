@@ -1,4 +1,4 @@
-# Package copy of doc-mimo/kernels/test_a8w4_gemm2.py (test harness removed, env knobs frozen).
+# Package copy of doc-mimo/kernels/test_a8w4_gemm2.py (test harness and experiment knobs removed).
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """Standalone A8W4 MoE stage2 (down-proj GEMM + routed atomic scatter) FlyDSL kernel
@@ -8,18 +8,16 @@ Extracted from the a16w4 port (``moe_2stage_a16wmix/gemm2.py``, ``a_dtype="fp8r"
 with only the configuration the tuned A8W4 build actually runs
 (``flydsl_moe2_afp8r_wfp4_bf16_t{BM}x{TN}x{TK}_atomic[_bnt*][_xcd*][_ftz]``):
 
-  * A  : FP8-FNUZ row-quantized stage1 intermediate ``[sorted_size, inter_dim]``
-         (by SORTED position) + f32 per-sorted-row scale
-  * W2 : mxfp4 (E2M1 + per-1x32 E8M0) ``[E, model_dim, inter_dim/2]``, standard
-         N-major preshuffle
-  * per-output-channel max E8M0 exponent derived in-kernel from the W2 scales
+  * A  : FP8-FNUZ stage1 intermediate ``[sorted_size, inter_dim]`` (by SORTED
+         position) + f32 scale per (sorted row, 128-K group): gemm1's q8s output
+  * W2 : fd2 mxfp4 ``[E, model_dim, inter_dim/2]`` (``prepare_weights``); the
+         per-output-channel max E8M0 codes are stored after the scales
   * MFMA(16,16,32,fp8) with fp4 -> fp8 decode through a per-32K-group byte LUT
-    (+ a sign-mask LUT, so FNUZ -0 never needs a per-fragment fix-up)
   * K (= inter_dim) loop unrolled, XOR-swizzled A-LDS, 4 waves split TILE_N
-  * ``dyn_rows``: per-WG runtime skip of all-padding 16-row sub-blocks
-  * epilogue: acc * a_scale[row] * 2**(exp-132) * route_weight -> bf16 LDS tile
-    (half the port's f32 staging) -> packed bf16x2 global atomic add into
-    ``[tokens, model_dim]``
+  * per-WG runtime skip of all-padding 16-row sub-blocks
+  * epilogue: acc * a_scale[row, g] * 2**(exp-132) * route_weight -> bf16 LDS
+    tile (half the port's f32 staging) -> packed bf16x2 global atomic add into
+    ``[tokens, model_dim]``; NTILE: straight from the accumulators (``direct64``)
 """
 
 import functools
@@ -60,8 +58,8 @@ from .._vendor.tensor_shim import _to_raw as _raw
 # W stays E2M1/E8M0. Output channel n is normalized by 2**(max_exp[n]-127-5)
 # (``_channel_factor``, applied in the epilogue); per 32-K group the remaining
 # 2**(5-delta), delta = max_exp - group_exp, is folded into an 8-entry
-# E2M1-magnitude -> FP8-FNUZ byte table (``_fp8_lut``) so each nibble decodes with
-# one v_perm.
+# E2M1-magnitude -> FP8-FNUZ byte table (``_fp8_lut_predelta``) so each nibble
+# decodes with one v_perm.
 
 
 def _perm_u32(hi, lo, sel):
@@ -72,73 +70,11 @@ def _perm_u32(hi, lo, sel):
     )
 
 
-def _fp8_lut(group_code, max_code, flush_tiny):
-    """8-entry ``|E2M1| * 2**(5-delta)`` -> FP8-FNUZ byte table.
-
-    Returns ``(lo, hi, sign_lo, sign_hi)``: the magnitude table plus a same-shaped
-    mask holding 0x80 for every non-zero entry (FNUZ has no -0; 0x80 is NaN).
-    """
-    difference = max_code - group_code
-    delta = fx.min(difference, 11).to(fx.Uint32) * fx.Uint32(0x08080808)
-    lo = (fx.Uint32(0x6C686080) - delta) & fx.Uint32(0xFFFFFF00)
-    hi = fx.Uint32(0x7C787470) - delta
-    if const_expr(flush_tiny):
-        # Approximation: drop groups < 2**-11 of this channel's largest scale.
-        lo = (difference > 11).select(fx.Uint32(0), lo)
-        hi = (difference > 11).select(fx.Uint32(0), hi)
-    else:
-        for diff, low, high in (
-            (12, 0x0C080400, 0x1C181410),
-            (13, 0x06040200, 0x14100C08),
-            (14, 0x03020100, 0x0C080604),
-            (15, 0x02010000, 0x06040302),
-            (16, 0x01000000, 0x03020201),
-            (17, 0, 0x02010100),
-            (18, 0, 0x01000000),
-        ):
-            lo = (difference == diff).select(fx.Uint32(low), lo)
-            hi = (difference == diff).select(fx.Uint32(high), hi)
-        lo = (difference >= 19).select(fx.Uint32(0), lo)
-        hi = (difference >= 19).select(fx.Uint32(0), hi)
-    # Entries are <= 0x7C, so +0x7F sets bit 7 exactly for non-zero bytes (no carry).
-    sign_lo = (lo + fx.Uint32(0x7F7F7F7F)) & fx.Uint32(0x80808080)
-    sign_hi = (hi + fx.Uint32(0x7F7F7F7F)) & fx.Uint32(0x80808080)
-    return lo, hi, sign_lo, sign_hi
-
-
-def _fp4x8_to_fp8x8(raw, lut):
-    """Eight consecutive FP4 nibbles (one i32) -> v8 FP8-FNUZ MFMA operand."""
-    raw = fx.Uint32(raw)
-    lo, hi, sign_lo, sign_hi = lut
-    sel_even = raw & 0x07070707  # magnitudes of nibbles 0,2,4,6
-    sel_odd = (raw >> 4) & 0x07070707  # magnitudes of nibbles 1,3,5,7
-    # byte = |value| | (nibble sign & 0x80-if-non-zero)
-    even = (_perm_u32(sign_hi, sign_lo, sel_even) & (raw << 4)) | _perm_u32(
-        hi, lo, sel_even
-    )
-    odd = (_perm_u32(sign_hi, sign_lo, sel_odd) & raw) | _perm_u32(hi, lo, sel_odd)
-    lo32 = _perm_u32(odd, even, 0x05010400).bitcast(fx.Int32)
-    hi32 = _perm_u32(odd, even, 0x07030602).bitcast(fx.Int32)
-    return fx.Vector.from_elements([lo32, hi32], fx.Int32).bitcast(fx.Float8E4M3FNUZ)
-
-
-# ---- fast decode (``fast_dec``, same scheme as test_a8w4_gemm1.py) ---------------
-# W pre-transformed by ``prep_w2_fast``: byte j of a dword = (k_j, k_{j+4}) and no -0,
+# ---- fd2 decode (same scheme as tp_gemm1) ----------------------------------------
+# W pre-transformed by ``prep_w1_fast``: byte j of a dword = (k_j, k_{j+4}) and no -0,
 # so even/odd nibbles decode straight to K 0..3 / 4..7 and the sign is a bit move.
-# fast_dec=2 also stores min(max-code, 11)*8 per group in the scale bytes (flushed
-# groups zeroed in W) and the per-channel max codes (int32) right after the scales.
-
-
-def _fp8_lut_fast(group_code, max_code):
-    difference = max_code - group_code
-    delta = fx.min(difference, 11).to(fx.Uint32) * fx.Uint32(0x08080808)
-    lo = (fx.Uint32(0x6C686080) - delta) & fx.Uint32(0xFFFFFF00)
-    hi = fx.Uint32(0x7C787470) - delta
-    flushed = difference > 11
-    lo = flushed.select(fx.Uint32(0), lo)
-    hi = flushed.select(fx.Uint32(0), hi)
-    smask = flushed.select(fx.Uint32(0), fx.Uint32(0x80808080))
-    return lo, hi, smask
+# The scale bytes hold delta*8, delta = min(max_code - code, 11) (flushed groups
+# zeroed in W); the per-channel max codes (int32) follow the scales.
 
 
 def _fp8_lut_predelta(delta):
@@ -213,8 +149,8 @@ def _atomic_bf16_epilog(
     staging, half the LDS), re-read it as (8 rows x 32 lanes x 2 cols) and
     ``global_atomic_pk_add_bf16`` into ``out[token, n]`` (128 B per row per op)."""
     # Row count comes from the accumulator list, not BM: a nested @flyc.jit call
-    # does not re-specialize on Python int arguments (dyn_rows calls this with
-    # several row variants in one kernel).
+    # does not re-specialize on Python int arguments (the row dispatch calls this
+    # with several row variants in one kernel).
     M_CHUNKS = len(accm)
     M_REPS = M_CHUNKS * 2  # 256 threads = 8 rows x 32 lanes per pass
     n_per_wave = BN // 4
@@ -339,45 +275,38 @@ def compile_a8w4_gemm2(
     b_cache_mod=2,
     xcd_swizzle=0,
     waves_per_eu=None,
-    flush_tiny=True,
-    epilog="lds",
-    dyn_rows=False,
-    A_GROUP=0,
-    fast_dec=0,
     NTILE=0,
-    ROW_VGPR=False,
 ):
-    """Build the A8W4 stage2 launcher (N = model_dim, K = inter_dim).
+    """Build the A8W4 stage2 launcher (N = model_dim, K = inter_dim; fd2 weights).
 
     ``NTILE`` (0 = the original one-tile-per-CTA body): each CTA owns one m-block
     and NTILE adjacent n-blocks (grid / NTILE). A is staged to LDS once and reused;
     the row-static data (ratio s0/s1 of the two A-scale groups, s1 * route weight,
-    sorted id) is loaded once and kept in LDS (+12 B/row) or, with ``ROW_VGPR``,
-    in VGPRs, so one accumulator set is rescaled at the group boundary instead of
-    two; all A loads are issued before any LDS write; W / scales of n-tile t+1 are
-    prefetched before tile t computes, so they land under tile t's MFMA +
-    epilogue. NTILE uses the ``direct64`` epilogue (LDS = A tile).
+    sorted id) is loaded once and kept in VGPRs (lane-distributed, fetched with
+    ds_bpermute), so one accumulator set is rescaled at the group boundary instead
+    of two; all A loads are issued before any LDS write; W / scales of n-tile t+1
+    are prefetched before tile t computes, so they land under tile t's MFMA +
+    epilogue.
 
-    ``A_GROUP``: 0 = one A scale per sorted row (``a_scale`` f32 [sorted_size]);
-    128 = one per (sorted row, 128-K group) (``a_scale`` f32 [sorted_size, K/128],
-    as written by gemm1's fused-quant ``q8s`` epilogue). Each group accumulates
-    into its own accumulators, combined at dequant as sum_g acc_g * s_g (a single
+    A scales: one per (sorted row, 128-K group) (``a_scale`` f32 [sorted_size,
+    K/128], as written by gemm1's q8s epilogue). Each group accumulates into its
+    own accumulators, combined at dequant as sum_g acc_g * s_g (a single
     accumulator rescaled by s_g/s_{g+1} at group boundaries needed more VGPRs:
     the compiler hoists the scale loads + divides; 89 vs 77 at bm32).
 
-    ``epilog``: ``"lds"`` (default, NTILE=0) stages a weighted bf16 tile in LDS
-    (BM*TILE_N*2, half the port's f32 staging) for 128 B contiguous atomics;
-    ``"direct64"`` (NTILE only) scatters straight from the MFMA accumulator
+    Epilogue: NTILE=0 (``lds``) stages a weighted bf16 tile in LDS (BM*TILE_N*2,
+    half the port's f32 staging) for 128 B contiguous atomics; NTILE>0
+    (``direct64``) scatters straight from the MFMA accumulator
     (``_direct64_scatter_tile``: no LDS staging, 64 B-contiguous atomics).
 
-    ``dyn_rows``: each WG computes only the leading 16-row sub-blocks of its sorted
-    block that hold valid rows (valid rows are contiguous from the block start),
-    so A loads / MFMA / dequant / scatter skip all-padding sub-blocks. All row
-    variants (16, 32, ..., BM) are compiled in; W traffic is unchanged.
+    Each WG computes only the leading 16-row sub-blocks of its sorted block that
+    hold valid rows (valid rows are contiguous from the block start), so A loads /
+    MFMA / dequant / scatter skip all-padding sub-blocks. All row variants (16,
+    32, ..., BM) are compiled in; W traffic is unchanged.
 
     Launch args (raw device pointers): ``a`` fp8 [sorted_size, K], ``a_scale`` f32
-    [sorted_size], ``w`` mxfp4 [E, N, K/2] (standard preshuffle), ``w_scale`` e8m0
-    (shuffled), ``sorted_expert_ids``, ``num_valid_ids``, ``sorted_ids``,
+    [sorted_size, K/128], ``w`` fd2 mxfp4 [E, N, K/2], ``w_scale`` (fd2 scales +
+    max codes), ``sorted_expert_ids``, ``num_valid_ids``, ``sorted_ids``,
     ``sorted_weights``, ``out`` bf16 [tokens, N] (pre-zeroed, atomically
     accumulated), then ``tokens``, four unused scalars (``dbg``, ``tbl``,
     ``rank``, ``epoch``: they only keep the kernarg layout, and so the ISA, of the
@@ -391,31 +320,22 @@ def compile_a8w4_gemm2(
     assert TILE_N % (NUM_WAVES * 16) == 0, "TILE_N must be a multiple of 64"
     assert BM % 16 == 0, f"BM must be a multiple of 16, got {BM}"
     assert (BM * TILE_K) % (256 * 16) == 0, "A tile must be whole 16 B per thread"
-    assert epilog == ("direct64" if NTILE else "lds"), f"bad epilog {epilog!r}"
-    assert epilog != "direct64" or TILE_N // NUM_WAVES == 32, (
-        "direct64: 32 columns per wave")
-    assert fast_dec in (0, 1, 2) and (flush_tiny or not fast_dec), fast_dec
-    assert A_GROUP in (0, 128), f"A_GROUP must be 0 or 128, got {A_GROUP}"
-    A_GROUPS = K // 128 if A_GROUP else 1  # A scale groups (= accumulator sets)
+    EPILOG = "direct64" if NTILE else "lds"
+    assert not NTILE or TILE_N // NUM_WAVES == 32, "direct64: 32 columns per wave"
+    A_GROUPS = K // 128  # A scale groups (= accumulator sets)
 
     NUM_N_BLOCKS = N_OUT // TILE_N
     K_TILES = K // TILE_K
     N_REPEAT = TILE_N // NUM_WAVES // 16  # 16-col MFMA blocks per wave
     K_STEPS = TILE_K // 32  # MFMA K32 steps per tile
     K_GROUPS = TILE_K // 128  # 128-K groups: one W dwordx4 + one scale byte each
-    # LDS epilogue: the A tile and the bf16 staging tile never coexist (barrier
+    # lds epilogue: the A tile and the bf16 staging tile never coexist (barrier
     # between) -> max, not sum. direct64: A tile only.
-    LDS_BYTES = (
-        BM * TILE_K if epilog == "direct64" else max(BM * TILE_K, BM * TILE_N * 2)
-    )
+    LDS_BYTES = BM * TILE_K if NTILE else max(BM * TILE_K, BM * TILE_N * 2)
     if NTILE:
         assert NUM_N_BLOCKS % NTILE == 0, f"NTILE={NTILE} must divide {NUM_N_BLOCKS}"
         assert K_TILES == 1, "NTILE keeps the whole A (one K tile) in LDS"
-    ROW_OFF = LDS_BYTES  # NTILE row data: f32 ratio[BM], f32 fin[BM], i32 id[BM]
-    if NTILE:
         assert K // 128 <= 2, "NTILE rescales one accumulator across <= 2 A groups"
-        if not ROW_VGPR:  # ROW_VGPR: row data per lane in VGPRs, no LDS
-            LDS_BYTES += BM * 12
     NBG = NUM_N_BLOCKS // max(NTILE, 1)  # CTAs per m-block
 
     # W (mxfp4) N-major preshuffle in bytes: (N/16, K/128, klane=4, nlane=16, kpack=16).
@@ -427,14 +347,13 @@ def compile_a8w4_gemm2(
     SC_STRIDE_N0 = (SCALE_K_PAD // 256) * 64
     WS_BYTES = NE * N_OUT * (SCALE_K_PAD // 32)
 
-    ftz_tag = "_ftz" if flush_tiny else ""
     wpe_tag = f"_w{waves_per_eu}" if waves_per_eu else ""
+    # _ftz / _fd2 / _dyn / _ag128 / _rv: tags of options that are now always on
+    # (names unchanged)
     kname = (
         f"a8w4_gemm2_h{N_OUT}_i{K}_ne{NE}_bm{BM}_tn{TILE_N}_tk{TILE_K}"
-        f"_bcm{b_cache_mod}_xcd{xcd_swizzle}{wpe_tag}{ftz_tag}_{epilog}"
-        f"{f'_fd{fast_dec}' if fast_dec else ''}"
-        f"{'_dyn' if dyn_rows else ''}{f'_ag{A_GROUP}' if A_GROUP else ''}"
-        f"{f'_nt{NTILE}' if NTILE else ''}{'_rv' if NTILE and ROW_VGPR else ''}"
+        f"_bcm{b_cache_mod}_xcd{xcd_swizzle}{wpe_tag}_ftz_{EPILOG}_fd2_dyn_ag128"
+        f"{f'_nt{NTILE}_rv' if NTILE else ''}"
     )
 
     def _body(
@@ -531,7 +450,7 @@ def compile_a8w4_gemm2(
             }
 
         def exp_issue(by_n, ni):
-            # fast_dec=2: per-channel max codes stored after the scale bytes
+            # per-channel max codes stored after the scale bytes
             n_lane = expert_off + by_n + n_wave_base + fx.Int32(ni * 16) + lane_mod_16
             return fx.Int32(
                 _global_i32_at(fx.Int64(arg_w_scale) + fx.Int64(WS_BYTES), n_lane)
@@ -541,32 +460,16 @@ def compile_a8w4_gemm2(
             code = {}  # code[ni, G]: this lane's e8m0 byte of 128-K group G
             for ni in range_constexpr(N_REPEAT):
                 for G in range_constexpr(K // 128):
-                    if const_expr(fast_dec == 2):
-                        # byte (G%2)*2 + npack = delta*8, broadcast by one v_perm
-                        p = packed[sc_key[ni], G // 2]
-                        sel = (fx.Int32((G % 2) * 2) + sc_npack[ni]) * fx.Int32(
-                            0x01010101
-                        )
-                        code[ni, G] = _perm_u32(p, p, sel)
-                        continue
-                    shift = fx.Int32((G % 2) * 16) + sc_npack[ni] * fx.Int32(8)
-                    code[ni, G] = packed[sc_key[ni], G // 2].shrui(shift) & fx.Int32(
-                        0xFF
+                    # byte (G%2)*2 + npack = delta*8, broadcast by one v_perm
+                    p = packed[sc_key[ni], G // 2]
+                    sel = (fx.Int32((G % 2) * 2) + sc_npack[ni]) * fx.Int32(
+                        0x01010101
                     )
-            # Per-output-channel max e8m0 code over K: lane max, then across the 4
-            # lanes (L//16) that share the column (fast_dec=2: stored after the scales).
+                    code[ni, G] = _perm_u32(p, p, sel)
+            # Per-output-channel max e8m0 code (stored after the scales).
             exp_n = []
             for ni in range_constexpr(N_REPEAT):
-                if const_expr(fast_dec == 2):
-                    exp_n.append(exp_issue(by_n, ni) if exp_pre is None else exp_pre[ni])
-                    continue
-                mx = code[ni, 0]
-                for G in range_constexpr(1, K // 128):
-                    mx = (code[ni, G] > mx).select(code[ni, G], mx)
-                for off in (16, 32):
-                    peer = mx.shuffle_xor(fx.Int32(off), fx.Int32(64))
-                    mx = (peer > mx).select(peer, mx)
-                exp_n.append(mx)
+                exp_n.append(exp_issue(by_n, ni) if exp_pre is None else exp_pre[ni])
             return code, exp_n
 
         if const_expr(not NTILE):
@@ -669,17 +572,12 @@ def compile_a8w4_gemm2(
                 for ni in range_constexpr(N_REPEAT):
                     luts = [
                         _fp8_lut_predelta(code[ni, base_k // 128 + g])
-                        if fast_dec == 2
-                        else _fp8_lut_fast(code[ni, base_k // 128 + g], exp_n[ni])
-                        if fast_dec
-                        else _fp8_lut(code[ni, base_k // 128 + g], exp_n[ni], flush_tiny)
                         for g in range_constexpr(K_GROUPS)
                     ]
-                    dec = _fp4x8_to_fp8x8_fast if fast_dec else _fp4x8_to_fp8x8
                     for ku in range_constexpr(K_STEPS):
-                        b8 = dec(raw[ni][ku // 4][ku % 4], luts[ku // 4])
+                        b8 = _fp4x8_to_fp8x8_fast(raw[ni][ku // 4][ku % 4], luts[ku // 4])
                         gg = base_k // 128 + ku // 4  # 128-K group of this K step
-                        acc = accg[gg if A_GROUP else 0]
+                        acc = accg[gg]
                         for mi in range_constexpr(M_REPEAT):
                             _mma_fp8(mma_atom, acc[mi][ni], load_a(mi, ku), b8)
                 gpu.barrier()  # A reads done before the slot (or the epilogue) reuses LDS
@@ -693,17 +591,13 @@ def compile_a8w4_gemm2(
                     for g in range_constexpr(A_GROUPS)
                 ]
                 for ni in range_constexpr(N_REPEAT):
-                    if const_expr(A_GROUP):
-                        vs = [Vec(accg[g][mi][ni].load()) for g in range(A_GROUPS)]
-                        out4 = []
-                        for ii in range_constexpr(4):
-                            t = vs[0][ii] * rs[0][ii]
-                            for g in range_constexpr(1, A_GROUPS):
-                                t = t + vs[g][ii] * rs[g][ii]
-                            out4.append(t * f_n[ni])
-                    else:
-                        v = Vec(accm[mi][ni].load())
-                        out4 = [v[ii] * (rs[0][ii] * f_n[ni]) for ii in range_constexpr(4)]
+                    vs = [Vec(accg[g][mi][ni].load()) for g in range(A_GROUPS)]
+                    out4 = []
+                    for ii in range_constexpr(4):
+                        t = vs[0][ii] * rs[0][ii]
+                        for g in range_constexpr(1, A_GROUPS):
+                            t = t + vs[g][ii] * rs[g][ii]
+                        out4.append(t * f_n[ni])
                     accm[mi][ni].store(Vec.from_elements(out4, fx.Float32))
 
             # ---- epilogue: routing weight + bf16x2 atomic scatter -------------------
@@ -729,11 +623,6 @@ def compile_a8w4_gemm2(
 
 
         # ---- NTILE body: one m-block x NTILE adjacent n-blocks ----------------------
-        def _ld1(atom, src, index, elem_ty):
-            frag = fx.make_rmem_tensor(1, elem_ty)
-            fx.copy(atom, src[None, index], frag)
-            return Vec(frag.load())[0]
-
         def run_rows_nt(rows):
             M_REPEAT = rows // 16
             A_LOADS = rows * TILE_K // (256 * 16)
@@ -756,11 +645,7 @@ def compile_a8w4_gemm2(
                 by_n_t = nb * fx.Int32(TILE_N)
                 wb, scb, sck, scn = w_cols(by_n_t)
                 packed_t = scale_issue(scb)
-                exp_t = (
-                    [exp_issue(by_n_t, ni) for ni in range(N_REPEAT)]
-                    if fast_dec == 2
-                    else None
-                )
+                exp_t = [exp_issue(by_n_t, ni) for ni in range(N_REPEAT)]
                 raw = []
                 for ni in range_constexpr(N_REPEAT):
                     per_g = []
@@ -777,97 +662,60 @@ def compile_a8w4_gemm2(
 
             # Row-static data, once per CTA: per sorted row ratio = s0/s1 (A-scale
             # groups 0/1; the single accumulator is rescaled by it at the group
-            # boundary), fin = s_last * route weight, and the sorted id.
-            # ROW_VGPR: each lane loads its own rows into VGPRs (vector loads, no
-            # LDS; LDS = A tile only). Else: cooperatively into LDS (+12 B/row),
-            # 4 threads per row writing the same value.
-            if const_expr(ROW_VGPR):
-                # lane-distributed: lane L of every wave holds rows h*64 + L
-                # (h < BM/64); a consumer fetches its row with one ds_bpermute
-                # (LDS crossbar, no LDS space, ~3 VGPRs per 64 rows)
-                rs_as = buffer_ops.create_buffer_resource_from_addr(_raw(fx.Int64(arg_a_scale)))
-                rs_w = buffer_ops.create_buffer_resource_from_addr(_raw(fx.Int64(arg_sweights)))
-                rs_id = buffer_ops.create_buffer_resource_from_addr(_raw(fx.Int64(arg_stids)))
-                RH = -(-BM // 64)
-                raw_s, raw_w, rid_h = [], [], []
-                for h in range_constexpr(RH):
-                    grow_h = m_row + fx.Int32(h * 64) + lane
-                    if const_expr(A_GROUPS > 1):
-                        v = Vec(buffer_ops.buffer_load(
-                            rs_as, grow_h * fx.Int32(A_GROUPS), vec_width=A_GROUPS, dtype=T.i32))
-                        raw_s.append([fx.Int32(v[g]) for g in range(A_GROUPS)])
-                    else:
-                        raw_s.append([fx.Int32(buffer_ops.buffer_load(
-                            rs_as, grow_h, vec_width=1, dtype=T.i32))])
-                    raw_w.append(fx.Int32(buffer_ops.buffer_load(rs_w, grow_h, vec_width=1, dtype=T.i32)))
-                    rid_h.append(fx.Int32(buffer_ops.buffer_load(rs_id, grow_h, vec_width=1, dtype=T.i32)))
-            else:
-                rrow = tx % fx.Int32(BM)
-                grow = m_row + rrow
-                if const_expr(A_GROUP):
-                    r = fx.make_rmem_tensor(fx.make_layout(A_GROUPS, 1), fx.Int32)
-                    fx.copy(asg_atom_nt, fx.slice(asg_tiles_nt, (None, grow)), r)
-                    v = fx.Vector(fx.memref_load_vec(r))
-                    a_s = [fx.Int32(v[g]).bitcast(fx.Float32) for g in range(A_GROUPS)]
+            # boundary), fin = s_last * route weight, and the sorted id. Each lane
+            # loads its own rows into VGPRs (vector loads, no LDS; LDS = A tile
+            # only): lane L of every wave holds rows h*64 + L (h < BM/64); a
+            # consumer fetches its row with one ds_bpermute (LDS crossbar, no LDS
+            # space, ~3 VGPRs per 64 rows).
+            rs_as = buffer_ops.create_buffer_resource_from_addr(_raw(fx.Int64(arg_a_scale)))
+            rs_w = buffer_ops.create_buffer_resource_from_addr(_raw(fx.Int64(arg_sweights)))
+            rs_id = buffer_ops.create_buffer_resource_from_addr(_raw(fx.Int64(arg_stids)))
+            RH = -(-BM // 64)
+            raw_s, raw_w, rid_h = [], [], []
+            for h in range_constexpr(RH):
+                grow_h = m_row + fx.Int32(h * 64) + lane
+                if const_expr(A_GROUPS > 1):
+                    v = Vec(buffer_ops.buffer_load(
+                        rs_as, grow_h * fx.Int32(A_GROUPS), vec_width=A_GROUPS, dtype=T.i32))
+                    raw_s.append([fx.Int32(v[g]) for g in range(A_GROUPS)])
                 else:
-                    a_s = [_ld1(ld_f32, as_buf_nt, grow, fx.Float32)]
-                r_w = _ld1(ld_f32, sweights_buf, grow, fx.Float32)
-                r_id = _ld1(ld_i32, stids_buf, grow, fx.Int32)
+                    raw_s.append([fx.Int32(buffer_ops.buffer_load(
+                        rs_as, grow_h, vec_width=1, dtype=T.i32))])
+                raw_w.append(fx.Int32(buffer_ops.buffer_load(rs_w, grow_h, vec_width=1, dtype=T.i32)))
+                rid_h.append(fx.Int32(buffer_ops.buffer_load(rs_id, grow_h, vec_width=1, dtype=T.i32)))
 
             for r, dst in a_regs:
                 fx.copy(lds_write_atom, r, fx.slice(lds_tiles16, (None, dst)))
-            lds_i32 = fx.Int32(fx.ptrtoint(lds_ptr))
-            if const_expr(not ROW_VGPR):
-                row_f = lds_typed_ptr(lds_i32 + fx.Int32(ROW_OFF), T.f32)
-                row_i = lds_typed_ptr(lds_i32 + fx.Int32(ROW_OFF), T.i32)
-                s_last = a_s[-1]
-                if const_expr(A_GROUP):
-                    # an all-zero group quantizes to scale 0 (its acc part is 0 too)
-                    s_last = (s_last == fx.Float32(0.0)).select(fx.Float32(1.0), s_last)
-                    row_f[rrow] = a_s[0] / s_last
-                row_f[fx.Int32(BM) + rrow] = s_last * r_w
-                row_i[fx.Int32(2 * BM) + rrow] = r_id
             rocdl.s_waitcnt(lgkmcnt=0)
-            gpu.barrier()  # A (+ LDS row data) visible (stay for every n-tile)
+            gpu.barrier()  # A visible (stays for every n-tile)
 
-            if const_expr(ROW_VGPR):
-                ratio_h, fin_h = [], []  # i32 bit patterns (ds_bpermute moves i32)
-                for h in range_constexpr(RH):
-                    w_h = raw_w[h].bitcast(fx.Float32)
-                    s_l = raw_s[h][-1].bitcast(fx.Float32)
-                    if const_expr(A_GROUP):
-                        s_l = (s_l == fx.Float32(0.0)).select(fx.Float32(1.0), s_l)
-                        ratio_h.append((raw_s[h][0].bitcast(fx.Float32) / s_l).bitcast(fx.Int32))
-                    fin_h.append((s_l * w_h).bitcast(fx.Int32))
+            ratio_h, fin_h = [], []  # i32 bit patterns (ds_bpermute moves i32)
+            for h in range_constexpr(RH):
+                w_h = raw_w[h].bitcast(fx.Float32)
+                s_l = raw_s[h][-1].bitcast(fx.Float32)
+                # an all-zero group quantizes to scale 0 (its acc part is 0 too)
+                s_l = (s_l == fx.Float32(0.0)).select(fx.Float32(1.0), s_l)
+                ratio_h.append((raw_s[h][0].bitcast(fx.Float32) / s_l).bitcast(fx.Int32))
+                fin_h.append((s_l * w_h).bitcast(fx.Int32))
 
-                def _fetch(q, row_static, row_lane):
-                    """q[row // 64] at block row ``row_static + row_lane`` (row_lane <
-                    64 - row_static % 64, so the half is static)."""
-                    src = fx.Int32(row_static % 64) + row_lane
-                    return fx.Int32(rocdl.ds_bpermute(T.i32, src * fx.Int32(4), q[row_static // 64]))
+            def _fetch(q, row_static, row_lane):
+                """q[row // 64] at block row ``row_static + row_lane`` (row_lane <
+                64 - row_static % 64, so the half is static)."""
+                src = fx.Int32(row_static % 64) + row_lane
+                return fx.Int32(rocdl.ds_bpermute(T.i32, src * fx.Int32(4), q[row_static // 64]))
 
             def row4(slot, mi):
-                """f32 row data of this lane's 4 acc rows of block mi."""
-                if const_expr(ROW_VGPR):
-                    q = ratio_h if slot == 0 else fin_h
-                    return [
-                        _fetch(q, mi * 16 + v, lane_div_16 * fx.Int32(4)).bitcast(fx.Float32)
-                        for v in range(4)
-                    ]
-                byte = fx.Int32(ROW_OFF + slot * BM * 4 + mi * 64) + lane_div_16 * fx.Int32(16)
-                return Vec(lds_vec_load(lds_i32, byte, Vec.make_type(4, fx.Float32), fx.Float32, align=16))
-
-            def row_id(row):
-                return lds_vec_load(
-                    lds_i32, fx.Int32(ROW_OFF + 2 * BM * 4) + row * fx.Int32(4),
-                    T.i32, fx.Int32, align=4,
-                )
+                """f32 row data (slot 0: ratio, 1: fin) of this lane's 4 acc rows of
+                block mi."""
+                q = ratio_h if slot == 0 else fin_h
+                return [
+                    _fetch(q, mi * 16 + v, lane_div_16 * fx.Int32(4)).bitcast(fx.Float32)
+                    for v in range(4)
+                ]
 
             def id_direct(mi, k):
                 """direct64 scatter: sorted id of this lane's row k of block mi."""
-                if const_expr(ROW_VGPR):
-                    return _raw(_fetch(rid_h, mi * 16 + k, lane_div_16 * fx.Int32(4)))
-                return _raw(row_id(fx.Int32(mi * 16 + k) + lane_div_16 * fx.Int32(4)))
+                return _raw(_fetch(rid_h, mi * 16 + k, lane_div_16 * fx.Int32(4)))
 
             def load_a(mi, ku):
                 row = lane_mod_16 + fx.Int32(mi * 16)
@@ -895,21 +743,13 @@ def compile_a8w4_gemm2(
                     for ni in range_constexpr(N_REPEAT):
                         acc[mi][ni].store(zero4)
                 luts = [
-                    [
-                        _fp8_lut_predelta(code_t[ni, g])
-                        if fast_dec == 2
-                        else _fp8_lut_fast(code_t[ni, g], exp_t[ni])
-                        if fast_dec
-                        else _fp8_lut(code_t[ni, g], exp_t[ni], flush_tiny)
-                        for g in range_constexpr(K_GROUPS)
-                    ]
+                    [_fp8_lut_predelta(code_t[ni, g]) for g in range_constexpr(K_GROUPS)]
                     for ni in range_constexpr(N_REPEAT)
                 ]
-                dec = _fp4x8_to_fp8x8_fast if fast_dec else _fp4x8_to_fp8x8
                 # ku outer: each A fragment is read from LDS once and feeds every
                 # ni (half the A LDS traffic of the ni-outer order)
                 for ku in range_constexpr(K_STEPS):
-                    if const_expr(A_GROUP and ku == 4):
+                    if const_expr(ku == 4):
                         # group 0 -> group 1 boundary: acc = acc0 * s0 / s1
                         for mi in range_constexpr(M_REPEAT):
                             rt = row4(0, mi)
@@ -919,7 +759,7 @@ def compile_a8w4_gemm2(
                                     Vec.from_elements([a4[v] * rt[v] for v in range(4)], fx.Float32)
                                 )
                     b8s = [
-                        dec(cur["raw"][ni][ku // 4][ku % 4], luts[ni][ku // 4])
+                        _fp4x8_to_fp8x8_fast(cur["raw"][ni][ku // 4][ku % 4], luts[ni][ku // 4])
                         for ni in range_constexpr(N_REPEAT)
                     ]
                     for mi in range_constexpr(M_REPEAT):
@@ -952,61 +792,42 @@ def compile_a8w4_gemm2(
                 )
                 cur = nxt
 
-        if const_expr(NTILE):
-            stids_buf = _flat_buffer(arg_stids, T.i32, 4)
-            sweights_buf = _flat_buffer(arg_sweights, T.f32, 4)
-            ld_i32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Int32)
-            ld_f32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
-            as_buf_nt = _flat_buffer(arg_a_scale, T.f32, 4)
-            asg_tiles_nt = _global_i32_buffer_tiles(
-                arg_a_scale, fx.Int64(0xFFFFFFFF), A_GROUPS
-            )
-            asg_atom_nt = (
-                fx.make_copy_atom(fx.rocdl.BufferCopy64b(), fx.Int32)
-                if A_GROUPS == 2
-                else fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Int32)
-                if A_GROUPS == 4
-                else None
-            )
         run = run_rows_nt if NTILE else run_rows
 
         # ---- row-variant dispatch ------------------------------------------------
-        if const_expr(dyn_rows):
-            # Valid rows of a sorted block are contiguous from its start, so the
-            # first 16-row sub-block whose first row is padding bounds the work.
-            pad = {
-                i: (
-                    fx.Int32(
-                        rocdl.readfirstlane(
-                            T.i32,
-                            _raw(_global_i32_at(arg_stids, m_row + fx.Int32(16 * i))),
-                        )
+        # Valid rows of a sorted block are contiguous from its start, so the
+        # first 16-row sub-block whose first row is padding bounds the work.
+        pad = {
+            i: (
+                fx.Int32(
+                    rocdl.readfirstlane(
+                        T.i32,
+                        _raw(_global_i32_at(arg_stids, m_row + fx.Int32(16 * i))),
                     )
-                    & fx.Int32(0x00FFFFFF)
                 )
-                >= i32_M
-                for i in range(1, BM // 16)
-            }
+                & fx.Int32(0x00FFFFFF)
+            )
+            >= i32_M
+            for i in range(1, BM // 16)
+        }
 
-            def _dispatch_from(i):
-                # sub-blocks 0..i-1 hold valid rows; decide on sub-block i.
-                if i == BM // 16:
-                    run(BM)
-                    return
-                cond = pad[i]
+        def _dispatch_from(i):
+            # sub-blocks 0..i-1 hold valid rows; decide on sub-block i.
+            if i == BM // 16:
+                run(BM)
+                return
+            cond = pad[i]
 
-                @flyc.jit
-                def _dispatch():
-                    if cond:
-                        run(16 * i)
-                    else:
-                        _dispatch_from(i + 1)
+            @flyc.jit
+            def _dispatch():
+                if cond:
+                    run(16 * i)
+                else:
+                    _dispatch_from(i + 1)
 
-                _dispatch()
+            _dispatch()
 
-            _dispatch_from(1)
-        else:
-            run(BM)
+        _dispatch_from(1)
 
     @fx.struct
     class SharedStorage:
@@ -1166,21 +987,15 @@ def a8w4_gemm2(
     tile_k=256,
     b_cache_mod=2,
     xcd_swizzle=0,
-    flush_tiny=True,
     waves_per_eu=None,
-    epilog="lds",
-    dyn_rows=False,
-    a_group=0,
-    fast_dec=0,
     n_tiles=0,
-    row_vgpr=False,
 ):
     """Host launcher. ``out`` is bf16 ``[tokens, model_dim]``; it is accumulated
     into (atomics), so the caller zeroes it (moe_sorting's moe_buf already is).
-    ``a_group=128``: ``a_scale`` is f32 [sorted_size, inter_dim/128].
-    ``fast_dec``: 1/2 need ``w2`` / ``w2_scale`` from ``prep_w2_fast``.
-    ``n_tiles``: n-blocks per CTA (``NTILE`` of ``compile_a8w4_gemm2``; 0 = off;
-    needs ``epilog="direct64"``)."""
+    ``a_scale`` is f32 [sorted_size, inter_dim/128] (gemm1's q8s output);
+    ``w2`` / ``w2_scale`` are fd2 weights (``prepare_weights``).
+    ``n_tiles``: n-blocks per CTA (``NTILE`` of ``compile_a8w4_gemm2``; 0 = off,
+    lds epilogue; > 0: direct64 epilogue)."""
     tokens, model_dim = out.shape
     inter_dim = a_fp8.shape[1]
     launch = compile_a8w4_gemm2(
@@ -1192,14 +1007,8 @@ def a8w4_gemm2(
         TILE_K=tile_k,
         b_cache_mod=b_cache_mod,
         xcd_swizzle=xcd_swizzle,
-        flush_tiny=flush_tiny,
         waves_per_eu=waves_per_eu,
-        epilog=epilog,
-        dyn_rows=dyn_rows,
-        A_GROUP=a_group,
-        fast_dec=fast_dec,
         NTILE=n_tiles,
-        ROW_VGPR=row_vgpr,
     )
     grid = sorted_expert_ids.numel() * (model_dim // tile_n) // max(n_tiles, 1)
     _run_compiled(

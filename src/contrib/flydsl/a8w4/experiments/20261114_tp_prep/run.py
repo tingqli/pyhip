@@ -65,11 +65,11 @@ def _tp2k_tail(cfg, x8, xs, W, sids, sw, seids, nv, out, sk=None):
                      adt="fp8", block_m=bm, rowv=rowv, zero=None, sched=None, ni=128, nw=8,
                      sch=3, pf=sk["pf"], arb=256, sk=sk["sk"], sk_tiles=sk["sk_tiles"])
     a2 = buf[:nd].view(torch.float8_e4m3fnuz).view(sorted_size, I)
-    kw = dict(tile_n=128, b_cache_mod=2, xcd_swizzle=0, dyn_rows=True)
+    kw = dict(tile_n=128, b_cache_mod=2, xcd_swizzle=0)
     if cfg["g2"] == "nt4":
-        kw.update(n_tiles=4, epilog="direct64", row_vgpr=True)
+        kw.update(n_tiles=4)
     G2.a8w4_gemm2(a2, a2s, W["w2"], W["w2_scale"], sids, sw, seids, nv, out,
-                  num_experts=E, tile_m=bm, a_group=128, fast_dec=2, **kw)
+                  num_experts=E, tile_m=bm, **kw)
     return out
 
 
