@@ -13,7 +13,7 @@
 
 ### 0.1 当前状态（每次停下来前更新）
 
-- **迭代**：I1、I1b、I2 已完成。I2（见 3.1 节）等用户 review；之后是 I3（`_vendor/tensor_shim.py` 的 3 个环境变量开关）。
+- **迭代**：I1、I1b、I2 已完成。用户看过 I2 后改了 I3 的范围（见 3.1 节）：`_vendor` 只留真正用到的代码，迁到 `kernels/` 下的共享模块，删掉 `_vendor/`。I3 进行中。
 - **分支**：`/sgl-workspace/pyhip` 的 `refactor/a8w4`。
 - **已有提交**：
   - 迭代 0，安全网：`64ce77c`、`d17f502`（ISA 基线在这个提交上生成）、`4e256d9`。
@@ -49,10 +49,10 @@
 | # | 内容 | 来源 | 验收 |
 |---|---|---|---|
 | I1 | 删除 TP kernel（`tp_gemm1`、`tp_gemm2`、`tp_fmoe`、`tp_fmoe_q`）里走不到的选项和冻结常量 | Q4，Phase 1 | ISA IDENTICAL；API 测试；单卡 pytest |
-| I1b | 删除 TP kernel 里调用方不用的模式取值（fast_dec 0/1、gemm1 的 bf16 epilogue 等，规则见 3.2 节） | 用户在 I1 review 时决定 | 同上 |
+| I1b | 删除 TP kernel 里调用方不用的模式取值（fast_dec 0/1、gemm1 的 bf16 epilogue 等，规则见 3.3 节） | 用户在 I1 review 时决定 | 同上 |
 | I2 | 删除 EP kernel 里走不到的选项（`TL` 等）和 a16w4 路径，包括 bench 的 `adt=bf16` 覆盖 | Q4，Q11 | 同上 |
-| I3 | `_vendor/tensor_shim.py` 里的 3 个环境变量开关：查清影响后，冻结成常量或删除 | Phase 1 | ISA IDENTICAL |
-| I4 | device 共享库：`_vendor` 用到的部分并入 `kernels/_*.py`；kernel 文件之间不再互相 import；`_fp4x8_to_fp8x8` 只留一份；硬件常量集中定义 | Q12，Q14，Phase 2 | ISA IDENTICAL |
+| I3 | 精简 `_vendor`：没人读的环境变量、类、函数、参数直接删；剩下的迁到 `kernels/` 下按主题分的共享模块；删除 `_vendor/`（规则见 3.1 节） | 原 I3 + 原 I4 前半；用户 2026-11-16 | ISA IDENTICAL；API 测试；单卡 pytest |
+| I4 | kernel 文件之间不再互相 import（共享的 device helper 搬进 I3 建的模块）；`_fp4x8_to_fp8x8`、`_fp8x4_pack` / `_pack_activation` 只留一份；硬件常量集中定义 | Q12，Q14，Phase 2 | ISA IDENTICAL |
 | I5 | host 封装改用 `@flydsl_kernel`，替代 `_run_compiled` 和 `functools.cache`；每个 kernel 文件一个公开入口；同时删掉 I1 留下的无用 kernel 参数（标了 `# unused` 的那些）。到时按文件再拆成几个迭代 | Q13，Phase 3 | ISA IDENTICAL（kernarg 偏移变化要逐个解释）；pytest |
 | I6 | 新建 `workspace.py`，统一管理每张卡一份的缓冲区 | Q19 | ISA IDENTICAL；pytest |
 
@@ -83,7 +83,38 @@
 
 ## 3. 当前迭代
 
-### 3.1 I2：删除 EP kernel 的调试开关和 a16w4 路径（已完成，等 review）
+### 3.1 I3：精简 `_vendor`，迁到 `kernels/` 的共享模块（进行中）
+
+**背景**：`_vendor/` 是为了不依赖 aiter，从 aiter 原样复制来的 9 个文件（2268 行）。用 AST 从包内所有调用点（含 `experiments/`）做可达性分析，约 1170 行走不到：
+
+- `dpp_utils.py`、`layout_utils.py` 整个没用；`kernels_common.py` 只用到 `LOG2E`；
+- `tensor_shim.py` 只用到 `_run_compiled`、`_preload_compiled`、`_to_raw`；原 I3 的 3 个环境变量（`AITER_FLYDSL_KERNARG_PRELOAD`、`..._COUNT`、`AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE`）没有任何代码读，`TensorView` / `GTensor` 等类也没用；
+- `mxfp4_gemm_common.py` 60 个定义只用到 8 个；`buffer_ops.py` 的 `BufferResourceDescriptor`、`create_buffer_resource` 没用。
+
+**规则**：
+
+- 删：走不到的定义；用到的函数里没有调用方传的参数和分支（`buffer_load` 的 `is_scalar` / `soffset_bytes`，`buffer_store` 的 `offset_is_bytes`，`get_element_ptr` 的静态偏移，`gate_up_act` 的 `swiglu`，`sigmoid_batch` 的 `alpha`）。
+- 冻结：只在 gfx942 和 FlyDSL 0.3.2 上取一个值的兼容分支（V# flags 读 `FLYDSL_GPU_ARCH` 判断 RDNA；`RawPtrBufferLoadOp` 的 `aux` 是属性还是操作数）。
+- 函数名暂不改（按术语表改名是中期的事），只改模块位置和 import。
+
+**目标布局**（helper 和 kernel 在同一目录后，改 helper 会进 FlyDSL 缓存 key，不再拿到旧二进制）：
+
+| 模块 | 内容 | 来源 |
+|---|---|---|
+| `kernels/_mem.py` | IR 值转换 `_raw`；global / LDS 指针、GEP；buffer resource、`buffer_load` / `buffer_store`；i32 buffer view；`_udiv` / `_umod` | `buffer_ops`、`mxfp4_gemm_common`、`moe_utils`、`tensor_shim._to_raw`、`a8w4_ops._pointer` |
+| `kernels/_act.py` | gate / up 激活（silu、situv2） | `act`、`kernels_common.LOG2E` |
+| `kernels/_cvt.py` | 数值格式转换：`_pack_activation`（4 个 f32 打包成 fp8）；I4 去重的 fp4 解码等也放这里 | `a8w4_ops` |
+| `kernels/_launch.py` | host 端：`_run_compiled`、`_preload_compiled`（I5 换成 `@flydsl_kernel` 后删除） | `tensor_shim` |
+| `kernels/channel_exp.py` | W 的通道指数扫描 kernel 和 host 入口 `channel_exponents`（`prepare_weights` 用） | `a8w4_ops` |
+
+**任务**：
+
+- [x] 第 1 步：在 `_vendor` 里原地删掉走不到的代码和参数，冻结兼容分支。2268 → 553 行，删掉 `dpp_utils`、`layout_utils`、`kernels_common` 三个文件。ISA IDENTICAL。
+- [ ] 第 2 步：迁到上表的模块；kernel 文件的 import 只留用到的名字；`G1.global_typed_ptr` 这类经别的 kernel 模块转手的引用改为直接 import；`experiments/`、`megamoe.py`、`isa_snapshot.py`、`weights.py` 跟着改；删除 `_vendor/` 和 `pyproject.toml` 里的子包。
+- [ ] 文档：README（目录结构、缓存 key 规则、来源表）、`flydsl-gfx942-pitfalls` skill 里拿 `_vendor` 举的例子。
+- **验收**：ISA IDENTICAL；API 测试；单卡 pytest。
+
+### 3.2 I2：删除 EP kernel 的调试开关和 a16w4 路径（已完成，等 review）
 
 **范围**（a16w4 依据 Q11：以后要上线时作为独立的族加回来）：
 
@@ -115,7 +146,7 @@
 - `experiments/20261114_splitk_gemm1/ep_gemm_sk.py` 是独立的副本，`SKG.*` 调用照旧带 `adt`，不要跟着改。
 - `ep_small` 的 gemm1 中间结果本来就是 bf16（两种模式都是），`_bf16x2_rne` 仍在用，不属于 a16w4。
 
-### 3.2 I1b：删除 TP kernel 里调用方不用的模式取值（已完成）
+### 3.3 I1b：删除 TP kernel 里调用方不用的模式取值（已完成）
 
 **规则**：
 
@@ -148,7 +179,7 @@
 - 折叠掉的选项在 kernel 名字里的标签，直接写成字符串常量，并加注释说明“这些选项现在恒开”。
 - 只服务于被删路径的 buffer、copy atom 等，删掉后 ISA 不变（本来就会被 DCE）。
 
-### 3.3 I1：删除 TP kernel 里走不到的代码（已完成）
+### 3.4 I1：删除 TP kernel 里走不到的代码（已完成）
 
 host 端（`moe._run_tp2k`，G1/G2 唯一的调用方）只用到 gemm1 的 `epilog="q8s"`（`moe.py:170`），以及 gemm2 的 `lds` 和 `epilog="direct64"`（`moe.py:178`）；megamoe 只用到 `G1.situ_args`。
 
@@ -176,7 +207,7 @@ host 端（`moe._run_tp2k`，G1/G2 唯一的调用方）只用到 gemm1 的 `epi
 - `experiments/` 里的脚本也会调用 kernel 的 host 函数，ISA 快照和 pytest 覆盖不到。删 host 参数后要 grep 这些脚本（`20261114_tp_prep/run.py` 原来给 gemm1 传了 `topk=`，已改）。
 - README 9.5 节原来列着这些实验选项，已经同步改了。
 
-当时列出的 I1b 候选（`fast_dec=0/1`、`flush_tiny`、`A_GROUP=0`、`ROW_VGPR=False`、`dyn_rows=False`、gemm1 的 `epilog="bf16"` 和 `pipeline`），用户决定删，已在 I1b 完成（见 3.2 节）。`dyn_m=False` 和 `xcd_swizzle` 按规则保留。
+当时列出的 I1b 候选（`fast_dec=0/1`、`flush_tiny`、`A_GROUP=0`、`ROW_VGPR=False`、`dyn_rows=False`、gemm1 的 `epilog="bf16"` 和 `pipeline`），用户决定删，已在 I1b 完成（见 3.3 节）。`dyn_m=False` 和 `xcd_swizzle` 按规则保留。
 
 ## 4. 迭代记录
 

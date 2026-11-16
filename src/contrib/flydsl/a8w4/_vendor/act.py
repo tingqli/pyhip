@@ -16,20 +16,21 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, rocdl
 from flydsl.expr.typing import T
 
-from .kernels_common import LOG2E
 from .tensor_shim import _to_raw as _raw
 
+LOG2E = 1.4426950408889634
 
-def sigmoid_batch(xs, *, alpha=1.0):
+
+def sigmoid_batch(xs):
     """Emit all exponentials before their reciprocals to preserve batch scheduling."""
     e = [
-        fx.Float32(rocdl.exp2(T.f32, _raw(x * fx.Float32(-alpha * LOG2E)))) for x in xs
+        fx.Float32(rocdl.exp2(T.f32, _raw(x * fx.Float32(-LOG2E)))) for x in xs
     ]
     return [fx.Float32(rocdl.rcp(T.f32, _raw(fx.Float32(1.0) + ei))) for ei in e]
 
 
-def sigmoid_f32(g, *, alpha=1.0):
-    return sigmoid_batch([g], alpha=alpha)[0]
+def sigmoid_f32(g):
+    return sigmoid_batch([g])[0]
 
 
 def clamp_gate_up(g, u, neg_limit):
@@ -40,16 +41,6 @@ def clamp_gate_up(g, u, neg_limit):
 def silu_mul_batch(gs, us):
     sig = sigmoid_batch(gs)
     return [gs[i] * sig[i] * us[i] for i in range(len(gs))]
-
-
-def swiglu_mul_batch(gs, us, neg_clamp_limit):
-    out = []
-    for i in range(len(gs)):
-        gate, up = clamp_gate_up(gs[i], us[i], neg_clamp_limit)
-        out.append(
-            gate * sigmoid_f32(fx.Float32(1.702) * gate) * (up + fx.Float32(1.0))
-        )
-    return out
 
 
 def tanh_batch(xs):
@@ -72,15 +63,9 @@ def tanh_f32(x):
     return tanh_batch([x])[0]
 
 
-def tanh_via_sigmoid_f32(x):
-    """Tanh identity used by split-K activation, preserving its rounding order."""
-    two = fx.Float32(2.0)
-    return two * sigmoid_f32(two * x) - fx.Float32(1.0)
-
-
-def situ_mul(g, u, beta, beta_rcp, lbeta, lbeta_rcp, *, tanh=tanh_f32):
-    gate = beta * tanh(g * beta_rcp) * sigmoid_f32(g)
-    up = lbeta * tanh(u * lbeta_rcp)
+def situ_mul(g, u, beta, beta_rcp, lbeta, lbeta_rcp):
+    gate = beta * tanh_f32(g * beta_rcp) * sigmoid_f32(g)
+    up = lbeta * tanh_f32(u * lbeta_rcp)
     return gate * up
 
 
@@ -128,11 +113,9 @@ def situ_params(beta, beta_rcp, linear_beta, linear_beta_rcp, swiglu_limit):
 def gate_up_act(act, gs, us, situ=None):
     """Fused gate+up epilogue activation: ``act(gate) * up``.
 
-    ``act`` is a compile-time string ("silu", "swiglu", or "situv2");
-    ``situ`` carries runtime activation parameters for the latter two modes.
+    ``act`` is a compile-time string, "silu" or "situv2"; ``situ`` carries the
+    runtime situv2 parameters.
     """
     if const_expr(act == "situv2"):
         return situ_mul_batch(gs, us, *situ)
-    if const_expr(act == "swiglu"):
-        return swiglu_mul_batch(gs, us, situ.neg_clamp_limit)
     return silu_mul_batch(gs, us)
