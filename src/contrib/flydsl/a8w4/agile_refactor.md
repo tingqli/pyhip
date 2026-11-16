@@ -13,9 +13,12 @@
 
 ### 0.1 当前状态（每次停下来前更新）
 
-- **迭代**：I1（删除 TP kernel 里走不到的代码）进行中。
+- **迭代**：I1（删除 TP kernel 里走不到的代码）已完成，等用户 review。待用户决定：先做 I1b（见第 3 节末尾），还是直接进入 I2。
 - **分支**：`/sgl-workspace/pyhip` 的 `refactor/a8w4`。
-- **已有提交**（迭代 0，安全网）：`64ce77c`、`d17f502`（ISA 基线在这个提交上生成）、`4e256d9`。设计文档相关的提交：`1383e41`、`0c50a56`、`ab05750`。
+- **已有提交**：
+  - 迭代 0，安全网：`64ce77c`、`d17f502`（ISA 基线在这个提交上生成）、`4e256d9`。
+  - 设计文档：`1383e41`、`0c50a56`、`ab05750`、`6e2c2ac`（本文件）。
+  - I1：`0b0e3c9`、`725209f`、`51817b1`、`f9d75f3`。
 - **用户的文件**：未跟踪的 `refactory2.md` 属于用户，不要改，也不要提交。
 
 ### 0.2 工作方式
@@ -47,7 +50,7 @@
 | I2 | 删除 EP kernel 里走不到的选项（`TL` 等）和 a16w4 路径，包括 bench 的 `adt=bf16` 覆盖 | Q4，Q11 | 同上 |
 | I3 | `_vendor/tensor_shim.py` 里的 3 个环境变量开关：查清影响后，冻结成常量或删除 | Phase 1 | ISA IDENTICAL |
 | I4 | device 共享库：`_vendor` 用到的部分并入 `kernels/_*.py`；kernel 文件之间不再互相 import；`_fp4x8_to_fp8x8` 只留一份；硬件常量集中定义 | Q12，Q14，Phase 2 | ISA IDENTICAL |
-| I5 | host 封装改用 `@flydsl_kernel`，替代 `_run_compiled` 和 `functools.cache`；每个 kernel 文件一个公开入口。到时按文件再拆成几个迭代 | Q13，Phase 3 | ISA IDENTICAL（元数据变化要逐个解释）；pytest |
+| I5 | host 封装改用 `@flydsl_kernel`，替代 `_run_compiled` 和 `functools.cache`；每个 kernel 文件一个公开入口；同时删掉 I1 留下的无用 kernel 参数（标了 `# unused` 的那些）。到时按文件再拆成几个迭代 | Q13，Phase 3 | ISA IDENTICAL（kernarg 偏移变化要逐个解释）；pytest |
 | I6 | 新建 `workspace.py`，统一管理每张卡一份的缓冲区 | Q19 | ISA IDENTICAL；pytest |
 
 ### 1.2 中期：方向清楚，细节做到时再定
@@ -75,30 +78,48 @@
 - bench 的 variant 覆盖只作用于 ep3k：`g1.*` 和 `g2.*` 会作为 `ep_gemm1` / `ep_gemm2` 的参数传入，此外还有 `bm`、`rowv`、`sched`、`sst`、`adt`（见 `bench/core.py` 约 160 到 260 行）。TP kernel 的选项只能经 `moe.py`、`tune`、megamoe 走到。
 - 删完后，剩下的 kernel 的 ISA 必须完全不变。不在快照矩阵里的配置，本来就走不到。
 
-## 3. 当前迭代：I1，删除 TP kernel 里走不到的代码
+## 3. 当前迭代：I1，删除 TP kernel 里走不到的代码（已完成）
 
-host 端只用到 `epilog="q8s"`、`"bf16"`（`moe.py:170`）和 `epilog="direct64"`（`moe.py:178`，属于 `tp_gemm2`）；megamoe 只用到 `G1.situ_args`。
+host 端（`moe._run_tp2k`，G1/G2 唯一的调用方）只用到 gemm1 的 `epilog="q8s"`（`moe.py:170`），以及 gemm2 的 `lds` 和 `epilog="direct64"`（`moe.py:178`）；megamoe 只用到 `G1.situ_args`。
 
-- [ ] `kernels/tp_gemm1.py`：
+- [x] `kernels/tp_gemm1.py`（`0b0e3c9`）：
   - 删除 `epilog` 的 `"q8"`、`"q8push"`、`"q8pushs"`，以及只服务于它们的参数和代码（`tbl`、`rank`、`epoch`、`npes`、`SCALE_RUN` 等）；
   - 删除 `w_layout="tile"`；
   - 删除 `PUSH_VAR`。
-- [ ] `kernels/tp_gemm2.py`：
-  - 删除 `TILE_ORDER`、`PROBE`、`AR`、`AR_SEP`；
+- [x] `kernels/tp_gemm2.py`（`725209f`，1741 行减到 1224 行）：
+  - 删除 `TILE_ORDER`、`PROBE`、`CHUNK_N`、`AR`、`AR_SEP`、`STAGE_ROWS`。AR 分支 import 了一个不存在的 `gemm2_ar_fused`，本来就跑不了；
   - 把冻结常量 `EPI_DRAIN`、`BF16_FAST`、`WPERM`、`PERSIST`、`AR_HOOK` 折叠掉；
-  - 删除走不到的 `epilog` 分支。
-- [ ] `kernels/tp_fmoe.py`：把冻结常量 `ABL`、`LDS_PAD`、`DELAY`、`G1_SPREAD`、`PROBE` 折叠掉。
-- [ ] `kernels/tp_fmoe_q.py`：把 `DBG` 折叠掉。
-- **验收**：
-  - 每个文件一个提交，每次都跑 `isa-snapshot` 加 `isa-diff`，要求 IDENTICAL；
-  - 每次都跑 `test_a8w4_api.py`；
-  - 迭代结束时跑一次单卡 pytest，基线是 94 passed、1 skipped。
+  - 删除走不到的 `epilog` 分支：现在 NTILE=0 只用 `lds`，NTILE>0 只用 `direct64`。
+- [x] `kernels/tp_fmoe.py`（`51817b1`）：把冻结常量 `ABL`、`LDS_PAD`、`DELAY`、`G1_SPREAD`、`PROBE` 折叠掉，`NO_ATOMIC` 也一起删了。`tp_fmoe_q` 的 kernel 名原来读 `F.NO_ATOMIC`，在同一个提交里改掉了。
+- [x] `kernels/tp_fmoe_q.py`（`f9d75f3`）：把 `DBG` 折叠掉，连同 trace 辅助函数和 `TRACE_N`。
+- **验收结果**：
+  - 每个提交都跑了 `isa-snapshot` 和 `isa-diff`，结果都是 IDENTICAL（558 次编译，177 份不同的 ISA）；
+  - 每个提交都跑了 `test_a8w4_api.py`：23 passed；
+  - 单卡 pytest：94 passed、1 skipped，与基线一致。
+
+**这一轮的经验**（以后的迭代也适用）：
+
+- 删 kernel 参数会改变 kernarg 偏移，从而改变 ISA。所以没用的参数先保留，标成 `# unused`，留到 I5 一起删。
+- 删除没用的 IR 运算（比如 `+0`、算了不用的值）不影响 ISA，会被 DCE 掉。
+- 恒为真的条件不一定能删：`tp_gemm2` 里的 `bx >= 0` 删掉后指令调度变了，ISA 不同，所以保留并加了注释。
+- 跨文件引用要查全：`tp_fmoe_q` 通过 `F.` 引用 `tp_fmoe` 的常量。删一个模块级名字之前，先 grep 所有 `模块别名.名字` 的用法。
+- `experiments/` 里的脚本也会调用 kernel 的 host 函数，ISA 快照和 pytest 覆盖不到。删 host 参数后要 grep 这些脚本（`20261114_tp_prep/run.py` 原来给 gemm1 传了 `topk=`，已改）。
+- README 9.5 节原来列着这些实验选项，已经同步改了。
+
+**I1b 候选，等用户决定**。下面这些是“取值”层面走不到的分支：调用方从来不传这些值，但它们属于正常的调优参数，不算实验代码。
+
+- 两个 gemm 的 `fast_dec=0/1`（调用方只用 2）、`flush_tiny=False`；
+- `tp_gemm2`：`A_GROUP=0`；NTILE 时的 `ROW_VGPR=False`；`dyn_rows=False`；
+- `tp_gemm1`：`epilog="bf16"`（已确认调用方只传 `"q8s"`）、`pipeline`、`dyn_m=False`、`xcd_swizzle=0`。
+
+删掉能让代码再短不少，但也会失去以后调优时的选项。
 
 ## 4. 迭代记录
 
 | 日期 | 迭代 | 结果 | 提交 |
 |---|---|---|---|
 | 2026-11-15 | 0 安全网 | `prof isa-snapshot` / `isa-diff` / `isa-cover`；API 契约测试和 CSV 往返测试；ISA 和 pytest 基线 | `64ce77c` `d17f502` `4e256d9` |
+| 2026-11-16 | I1 删除 TP kernel 的死代码 | 4 个文件净减约 830 行；ISA IDENTICAL；API 测试 23 passed；单卡 pytest 94 passed、1 skipped | `0b0e3c9` `725209f` `51817b1` `f9d75f3` |
 
 ## 5. 草图摘要：第 5–7 轮讨论（远期目标的素材，不是承诺）
 

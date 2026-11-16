@@ -806,18 +806,13 @@ python a8w4/tests/test_a8w4_mori_tp8.py --allreduce aiter --act silu situv2 \
 
 ### 9.5 kernel 文件里保留的实验选项
 
-为了与实验版逐位一致，kernel 文件保留了原来的全部编译选项，`a8w4_moe` 只用到其中一部分：
+TP kernel（`tp_gemm1`、`tp_gemm2`、`tp_fmoe`、`tp_fmoe_q`）里走不到的实验选项和冻结常量已经删掉（见 [agile_refactor.md](agile_refactor.md) 的 I1），剩下的 ISA 与删之前逐位相同。还留着的有：
 
-- **gemm1**：`q8push` / `q8pushs` 等 TP 通讯融合用的 epilogue，`w_layout="tile"`，`pipeline` 开关。
-- **gemm2**：`AR` / `AR_SEP` 的 all-reduce 融合、`TILE_ORDER`、`PROBE` 等。其中 AR 路径依赖实验目录里的 `gemm2_ar_fused`，本包没有复制。
-- **冻结成默认值的环境变量开关**：在实验版里可以通过环境变量调，在本包里固定为默认值：
-  - tp_gemm1：`PUSH_VAR`；
-  - tp_gemm2：`EPI_DRAIN`、`BF16_FAST`、`WPERM`、`PERSIST`、`AR_HOOK`；
-  - tp_fmoe：`ABL`、`LDS_PAD`、`DELAY`、`G1_SPREAD`、`PROBE`；
-  - tp_fmoe_q：`DBG`；
-  - ep_gemm：`TL`（per-tile 时间线）。
-  
-  要做这类实验，改源文件里的常量即可：kernel 代码按名字读到的模块级常量按值进入缓存 key，FlyDSL 会重新编译（缓存 key 的完整规则见 10 节第 1 条）。
+- **调优参数中调用方不用的取值**：比如 `fast_dec=0/1`、gemm1 的 `pipeline` 开关和 `epilog="bf16"`。它们是正常的编译选项，调优时可以用。
+- **没用的 kernel 参数**：`tp_gemm1` 的 `tbl`、`rank`、`epoch`、`tiles`，`tp_gemm2` 的 `dbg`、`tbl`、`rank`、`epoch`，`tp_fmoe` 的 `dbg`。代码里标了 `# unused`，host 端传 0。删掉会改变 kernarg 偏移从而改变 ISA，所以留到 host 封装重写时一起删。
+- **EP kernel 的冻结常量**：`ep_gemm` 的 `TL`（per-tile 时间线）。
+
+要用 `TL` 做实验，改源文件里的常量即可：kernel 代码按名字读到的模块级常量按值进入缓存 key，FlyDSL 会重新编译（缓存 key 的完整规则见 10 节第 1 条）。
 
 ### 9.6 集成到推理框架
 
