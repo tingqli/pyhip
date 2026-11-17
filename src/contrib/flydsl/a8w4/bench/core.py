@@ -1,20 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Shared pieces of the bench tools: cases, timing protocols, variant specs, routing
-samples, run metadata, result files and the noise / verdict rules.
-
-Timing protocols (experiments/log_20261115.md 3.3). Only ``coldrot`` with >= 8 weight
-copies matches a model (each layer reads other weights, so W is never left in the
-256 MB MALL between two calls of the same layer); the others exist to measure the bias:
-
-  coldrot  512 MB read flush + GPU sleep; each call reads the next of N weight copies
-  rotate   N weight copies back to back, no flush (depends on the previous call's MALL)
-  cold     flush + sleep, the same weights every call: the MALL keeps them, so configs
-           that read W through the cache (bcm 0 / 1) look 5-13% faster than they are
-  bigread  2 GB read flush + sleep, the same weights (the same bias as cold)
-  wflush   512 MB write + read flush + sleep, the same weights (dirty lines: cached-W
-           configs look 9-48% slower)
-  warm     no flush, the same weights
+"""Shared pieces of the bench tools: cases, variant specs, routing samples, run metadata,
+result files. Timing protocols, ABBA rounds, the noise band and verdicts are
+``pyhip.kit.timing`` (re-exported here: ``PROTOCOLS``, ``Timer``, ``interleaved``, ...).
 """
 
 import dataclasses
@@ -26,11 +14,20 @@ import logging
 import os
 import shlex
 import socket
-import statistics
 import subprocess
 import sys
 
 import torch
+
+from pyhip.kit.timing import (  # noqa: F401 - re-exported for the bench tools
+    MIN_COPIES,
+    MIN_NOISE,
+    PROTOCOLS,
+    Timer,
+    interleaved,
+    noise_band,
+    verdict,
+)
 
 from .. import ref as R
 from ..kernels import ep_gemm as EG
@@ -38,9 +35,6 @@ from ..moe import MOE, shape_vocab
 from ..tune import CASES, COS_TOL  # noqa: F401 - COS_TOL: re-exported for the tools
 
 PKG_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PROTOCOLS = ("coldrot", "rotate", "cold", "bigread", "wflush", "warm")
-MIN_COPIES = 8  # 2 copies still favor cached W at 16 tokens (log_20261115 3.3)
-MIN_NOISE = 0.3  # % : below this a difference is never called
 DIFF_TOL = 1e-4  # cos diff vs the base above this: flagged (bf16 atomics alone: ~1e-5)
 
 
@@ -297,99 +291,6 @@ def check_protocols(resolved, protocols, wcopies, allow_biased):
     if not allow_biased:
         raise SystemExit(msg + ". Add coldrot, or pass --allow-biased to measure the bias.")
     print("WARNING: " + msg, flush=True)
-
-
-# =============================================================================
-# timing
-# =============================================================================
-
-
-class Timer:
-    """Call times of ``fn(W)`` under a protocol; ``Ws``: weight copies, Ws[0] the original."""
-
-    def __init__(self, Ws):
-        self.Ws, self._i, self._buf = Ws, 0, {}
-
-    def _next(self):
-        self._i = (self._i + 1) % len(self.Ws)
-        return self.Ws[self._i]
-
-    def _pre(self, protocol):
-        if protocol in ("coldrot", "cold"):
-            R.flush_cache()
-        elif protocol == "wflush":
-            if "w" not in self._buf:
-                self._buf["w"] = torch.empty(512 << 20, dtype=torch.uint8, device="cuda")
-            self._buf["w"].zero_()
-            R.flush_cache()
-        elif protocol == "bigread":
-            if "r" not in self._buf:
-                self._buf["r"] = torch.ones(512 << 20, dtype=torch.int32, device="cuda")
-            self._buf["r"].amax()
-        else:
-            assert protocol == "warm", protocol
-
-    def times(self, fn, protocol, iters, warmup=3):
-        """``iters`` GPU times (us) of ``fn(W)``; host launch overhead excluded (a GPU sleep
-        lets the host enqueue fn before the start event)."""
-        if protocol == "rotate":
-            return self._rotate(fn, iters)
-        for _ in range(warmup):
-            fn(self.Ws[0])
-        torch.cuda.synchronize()
-        out = []
-        for _ in range(iters):
-            W = self._next() if protocol == "coldrot" else self.Ws[0]
-            self._pre(protocol)
-            torch.cuda._sleep(2_000_000)  # ~1 ms
-            e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-            e0.record()
-            fn(W)
-            e1.record()
-            torch.cuda.synchronize()
-            out.append(e0.elapsed_time(e1) * 1e3)
-        return out
-
-    def _rotate(self, fn, iters):
-        out, n = [], len(self.Ws)
-        for p in range(-(-iters // n) + 1):  # pass 0: warm-up
-            ev = [torch.cuda.Event(enable_timing=True) for _ in range(n + 1)]
-            torch.cuda._sleep(4_000_000)
-            ev[0].record()
-            for i, W in enumerate(self.Ws):
-                fn(W)
-                ev[i + 1].record()
-            torch.cuda.synchronize()
-            if p:
-                out += [ev[i].elapsed_time(ev[i + 1]) * 1e3 for i in range(n)]
-        return out
-
-
-def interleaved(fns, protocols, timer, rounds, iters):
-    """{(protocol, label): [median of each round]}: each round times every (protocol,
-    variant) once; the variant order reverses every other round (ABBA), so clock and
-    power drift hit all variants alike."""
-    res = {(p, n): [] for p in protocols for n in fns}
-    for rnd in range(rounds):
-        names = list(fns) if rnd % 2 == 0 else list(fns)[::-1]
-        for p in protocols:
-            for n in names:
-                res[p, n].append(statistics.median(timer.times(fns[n], p, iters)))
-    return res
-
-
-def noise_band(base, dup=None):
-    """% band within which a difference to ``base`` (round medians) is noise: the dup's
-    |delta|, half the base's round spread, at least MIN_NOISE."""
-    b = statistics.median(base)
-    band = (max(base) - min(base)) / b * 50 if len(base) > 1 else 0.0
-    if dup:
-        band = max(band, abs(statistics.median(dup) / b - 1) * 100)
-    return max(band, MIN_NOISE)
-
-
-def verdict(delta, noise):
-    return "~" if abs(delta) <= noise else ("faster" if delta < 0 else "slower")
 
 
 # =============================================================================

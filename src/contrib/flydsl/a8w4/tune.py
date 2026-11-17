@@ -21,7 +21,7 @@ Run from the directory that contains ``a8w4/`` (or put it on PYTHONPATH);
 ``python a8w4/tune.py ...`` works too. Timing: cold caches (L2 flushed, and every
 timed call reads the next of ``--wcopies`` weight copies: the flush does not evict
 weights that every call re-reads from the MALL), host launch overhead excluded,
-median of ``--iters`` (see ``ref.time_cold``, ``ref.weight_copies``).
+median of ``--iters`` (``pyhip.kit.timing``: ``time_cold``, ``copies``).
 SiTUv2 runs with ``ref.SITU`` (its betas / clamp are launch arguments: no effect on
 the time). See configs/README.md for the commands that produced the shipped table.
 """

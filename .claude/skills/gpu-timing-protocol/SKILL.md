@@ -5,9 +5,9 @@ description: How to time GPU kernels on MI300X-class AMD GPUs so that A/B result
 
 # Timing GPU kernels so the result holds in the model
 
-Reference implementation: pyhip `src/contrib/flydsl/a8w4/bench/core.py` (`Timer`,
-`interleaved`, `noise_band`, `check_protocols`) and `a8w4/ref.py` (`flush_cache`,
-`weight_copies`, `time_cold`). Evidence: `a8w4/experiments/log_20261115.md` §3.3.
+Reference implementation: pyhip `src/kit/timing.py` (`pyhip.kit.timing`: `flush_cache`,
+`copies`, `time_cold`, `Timer`, `interleaved`, `noise_band`, `verdict`), used by the a8w4
+tuner and `a8w4/bench` (`check_protocols`). Evidence: `a8w4/experiments/log_20261115.md` §3.3.
 
 ## 1. Cold caches: flush L2 AND do not let the MALL keep the weights
 

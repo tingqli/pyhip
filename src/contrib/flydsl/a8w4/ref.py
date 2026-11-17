@@ -14,7 +14,9 @@ The problem side of the ops ``moe`` and ``moe_dyn`` (``pyhip.kit``, registered i
 ``_ops.ops``; the kernels are the implementations in ``moe.py``): ``<op>_ref`` the
 interface and the answer, ``<op>_test`` the inputs of one test case (its parameters:
 the vocabulary of the kernels' limits), ``<op>_check`` the tolerance, ``<op>_dims`` the
-vocabulary of a call.
+the vocabulary of a call), ``<op>_check`` the tolerance, ``<op>_dims`` the
+vocabulary of a call. Cold-cache timing (``flush_cache``, ``weight_copies``,
+``time_cold``, ``WCOPIES``) is ``pyhip.kit.timing``, re-exported here.
 """
 
 import functools
@@ -22,6 +24,9 @@ import functools
 import torch
 
 from pyhip.kit import param
+from pyhip.kit.timing import NCOPIES as WCOPIES  # noqa: F401 - re-exported for the tools
+from pyhip.kit.timing import copies as weight_copies  # noqa: F401
+from pyhip.kit.timing import flush_cache, time_cold  # noqa: F401
 
 from ._ops import op_register
 from .weights import prepare_weights, shuffle_mxfp4, weight_shape
@@ -356,53 +361,3 @@ def moe_dyn_dims(x, W, topk_weights, topk_ids, m_valid, *, x_scale=None, expert_
     return dict(model_dim=H, inter_dim=I, experts=E, experts_global=num_experts or E,
                 topk=topk, expert_offset=expert_offset, act=act, capacity=M, num_tokens=est,
                 fp8=x_scale is not None)
-
-
-# =============================================================================
-# cold-cache timing
-# =============================================================================
-
-_FLUSH = {}
-WCOPIES = 8  # weight copies timed calls cycle through (8 x the EP8 / TP8 weights: 3+ GB)
-
-
-def flush_cache():
-    """Read 512 MB: evicts L2 with clean lines (a read-modify-write flush leaves dirty
-    lines whose write-back then steals HBM bandwidth). It does not evict the lines that
-    every timed call re-reads from the 256 MB MALL (a 2 GB read does not either): the
-    same weights read with cached loads stay there, so time with ``weight_copies``."""
-    if "buf" not in _FLUSH:
-        _FLUSH["buf"] = torch.ones(128 << 20, dtype=torch.int32, device="cuda")
-    _FLUSH["buf"].amax()
-
-
-def weight_copies(W, n=WCOPIES):
-    """``n`` copies of prepared weights (``W`` first). A timed closure that takes the
-    next copy per call reads weights that no recent call touched, as consecutive layers
-    of a model do (experiments/log_20261115.md: with one copy, cached W loads looked
-    5-13% faster than they are)."""
-    return [W] + [{k: v.clone() if torch.is_tensor(v) else v for k, v in W.items()}
-                  for _ in range(n - 1)]
-
-
-def time_cold(fn, iters=20, warmup=3, flush=True):
-    """Median GPU time (us) of ``fn`` with cold caches. A GPU-side sleep after the
-    flush lets the host enqueue all of fn's launches before the start event, so
-    host overhead is excluded (as in a CUDA graph replay)."""
-    for _ in range(warmup):
-        fn()
-    torch.cuda.synchronize()
-    ev = [(torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
-          for _ in range(iters)]
-    ts = []
-    for e0, e1 in ev:
-        if flush:
-            flush_cache()
-        torch.cuda._sleep(2_000_000)  # ~1 ms of GPU spin
-        e0.record()
-        fn()
-        e1.record()
-        torch.cuda.synchronize()
-        ts.append(e0.elapsed_time(e1) * 1e3)
-    ts.sort()
-    return ts[len(ts) // 2]

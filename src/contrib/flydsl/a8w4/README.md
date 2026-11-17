@@ -158,7 +158,7 @@ a8w4/
   tables.py                    调优表报告：compare（`kit.table.compare`，按 shape / act / tokens 列出两张表逐点的 winner）、readme（重新生成 / 检查 README 7.2–7.4）、stats（situv2 与 silu）
   ref.py                       测试与调优用：算子的问题定义（moe_ref 参考实现、moe_test 测试输入、moe_check 判定、moe_dims 读词汇并检查输入；moe_dyn_* 同理）、随机权重和路由、模拟 fp8 量化的 fp32 参考、冷 cache 计时
   megamoe.py                   MegaMoeEpA8W4：EP8 整层（dispatch + 专家 + combine）的单 persistent kernel 封装，用于大 batch
-  bench/                       实验工具 python -m a8w4.bench：ab（A/B 计时）、breakdown（每个 kernel 的耗时）、check（正确性）、dist（megamoe 8 卡变体）；core.py 是计时协议和变体写法，dist.py 也是 8 卡测试共用的 helper
+  bench/                       实验工具 python -m a8w4.bench：ab（A/B 计时）、breakdown（每个 kernel 的耗时）、check（正确性）、dist（megamoe 8 卡变体）；core.py 是用例、变体写法和记录（计时协议、ABBA、噪声带在 `pyhip.kit.timing`），dist.py 也是 8 卡测试共用的 helper
   prof.py                      python -m a8w4.prof：counters（rocprofv3 计数器汇总）、isa（VGPR / spill / LDS）
   exp.py                       python a8w4/exp.py：实验登记 experiments/index.csv 的 grep / ls / add / new / lint / clean
   experiments/                 历次实验：index.csv（一行一个实验）、log_YYYYMMDD.md、各实验目录；_launch.py 是旧实验脚本用的 _run_compiled
@@ -461,7 +461,7 @@ ARB 是每个 K-tile 每行 A 的字节数，默认 256。`t16` 的 gemm2 用窄
   - 同一轮内各候选交错执行，时钟和功耗的漂移会均匀落到每个候选上。
   
   每个候选最终取各轮的中位数。每测完一个 token 数就写一次文件（同 key 的行覆盖）。
-- **计时**（`ref.time_cold`）：
+- **计时**（`pyhip.kit.timing.time_cold`，`ref.time_cold` 是同一个函数）：
   - 每次迭代前读一遍 512 MB，用干净行挤掉 L2。用读而不是读改写，是为了不留下 dirty 行，否则写回会抢 HBM 带宽；
   - 刷 cache 挤不掉 MALL 里每次调用都读的权重（读 2 GB 也一样），所以每次调用换一份权重：`ref.weight_copies` 复制 8 份（`--wcopies`，EP8 / TP8 约 3.3 GB），轮流使用，和模型里相邻各层读不同的权重一样。只用一份权重时，W 走 cache 的配置会显得快 5–13%（10 节第 15 条）；
   - 再让 GPU 空转约 1 ms（`torch.cuda._sleep`），这段时间里 host 已经把本次调用的所有 launch 入队，因此 host 开销不计入，和 graph 回放的情况一致；
