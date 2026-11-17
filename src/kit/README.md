@@ -454,7 +454,7 @@ python -m pyhip.kit <命令> <模块>:<op> [参数...] [选项]
 
 `<模块>:<op>`：一个可导入的模块，里面正好有一个 `Registry`，加上 op 名，例如 `a8w4:moe`、`axpy_ops:axpy`。
 
-**调优 case**：`<op>_test` 的网格去掉分桶轴后的每个点，id 由其余各轴的 id 用 `-` 连接（例如 `tp8-silu`）。`--set name=value` 改这个 case 的词汇值（换形状、换路由），值按 `<op>_test` 默认值的类型转换。
+**调优 case**：`<op>_test` 的网格去掉分桶轴后的每个点，id 由其余各轴的 id 用 `-` 连接（例如 `tp8-silu`）。`--set name=value` 改这个 case 的词汇值（换形状、换路由），详见下面的“调优时的词汇从哪来”。
 
 | 命令 | 用法 | 作用 |
 |---|---|---|
@@ -469,6 +469,43 @@ python -m pyhip.kit <命令> <模块>:<op> [参数...] [选项]
 | `ab`、`check` | 见第 11 节 | |
 
 通用选项：`-t/--points`（分桶值）、`--set NAME=VALUE ...`、`--table`、`--out`、`--iters`（每次计时的调用数，默认 20）、`--rounds`（默认 3）、`--copies`（轮换副本数，默认 8）、`--gpus`、`--per-job`、`--force`。
+
+**调优时的词汇从哪来**。一次调优的全部词汇值有三个来源，后面的覆盖前面的：
+
+1. **tune case**：`<op>_test` 的 `@param` 网格去掉分桶轴后的一个点；不在网格里的词汇取 `<op>_test` 的默认值。`cases` 命令列出全部 case 和它们的值（分桶维为 None）。
+2. **`--set name=value ...`**：覆盖 case 里任意一个词汇。名字必须是词汇；旋钮不能 set，旋钮由网格枚举。值按 `<op>_test` 默认值的类型转换；没有默认值时依次尝试 int、float，否则当作 str。
+3. **分桶维**：取 `-t` 的每个值，不写 `-t` 时用 `Registry(points=)`；即使对分桶维用了 `--set` 也会被覆盖。
+
+```
+$ python -m pyhip.kit cases axpy_ops:axpy
+bf16 {'dtype': 'bf16', 'seed': 0}
+fp32 {'dtype': 'fp32', 'seed': 0}
+$ python -m pyhip.kit tune axpy_ops:axpy bf16 --set dtype=fp32 -t 2048 --out set.csv
+[23:01:38] axpy bf16 {'dtype': 'fp32', 'seed': 0}: 3 candidates, 8 copies of ['x', 'y']
+[23:01:39] n   2048: torch 6.1 | tiled b16384 6.2 | tiled b1024 8.4
+$ cat set.csv
+dtype,n,config,us,err
+fp32,2048,torch,6.1,0.0e+00
+...
+$ python -m pyhip.kit tune axpy_ops:axpy bf16 --set block=4
+--set 'block=4': expected name=value, name in ['n', 'dtype', 'seed']
+```
+
+`candidates`、`show`、`verify`、`tune-all`（作用于每个 case）和 `ab`、`check` 也接受同样的 `--set`。a8w4 的写法相同，例如 `python -m a8w4.tune tune tp8-silu --set routing=hot -t 1 2 4 --out /tmp/p.csv`。在 Python 里，把 case dict 直接传给 `tune`：
+
+```python
+from pyhip.kit import tune as kt
+
+c = kt.case(op, "bf16", ["dtype=fp32"])        # {'dtype': 'fp32', 'seed': 0, 'n': None}
+kt.tune(op, c, [2048], "out.csv")              # 也可以手写 c，但要包含全部词汇名
+```
+
+注意：
+
+- **只有部分词汇是 key**：表的 key 列是词汇去掉 `unkeyed` 和分桶维后剩下的。`--set` 一个 unkeyed 的名字（例如 a8w4 的 `expert_offset`）只改变输入，不改变 key，所以它必须确实不影响哪个配置最快。
+- **`seed` 不能用 `--set` 改**：调优器会把它改写成 101 × 点 + 轮次。
+- **调出来的行要能被分派选中**：调用时的 key 来自 `<op>_dims` 的返回值，加上调用时传的提示参数；`<op>_dims` 不返回的名字按 `<op>_test` 的默认值匹配（第 6 节）。所以用 `--set routing=hot` 调出来的行，只有 `ops.moe(..., routing="hot")` 这样的调用才会选中。
+- **长期使用的值放进网格**：`--set` 适合临时、一次性的调优。一个 shape 要长期保留时，把它加进 `<op>_test` 的 `@param` 网格：它会成为新的 tune case，`tune-all` 会自动调它，生成的测试也会覆盖它。
 
 **`tune` 的过程**（每个点）：
 
