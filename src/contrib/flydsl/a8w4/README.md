@@ -147,11 +147,11 @@ out = a8w4_moe_dyn(x, W, topk_weights, topk_ids, m_valid, x_scale=None,
 ```
 a8w4/
   __init__.py                  公开接口
-  moe.py                       a8w4_moe / a8w4_moe_dyn、5 类 runner、能力过滤 supported()、调优表查找（lookup_config / dyn_config）
+  moe.py                       a8w4_moe / a8w4_moe_dyn；各族的实现函数 moe_<kind>（@param 网格、@requires 结构限制、@meta），由 pyhip.kit 收集成算子 MOE / MOE_DYN（9.3 节）；supported()、调优表查找（lookup_config / dyn_config）
   weights.py                   prepare_weights（fd2 权重）、shuffle_mxfp4、weight_shape
   tune.py                      调优 CLI：tune / merge / show / verify / candidates / tune-all / compare / readme / stats
   tables.py                    调优表报告：compare（两张表逐点的 winner）、readme（重新生成 / 检查 README 7.2–7.4）、stats（situv2 与 silu）
-  ref.py                       测试与调优用：随机权重和路由、模拟 fp8 量化的 fp32 参考、冷 cache 计时
+  ref.py                       测试与调优用：算子的问题定义（moe_ref 参考实现、moe_test 测试输入、moe_check 判定、moe_dims；moe_dyn_* 同理）、随机权重和路由、模拟 fp8 量化的 fp32 参考、冷 cache 计时
   megamoe.py                   MegaMoeEpA8W4：EP8 整层（dispatch + 专家 + combine）的单 persistent kernel 封装，用于大 batch
   bench/                       实验工具 python -m a8w4.bench：ab（A/B 计时）、breakdown（每个 kernel 的耗时）、check（正确性）、dist（megamoe 8 卡变体）；core.py 是计时协议和变体写法，dist.py 也是 8 卡测试共用的 helper
   prof.py                      python -m a8w4.prof：counters（rocprofv3 计数器汇总）、isa（VGPR / spill / LDS）
@@ -199,7 +199,11 @@ EP 族（`ep3k` / `ep1k`）和 `prepare_weights` 在运行时都不需要 aiter�
 
 **复制到其他工程**：
 
-- 整个目录复制过去即可，也可以放进别的包里。包内只有 kernel 文件的 `from pyhip.contrib.flydsl.host_launch import flydsl_kernel` 是绝对导入（`grep -rn pyhip.contrib kernels/`），其余全部是相对 import；不带 pyhip 时，把 `host_launch.py` 一起复制过去并改这些 import。只有 `tests/` 和 `tune.py` 的命令行入口按顶层包名 `a8w4` 导入，改了包名要同步修改。
+- 整个目录复制过去即可，也可以放进别的包里。包内的绝对导入只有两处，其余全部是相对 import：
+  - kernel 文件的 `from pyhip.contrib.flydsl.host_launch import flydsl_kernel`；
+  - `moe.py`、`ref.py` 的 `from pyhip.kit import ...`，以及 `tests/test_a8w4_ops.py` 的 `pyhip.kit.testing`。
+
+  用 `grep -rn "pyhip\.\(contrib\|kit\)" --include=*.py . | grep -v experiments/` 列出它们。不带 pyhip 时，把 `host_launch.py` 和 `pyhip.kit`（仓库里的 `src/kit/`：两个文件，只依赖标准库；`testing.py` 另需 pytest）一起复制过去并改这些 import。只有 `tests/` 和 `tune.py` 的命令行入口按顶层包名 `a8w4` 导入，改了包名要同步修改。
 - 调优表按 shape 存放，其他模型要先调优（第 6 节）。
 - 换了机器（不同 SKU 或功耗墙）要先跑 `verify`，必要时重新调优。
 
@@ -641,7 +645,7 @@ profile 中的 kernel 名：
 
 ## 8. 正确性与测试
 
-- **参考实现**：`ref.ref_moe` 是 fp32 参考，按 kernel 的方式模拟 fp8 量化：x 每行量化一次，中间结果每（行, 128 列）量化一次。剩下的差别只来自累加顺序和 bf16 输出。阈值是 cos 差 < 5e-3，实测 1e-5 到 3.5e-4。
+- **参考实现**：`ref.moe_ref` / `moe_dyn_ref` 是 fp32 参考，参数与 `a8w4_moe` / `a8w4_moe_dyn` 相同（读 prepare 后的权重，用 `decode_fd2` 解码）；`ref_moe` 是读未 shuffle 的 mxfp4 张量的旧接口，三者共用一个 fp32 核心。它们按 kernel 的方式模拟 fp8 量化：x 每行量化一次，中间结果每（行, 128 列）量化一次。剩下的差别只来自累加顺序和 bf16 输出。阈值是 cos 差 < 5e-3，实测 1e-5 到 3.5e-4。
 - **`tests/test_a8w4_ops.py`**：由算子生成（`test_ops = op_tests(OPS)`，`pyhip.kit.testing`）。每个用例（`ref.moe_test` / `moe_dyn_test` 的网格）× 每个实现的每个配置跑一项：`MOE.run(cfg, **inputs)` 对 `moe_ref` / `moe_dyn_ref`，用 `moe_check` / `moe_dyn_check` 判（bf16、shape、cos 差 < 5e-3）。本机 506 项：360 passed、146 skipped，首次约 3 分钟（编译），之后约 20 秒。
   - `moe`：tp8 / tp4 / ep8 三个 shape（EP 用 rank 3、全局专家 id）× tokens 1 / 77 / 600 × silu / situv2，配置是全部实现的网格（tp2k / tp1k / tp1kq / ep3k 的 6 个预设 / ep1k）；
   - `moe_dyn`：EP8 接收缓冲区，容量 512 时有效行数 0 / 1 / 37 / 300，容量 2048 时 1500（TR epilogue）；无效行填 NaN 和随机 id；× bf16 / fp8 分组 scale 输入 × silu / situv2，ep3k 的 6 个预设；
@@ -680,7 +684,7 @@ profile 中的 kernel 名：
   - topk=1 时每个输出元素只被 atomic 加一次，tp2k / tp1k / tp1kq / ep3k 全部配置在 1 / 300 / 3000 tokens 下与原 kernel 逐位相同；
   - topk=8 时，新旧 kernel 之间的 cos 差与原 kernel 自身两次运行之间的差在同一量级（1e-7 – 1e-5）。
 - **与 sglang PR #45 的 `ep8_moe_dyn` 一致**：topk=1 时 t16 / s32 / l128、bf16 / fp8 输入逐位相同；topk=8 时 cos 差约 3e-7，与 PR 版自身两次运行之间的差相同。
-- **单个配置或实验变体的检查**：`python -m a8w4.bench check --case tp8 -t 1 77 4096 -v @table "tp1k bcm2 ks1" --graph`，逐个变体查对参考、对第一个变体、重复调用的稳定性和 graph 回放（`--bitwise` 配合 topk 1 的 `--shape` 查逐位一致）。三个 8 卡测试的进程组、计时和 megamoe 参考检查共用 `bench/dist.py`。
+- **单个配置或实验变体的检查**：`python -m a8w4.bench check --case tp8 -t 1 77 4096 -v @table "tp1k bcm2 ks1" --graph`，逐个变体查对参考、对第一个变体、重复调用的稳定性和 graph 回放（`--bitwise` 配合 topk 1 的 `--shape` 查逐位一致）。`@requires` 拒绝的变体记为 n/a 并写出原因；ep3k 带覆盖项的变体（`m64:g2.pf=1`）按覆盖后的配置检查（`bench ab` 把这些变体列在 dropped 里）。三个 8 卡测试的进程组、计时和 megamoe 参考检查共用 `bench/dist.py`。
 
 ### 8.1 整层测试与性能（MORI EP8）
 
@@ -789,7 +793,7 @@ python a8w4/tests/test_a8w4_mori_tp8.py --allreduce aiter --act silu situv2 \
 | ep1k | 同上 | I % 2048 == 0 | 同上，另需 topk = 8、M ≤ 512 |
 | 32 位偏移 | W1 字节数 E·I·H < 4 GiB；tokens·H < 2^31 | | sorted id 中 token 占 24 位 |
 
-`supported()` 里写的是其中会影响选择的部分。其他组合在调用前就会被 kernel 里的 assert 拦下。
+`moe.py` 各实现函数的 `@requires` 写的是其中会影响选择的部分（`supported()` 汇总它们）。其他组合在调用前就会被 kernel 里的 assert 拦下。
 
 ### 9.2 硬件假设
 
@@ -804,11 +808,34 @@ python a8w4/tests/test_a8w4_mori_tp8.py --allreduce aiter --act silu situv2 \
 
 ### 9.3 加一个新 kernel 或新配置
 
-1. 在 `kernels/` 加 device 代码，在 `moe.py` 加 runner，并注册到 `RUNNERS`。host 封装用 `pyhip.contrib.flydsl.host_launch` 的 `@flydsl_kernel`，不再手写 `functools.cache` + `_run_compiled`：builder 的关键字参数是编译 key，op 直接传 tensor（`kern(x, out, n, H=...)`），常驻对象在构造时绑定 `kern.get(**key)`；写法见 skill `flydsl-host-launch`。
-2. 更新 `config_name` / `parse_config`（名字要能解析回 dict，CSV 里存的是名字）。
-3. 在 `supported()` 里写清结构限制，包括 act、capture、tokens。
-4. 在 `tune.candidates()` 里加入候选。
-5. 在 `tests/` 里加对参考实现的用例，然后重新调优并 merge。
+1. 在 `kernels/` 加 device 代码。host 封装用 `pyhip.contrib.flydsl.host_launch` 的 `@flydsl_kernel`，不再手写 `functools.cache` + `_run_compiled`：builder 的关键字参数是编译 key，op 直接传 tensor（`kern(x, out, n, H=...)`），常驻对象在构造时绑定 `kern.get(**key)`；写法见 skill `flydsl-host-launch`。
+2. 在 `moe.py` 写一个实现函数 `moe_<kind>`。`OPS = collect(globals())` 按名字前缀把它收进算子 `MOE`，不用注册。`moe_dyn_<kind>` 收进 `MOE_DYN`，但 `a8w4_moe_dyn` 目前只选 ep3k（`dyn_config`）。写法：
+   - 参数先与 `ref.moe_ref` 完全相同，后面是带默认值的 keyword-only knob；
+   - 每个 knob 一个 `@param(name, values, id="bm{}")`：
+     - `values` 是调优网格，也可以是 vocabulary 的函数，如 tp1k 的 `ksplit`；
+     - `id` 是它在配置名里的写法。`config_name` / `parse_config` 由此生成，CSV 里存的就是这个名字；
+   - 结构限制写成 `@requires(lambda ...: ..., "原因")`：
+     - lambda 的参数名是 vocabulary（`ref.moe_test` 的参数 `model_dim`、`inter_dim`、`experts`、`experts_global`、`topk`、`num_tokens`、`act` 等，另有 `capturing`）或 knob；
+     - 原因里用 `{名字}` 引用它们的值；
+     - 几个族共用的限制用 `stack(...)` 组合（`tp_limits`、`ep_limits`）；
+   - `@meta(tile_m=..., cached_loads=...)` 给 bench 用：`tile_m` 是 block 行数表头；`cached_loads` 表示 W / A 走 cache，这时 bench 拒绝不轮换权重的计时协议。
+
+   例如 tp1kq：
+
+   ```python
+   @param("bcm", (1,))
+   @tp_limits
+   @requires(lambda inter_dim: inter_dim == 256,
+             "tp1kq needs inter_dim == 256 (inter_dim={inter_dim})")
+   @requires(lambda capturing: not capturing, "tp1kq is not CUDA-graph safe (host launch epoch)")
+   @meta(tile_m=Q.BM, cached_loads=lambda bcm: bcm != 2)
+   def moe_tp1kq(x, W, topk_weights, topk_ids, *, expert_offset=0, num_experts=None, act="silu",
+                 situ=None, bcm=1):
+       ...
+   ```
+
+   这些限制在四个地方生效：查表时的过滤（`supported()`）、调优的候选（`MOE.candidates`）、生成的测试的 skip、bench 的 n/a。
+3. 测试不用另写：`pytest -q a8w4/tests/test_a8w4_ops.py -k <kind>` 会在全部用例上跑新实现的全部配置。第一次加 `PYHIP_FLYDSL_CHECK=1` 跑。然后重新调优并 merge。
 
 按某个激活调优：`tune --act <act>`，结果写成该 act 的一组行（CSV 的 act 列），命令见 [configs/README.md](configs/README.md)。
 

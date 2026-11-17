@@ -13,7 +13,7 @@
 
 ### 0.1 当前状态（每次停下来前更新）
 
-- **迭代**：I1、I1b、I2、I3、I4 已完成。I3 的范围是用户看过 I2 后改的（见 3.4 节）：`_vendor` 只留真正用到的代码，迁到 `kernels/` 下的共享模块，删掉 `_vendor/`。用户看过 I4 后决定先跳过 I4b（NaN 传播，1.1 节），先做 I5（3.2 节）。I5 已完成。之后讨论出函数级 kit 的设计（`refactor6.md`），用户 2026-11-17 让开始实现：迭代 K（3.1 节）进行中。I4b、I6 排在 K 之后。
+- **迭代**：I1、I1b、I2、I3、I4 已完成。I3 的范围是用户看过 I2 后改的（见 3.4 节）：`_vendor` 只留真正用到的代码，迁到 `kernels/` 下的共享模块，删掉 `_vendor/`。用户看过 I4 后决定先跳过 I4b（NaN 传播，1.1 节），先做 I5（3.2 节）。I5 已完成。之后讨论出函数级 kit 的设计（`refactor6.md`），用户 2026-11-17 让开始实现：迭代 K（3.1 节）已完成，等用户 review。I4b、I6 排在 K 之后；另有一个待定问题：`ref_moe(raw)` 的调用方（`bench/core.py`、`bench/dist.py` 的 megamoe 参考、两个 MORI 测试）要不要改用 `moe_ref(W)`。
 - **分支**：`/sgl-workspace/pyhip` 的 `refactor/a8w4`。
 - **已有提交**：
   - 迭代 0，安全网：`64ce77c`、`d17f502`（ISA 基线在这个提交上生成）、`4e256d9`。
@@ -24,7 +24,8 @@
   - I3：`18f243f`（原地精简）、`cc44955`（迁到 `kernels/`，删除 `_vendor/`）、`bf95fe8`（文档）。
   - I4：`47bde29`（计划）、`6c8434c`、`4b9eb2f`、`5e5d9e3`、`e565657`（合并 fp8x4 pack）、`f9d0ca1`（`tp_fmoe` 的 `NUM_XCD`）、`f95a9e6`（文档）。
   - I5：`97eb73e`（计划）、`d306c51`、`3067a2d`、`af9f077`、`89bf081`、`06d3875`（删 `kernels/_launch.py`）、`ff82c3d`（删无用 kernel 参数，有意改 ISA）、`0e7eaee`（文档）、`1d9f8e6`（skills）。
-- **用户的文件**：未跟踪的 `refactory2.md` 属于用户，不要改，也不要提交。
+  - K：`77aa77d`（计划）、`3361672`（K0）、`a6862e8`（K1）、`6acef65`（K2）、`b92ecc4`（K3）、`2a8e774`（修 `test_cuda_graph`）、`9859360`（K4）、`2ee2a19`（K5），以及文档提交。
+- **用户的文件**：未跟踪的 `refactory2.md` 属于用户，不要改，也不要提交。`refactor3.md`–`refactor6.md`（设计稿）同样不提交。
 
 ### 0.2 工作方式
 
@@ -59,14 +60,14 @@
 | I4 | kernel 文件之间不再互相 import（共享的 device helper 搬进 I3 建的模块，按名字导入；现在的 `G1.x`、`EP.x` 这类模块属性调用不进 FlyDSL 缓存 key）；`_fp4x8_to_fp8x8`、`_fp8x4_pack` / `_pack_activation` 只留一份；硬件常量集中定义 | Q12，Q14，Phase 2 | ISA IDENTICAL（第 4 步除外：有意改动，输出逐位比较 + 性能 A/B） |
 | I4b | 量化的 amax 改成传播 NaN（PyTorch 要求算子尽量传播 NaN）。I4 第 4 步实测：输入 x 的一个元素是 NaN 时，ep3k 的 3 个 tr 配置（`m64`、`l128`、`l128c`）、`ep1k`，以及对应的 dyn 配置输出有限的错误值；ref 和其他配置是整行 NaN。原因是 gemm1→gemm2 的重量化用 `maxnumf` 求 amax，忽略了 NaN：`ep_gemm` 的 tr epilogue（约 376–396 行）、`_kloop.quant_chunk`（ep1k 的 gemm2 输入）。同样写法的还有 megamoe 的 `ep_mega` epilogue 和 `ep_mega_comm.mega_quant_kernel`（量化原始 x），多卡，测试脚本还没覆盖。改成 `fx.max`，pack 函数不用动 | 用户 2026-11-16 | 每个配置注入 NaN / ±Inf 后输出和 ref 一样整行 NaN、其他行不受影响（加进 pytest）；ISA 只在这几处变；性能 A/B；单卡 pytest |
 | I5 | host 封装改用 `@flydsl_kernel`，替代 `_run_compiled` 和 `functools.cache`；每个 kernel 文件一个公开入口；同时删掉 I1 留下的无用 kernel 参数（标了 `# unused` 的那些）。已完成，见 3.2 节 | Q13，Phase 3 | ISA IDENTICAL（kernarg 偏移变化要逐个解释）；pytest |
-| K | 函数级 kit：op 写成一族函数（`moe_ref`、`moe_test`、`moe_tp1k` …），配置空间和限制写在函数的装饰器上，测试和 tune 由 `pyhip.kit` 生成或驱动。见 3.1 节 | `refactor6.md`（Q66–Q76）；用户 2026-11-17 | 见 3.1 节 |
+| K | 函数级 kit：op 写成一族函数（`moe_ref`、`moe_test`、`moe_tp1k` …），配置空间和限制写在函数的装饰器上，测试和 tune 由 `pyhip.kit` 生成或驱动。已完成，见 3.1 节 | `refactor6.md`（Q66–Q76）；用户 2026-11-17 | 见 3.1 节 |
 | I6 | 新建 `workspace.py`，统一管理每张卡一份的缓冲区 | Q19 | ISA IDENTICAL；pytest |
 
 ### 1.2 中期：方向清楚，细节做到时再定
 
 - kernel 内部按术语表改名，长函数拆成按阶段命名的函数（Q20、Q21）。可以在碰到某个文件时顺手做。
 - `table.py`：把调优表 CSV 的读、写、合并收拢到一处，供 dispatch 和 tune 共用。配置字符串的 parse / format 加往返测试（Q10）。
-- 族模块加注册表，目标是“加一个族只改一处”（Q1a、Q9、Q18）。迭代 K 用函数族 + `collect` 实现（3.1 节）。
+- 族模块加注册表，目标是“加一个族只改一处”（Q1a、Q9、Q18）。迭代 K 已用函数族 + `collect` 实现：加一个族就是在 `moe.py` 写一个 `moe_<kind>` 函数，配置名、tune 候选、测试、bench 都从它导出（README 9.3 节）。
 - 统一命令行入口，去掉 `sys.path` hack（Q7）；工具搬进 `dev/`（Q16、Q25）。
 - 测试整理（Q22）、文档拆分（Q24）。
 - megamoe 套用同样的分层（Q15）。
@@ -84,12 +85,12 @@
 ## 2. 删除规则（I1–I3 共用）
 
 - 一个选项只有在 `a8w4_moe`、`a8w4_moe_dyn`、`MegaMoeEpA8W4`、`tune`、`bench` 都走不到时才能删。
-- bench 的 variant 覆盖只作用于 ep3k：`g1.*` 和 `g2.*` 会作为 `ep_gemm1` / `ep_gemm2` 的参数传入，此外还有 `bm`、`rowv`、`sched`、`sst`（见 `bench/core.py` 约 160 到 260 行；`adt` 覆盖已在 I2 删掉）。TP kernel 的选项只能经 `moe.py`、`tune`、megamoe 走到。
+- bench 的 variant 覆盖只作用于 ep3k：`g1.*` 和 `g2.*` 会作为 `ep_gemm1` / `ep_gemm2` 的参数传入，此外还有 `bm`、`rowv`、`sched`、`sst`（语法见 `bench/core.py` 的 `VARIANT_HELP`；K5 起由 `moe.ep_preset` 经 `moe_ep3k(**over)` 应用；`adt` 覆盖已在 I2 删掉）。TP kernel 的选项只能经 `moe.py`、`tune`、megamoe 走到。
 - 删完后，剩下的 kernel 的 ISA 必须完全不变。不在快照矩阵里的配置，本来就走不到。
 
 ## 3. 当前迭代
 
-### 3.1 K：函数级 kit（进行中，设计见 `refactor6.md`）
+### 3.1 K：函数级 kit（已完成，设计见 `refactor6.md`）
 
 **目标**：同一个 op 的参考实现、各个实现、测试输入和配置空间写成一族普通函数，靠名字前缀归到一起：
 
@@ -112,6 +113,28 @@
 **实现时定下的细节**（不对再改）：
 
 - tune 保留自己的 `CASES`（生产形状 `mimo-v2.6-flash-*`），自己拼用例 dict，不用测试网格；所以 `Op.cases()` 先不支持过滤和替换轴（refactor6.md §3、§5.2 里的 `only` / `**axes` 暂不做）。
+- `lookup_config` / `dyn_config` 按（shape、tokens、act、capturing、routing、表路径、表的 mtime）记住结果：通用的 `@requires` 检查比原来手写的 `supported()` 慢（每次 1.5–2.6 µs，原来 0.2–0.3 µs），记住结果后查表路径反而更快。
+- bench 的 ep3k 覆盖项是 cfg 里的额外项（knob 以外的 key），只有带 `**over` 的实现（`moe_ep3k`、`moe_dyn_ep3k`）接受；`@requires` / `@meta` 也看得到它们。
+
+**结果**：
+
+- [x] K0 `3361672`：`src/kit/__init__.py`（533 行）、`src/kit/testing.py`（76 行）；`tests/kit` 用玩具 op 写的 CPU 测试 12 passed，包括用 `pytester` 跑生成的测试。
+- [x] K1 `a6862e8`：`decode_fd2` 解码 prepare 后的权重；`moe_ref` / `moe_dyn_ref` 的参数与 `a8w4_moe` / `a8w4_moe_dyn` 相同；`ref_moe` 与改之前逐位相同（TP8 / EP8，1 / 77 / 600 tokens，silu / situv2）。新测试：`decode_fd2` 往返、`moe_ref` 与 `ref_moe` 逐位相同。
+- [x] K2 `6acef65`：6 个实现函数和共用的限制 `tp_limits` / `ep_limits` / `ep3k_space`；`ref.py` 加 `moe_test` / `moe_check` / `moe_dims` 和 `moe_dyn_*`。验证：
+  - 冻结函数的 golden JSON 全部相等：`supported` 20088 点、候选 12、名字往返 31、解析错误 8、`lookup_config` 4608、`default_config` 1152、`dyn_config` 1152；
+  - ISA IDENTICAL（558 次编译）；
+  - 每次 `a8w4_moe` 调用的 host 时间（eager，同卡 ABAB）：指定配置不变；查表路径 tp8 67.2 → 66.2 µs，ep8 76.2 → 73.2 µs。
+- [x] K3 `b92ecc4`：`tests/test_a8w4_ops.py` 生成 506 项（360 passed，146 skipped，skip 原因来自 `@requires`），取代 4 个手写测试和 `recv_buffer`。旧的每个（shape、配置、token 数）组合都在里面；新增 tp4、situv2 的全部配置、`moe_dyn` 的全部 ep3k 预设。`2a8e774` 修了 K 之前就有的 `test_cuda_graph` 偶发失败：eager 选 tp1kq、capture 选 tp1k，两者之差恰好跨 1e-5 的阈值；现在 eager 参考用 capture 的配置。
+- [x] K4 `9859360`：tune / verify 改用 `MOE.candidates`、`moe_test`、`moe_ref`、`MOE.run`、`moe_check`；删 `_situ`。验证：
+  - `tune candidates` 的输出 tp8 / tp4 / ep8 逐字相同；
+  - 4 个 token 数的 8 卡 tune，新旧 CSV 的表头和 key 相同，cos 相同或差 ≤ 3e-6；
+  - 同卡 ABAB 计时，新 / 旧中位数 0.998 / 1.000（波动 ±2.5%）；
+  - verify 的选择和 cos 相同。
+- [x] K5 `2ee2a19`：bench 的 `resolve()` 改用 `MOE.why_not` / `run` / `meta`；删 `ep_cfg`、`_ep_cached`、`cached_loads()`、`block_m()`。验证：
+  - `resolve()` 的输出（17 个 spec × tp8 / tp4 / ep8 silu / ep8 situv2 × 1 / 77 / 600 / 4096 tokens）：label、config、bm、cached 和 `ep_moe` 的参数完全相同，计算结果在噪声内；
+  - CLI（`ab` tp8 / ep8、`breakdown`、协议拒绝、`check` tp8 / ep8）只差有意的改动：skip 行写出 `@requires` 的原因；ep8 的 `t16:g2.arb=512` 原来 resolve 之后在 kernel 里 assert 失败（check 报 3 FAILED），现在是 n/a 并给出原因。
+- [x] 文档：README（文件表、复制到其他工程、8 节的参考实现和 bench check、9.1、9.3 加一个族）、skill `a8w4-perf-experiment`（landing checklist）、本文件。
+- **验收**：都已满足。最后一次全量：API 23 passed；单卡 `test_a8w4_moe.py` + `test_a8w4_ops.py` 391 passed、146 skipped；kit 12 passed；`tune readme --check` 通过。
 
 ### 3.2 I5：host 封装改用 `@flydsl_kernel`（已完成）
 
@@ -377,6 +400,7 @@ host 端（`moe._run_tp2k`，G1/G2 唯一的调用方）只用到 gemm1 的 `epi
 | 2026-11-16 | I3 精简 `_vendor`，迁到 `kernels/` | `_vendor/` 9 个文件 2268 行 → `kernels/` 5 个共享模块 464 行；helper 按名字导入，大部分进了 FlyDSL 缓存 key；`_run_compiled` 改用 pyhip `host_launch`；删 25 个无用 import；ISA IDENTICAL；`channel_exponents` ISA 和输出逐字节相同；API 测试 23 passed；单卡 pytest 94 passed、1 skipped | `18f243f` `cc44955` |
 | 2026-11-16 | I4 kernel 文件之间不再互相 import | 新增共享模块 `_mma`、`_hw`、`_atomic`、`_kloop`、`_protocol`，扩充 `_cvt`、`_mem`、`_act`；kernel 之间只剩 host 端 `ep_gemm` → `ep_prep`；重复的 helper 和硬件常量各只一份。第 1–3 步和补漏 ISA IDENTICAL；第 4 步有意改 ISA（合并 fp8x4 pack，指令更少，输出逐位相同，NaN 不变、±Inf 更接近 ref，快 0–1.6%）；API 测试 23 passed；单卡 pytest 94 passed、1 skipped | `6c8434c` `4b9eb2f` `5e5d9e3` `e565657` `f9d0ca1` |
 | 2026-11-16 | I5 host 封装改用 `@flydsl_kernel` | 16 个编译函数改成 kernel 对象（`<文件名>_kernel`），op 直接传 tensor，去掉 `_run_compiled`、`current_stream()`、`.data_ptr()`、`functools.cache`；megamoe 构造时绑定 `kern.get()`；删除 `kernels/_launch.py`（实验脚本改用 `experiments/_launch.py`）；删除 TP kernel 的 9 个无用参数。第 1–5 步 ISA IDENTICAL；第 6 步有意改 ISA（kernarg 变短、标量 load 合并），TP4 / TP8 A/B 在噪声内；host 开销每次调用少 6–13 µs；API 测试 23 passed；单卡 pytest 94 passed、1 skipped（含 CHECK 模式）；8 卡 pytest 3 passed | `d306c51` `3067a2d` `af9f077` `89bf081` `06d3875` `ff82c3d` |
+| 2026-11-17 | K 函数级 kit | 新增 `pyhip.kit`（op = 一族同前缀的函数，`@param` / `@requires` / `@meta` / `stack`、`collect`、`op_tests`）；`ref.py` 定义问题（`moe_ref` 读 prepare 后的权重、`moe_test`、`moe_check`、`moe_dims`、`moe_dyn_*`），`moe.py` 的 runner 表改成 6 个实现函数；测试由 op 生成（506 项），tune / verify / bench 都改走 op。冻结 API 的 golden JSON 全部相等；ISA IDENTICAL；查表路径 host 时间少 1–3 µs；tune 候选逐字相同、计时不变；bench 只有 skip 原因变具体、覆盖项受 `@requires` 检查。API 测试 23 passed；单卡 pytest 391 passed、146 skipped；kit 12 passed | `3361672` `a6862e8` `6acef65` `b92ecc4` `2a8e774` `9859360` `2ee2a19` |
 
 **I4 的经验**：
 
@@ -390,6 +414,13 @@ host 端（`moe._run_tp2k`，G1/G2 唯一的调用方）只用到 gemm1 的 `epi
 - 迁移时要找出所有把 launcher 存起来再调用的地方（megamoe 的 `self.launch`、bench / 实验脚本里替换它的代码）。存的东西从 JitFunction 变成 specialization 后，替换方也要改成 `.get(...)`。
 - 删 kernel 参数即使只改 kernarg 布局，也可能让编译器合并标量 load 并重排调度。ISA 差异要按指令助记符逐对比较，不能只看 offset；会重排的 kernel 要做性能 A/B。
 - A/B 新旧代码：把旧提交 `git archive` 成另一个包名（`/tmp/i5/oldpkg/a8w4_old`），用 `bench ab` 的 `py:` variant 跑它，不用另写计时脚本。
+
+**K 的经验**：
+
+- “换实现、不换行为”的重构，先把冻结函数在整个输入网格上的输出存成 golden JSON，改完逐项比较，比挑几个例子可靠。
+- TP / EP kernel 都用 atomic，同一输入两次运行不逐位相同（TP 的 cos 差到 2e-5，EP 到 7e-7）。比较新旧输出前先量出“旧对旧”的噪声，cos 用 float64 算：float32 的 `cosine_similarity` 在 16M 个元素上会给出错误的值，甚至负数。
+- 生成的测试把原来的偶发失败暴露了出来（`test_cuda_graph` 比的其实是两个不同的 kernel）。偶发失败先查它比较的是不是同一个东西。
+- 限制写在实现函数上以后，原来绕过检查的路径（bench 的覆盖项）也被检查到了；这类行为变化要在提交信息里单独列出。
 
 ## 5. 草图摘要：第 5–7 轮讨论（远期目标的素材，不是承诺）
 

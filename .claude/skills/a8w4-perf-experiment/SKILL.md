@@ -63,7 +63,8 @@ python -m a8w4.bench ab --case ep8 -t 4096 --samples 3 -v l128 l128c     # EP8: 
 ```
 - Variant spec: `[label=]<config name | bare CFGS name | @table | @auto>[:override,...]`;
   ep3k overrides `g1.<k>=v`, `g2.<k>=v` (pf, bcm, acm, sch, st, prio, nw, ni/no, arb, tr, wpe),
-  `bm=`, `rowv=32/64/128`, `sched=`, `sst=`, `adt=bf16` (a16w4), `-` drops a key. Custom
+  `bm=`, `rowv=32/64/128`, `sched=`, `sst=`, `-` drops a key; `moe.py`'s `@requires` check the
+  overridden config (a variant that cannot run is listed with the reason). Custom
   pipelines: `label=py:<file.py | module>:<func>` with
   `func(x, W, tw, ti, *, expert_offset, num_experts, act, situ) -> out` — put an experiment's
   kernel variant behind such a function instead of writing a new timing script.
@@ -106,9 +107,10 @@ Needs all 8 GPUs idle (`rocm-smi --showuse`). Full-layer comparisons vs MORI: th
 
 ## 7. Landing checklist
 
-1. Kernel / CFGS / `AUTO` / `tune.EP_CFGS` / `tune.candidates` / `supported()` as needed
-   (README §9.3), a8w4 and a16w4 (shared CFGS: `adt=bf16` variants) both checked.
-2. `python -m pytest -q a8w4/tests/test_a8w4_moe.py`; for megamoe / MORI / TP-layer changes
+1. Kernel, `ep_gemm.CFGS` / `AUTO`, `moe.EP_CFGS`, and the `moe_<kind>` function in `moe.py`
+   (`@param` grid, `@requires` limits, `@meta`) as needed (README §9.3).
+2. `python -m pytest -q a8w4/tests/test_a8w4_ops.py a8w4/tests/test_a8w4_moe.py` (the ops file
+   runs every config of every implementation); for megamoe / MORI / TP-layer changes
    also the three 8-GPU tests.
 3. Selection changed: `python -m a8w4.tune tune-all --gpus 0-7 --out /tmp/a8w4_tune`
    (idle check, locks, BAD/FAIL report, merged table), `tune compare`, copy the table,
