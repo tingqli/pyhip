@@ -50,6 +50,7 @@ from . import ref as R  # noqa: E402
 from .moe import (  # noqa: E402
     DEFAULT_CSV,
     FIELDS,
+    MOE,
     _load_table,
     a8w4_moe,
     config_name,
@@ -57,8 +58,10 @@ from .moe import (  # noqa: E402
     lookup_config,
     parse_config,
     run_config,
+    shape_vocab,
     supported,
 )
+from .ref import COS_TOL  # noqa: E402
 
 # (H, I, E local, E global, topk, expert_offset). XiaomiMiMo/MiMo-V2.6-Flash(-RL):
 # hidden 4096, moe_intermediate 2048, 256 routed experts, top-8, SiLU.
@@ -69,31 +72,15 @@ CASES = {
 }
 TOKENS = [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 320, 384, 448, 512, 640,
           768, 1024, 1280, 1536, 2048, 2560, 3072, 4096, 6144, 8192, 12288, 16384, 24576, 32768]
-COS_TOL = 5e-3  # vs the fp8-emulating fp32 reference (typical 1e-5 .. 1e-4)
-EP_CFGS = ("t16", "s16", "s32", "m64", "l128", "l128c")
 # (act, case) groups of the shipped table (configs/README.md)
 TABLE_JOBS = ("situv2:mimo-v2.6-flash-tp8", "situv2:mimo-v2.6-flash-ep8",
               "silu:mimo-v2.6-flash-tp8", "silu:mimo-v2.6-flash-ep8", "silu:mimo-v2.6-flash-tp4")
 
 
 def candidates(shape):
-    """Every config worth measuring on ``shape`` (structurally supported ones)."""
-    H, I, E, EGl, K = shape
-    out = []
-    for bm in (32, 64):
-        for g1 in (1, 2):
-            for g2 in ("base", "nt4"):
-                out.append(dict(kind="tp2k", block_m=bm, g1_bcm=g1, g2=g2))
-    # fused: each CTA takes 256 / 384 / 512 inter columns (256: 2 waves/SIMD, best for
-    # small/medium batches; 384-512: 1 wave/SIMD, best for large batches at large I)
-    splits = sorted({I // c for c in (256, 384, 512) if I % c == 0})
-    for bcm in (1, 2):
-        for ks in splits:
-            out.append(dict(kind="tp1k", bcm=bcm, ksplit=ks))
-    out.append(dict(kind="tp1kq", bcm=1))
-    out += [dict(kind="ep3k", cfg=n) for n in EP_CFGS]
-    out.append(dict(kind="ep1k", maxm=512))
-    return [c for c in out if supported(c, shape)]
+    """Every config worth measuring on ``shape``: the grids of the kernel families
+    (``moe.MOE``) minus the structurally unsupported points."""
+    return MOE.candidates(shape_vocab(shape))
 
 
 def _situ(act):

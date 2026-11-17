@@ -217,6 +217,8 @@ def test_convention_errors():
     _raises(ref + "@requires(lambda n: n, 'r')\ndef f_test(n=1): pass", "only @param marks")
     _raises(ref + "def f_test(*a): pass", "named parameters only")
     _raises(ref + "def f_check(out): pass", "does not take the arguments")
+    _raises("def f_ref(x, *, out=None): pass\ndef f_check(out, expected, **_): pass",
+            "multiple values for argument 'out'")
     _raises(ref + "def f_dims(y): pass", "does not take the arguments")
     _raises("def f_ref(x, *a): pass", "named parameters only")
     _raises("@meta(k=1)\ndef f_ref(x): pass", "only implementations")
@@ -234,6 +236,8 @@ def test_default_check():
     assert_close(torch.ones(3, dtype=torch.bfloat16), torch.ones(3))
     with pytest.raises(AssertionError):
         assert_close(torch.ones(3), torch.zeros(3))
+    # the interface's own arguments may be called out / expected
+    assert_close(torch.ones(3), torch.ones(3), out=None, expected=None)
 
 
 def test_generated_tests(pytester):

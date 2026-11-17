@@ -9,11 +9,18 @@ plain torch.
 References: ``moe_ref`` / ``moe_dyn_ref`` take the same arguments as ``a8w4_moe`` /
 ``a8w4_moe_dyn`` (the prepared weights, decoded by ``decode_fd2``); ``ref_moe`` is the
 older form on the unshuffled mxfp4 tensors. All share one fp32 core.
+
+The problem side of the ops ``moe`` and ``moe_dyn`` (``pyhip.kit``; the kernels are
+the implementations in ``moe.py``): ``<op>_ref`` the interface and the answer,
+``<op>_test`` the inputs of one test case (its parameters: the vocabulary of the
+kernels' limits), ``<op>_check`` the tolerance, ``<op>_dims`` the vocabulary of a call.
 """
 
 import functools
 
 import torch
+
+from pyhip.kit import param
 
 from .weights import prepare_weights, shuffle_mxfp4, weight_shape
 
@@ -225,6 +232,102 @@ def cos_diff(x, y):
     if float(den) == 0.0:
         return 0.0
     return float(1 - 2 * (x * y).sum() / den)
+
+
+# =============================================================================
+# ops moe / moe_dyn: test problems, tolerance, vocabulary of a call
+# =============================================================================
+
+COS_TOL = 5e-3  # vs the fp8-emulating fp32 reference (typical 1e-5 .. 1e-4)
+# name: (model_dim, inter_dim, experts, experts_global, topk, expert_offset), the
+# MiMo-V2.6-Flash per-rank shapes (EP: rank 3, global expert ids [96, 128))
+SHAPES = {
+    "tp8": (4096, 256, 256, 256, 8, 0),
+    "tp4": (4096, 512, 256, 256, 8, 0),
+    "ep8": (4096, 2048, 32, 256, 8, 96),
+}
+_SHAPE = "model_dim, inter_dim, experts, experts_global, topk, expert_offset"
+
+
+@functools.lru_cache(maxsize=1)  # the test cases run shape by shape
+def _weights(experts, model_dim, inter_dim):
+    return make_weights(experts, model_dim, inter_dim)[0]
+
+
+@param(_SHAPE, SHAPES)
+@param("num_tokens", (1, 77, 600), id="t{}")
+@param("act", ACTS, id="{}")
+def moe_test(model_dim, inter_dim, experts, experts_global, topk, expert_offset, num_tokens,
+             act="silu", routing="uniform", seed=0):
+    """Inputs of ``moe_ref`` / ``a8w4_moe``: random mxfp4 weights of ``experts`` local
+    experts (``make_weights``, cached per shape), ``make_routing(seed=seed)`` over
+    ``experts_global``; SiTUv2 with ``SITU``."""
+    x, tw, ti = make_routing(num_tokens, model_dim, experts_global, topk, seed=seed,
+                             routing=routing)
+    return dict(x=x, W=_weights(experts, model_dim, inter_dim), topk_weights=tw, topk_ids=ti,
+                expert_offset=expert_offset, num_experts=experts_global, act=act,
+                situ=SITU if act == "situv2" else None)
+
+
+def moe_check(out, expected, **_):
+    """bf16 output of the reference's shape within ``COS_TOL`` -> {"cos": cos diff}."""
+    assert out.dtype == torch.bfloat16 and out.shape == expected.shape, (out.dtype, out.shape)
+    d = cos_diff(expected, out.float())
+    assert d < COS_TOL, f"cos diff {d:.2e} >= {COS_TOL}"
+    return {"cos": d}
+
+
+def moe_dims(x, W, topk_weights, topk_ids, *, expert_offset=0, num_experts=None, act="silu",
+             situ=None):
+    E, H, I = weight_shape(W)
+    return dict(num_tokens=x.shape[0], model_dim=H, inter_dim=I, experts=E,
+                experts_global=num_experts or E, topk=topk_ids.shape[1],
+                expert_offset=expert_offset, act=act)
+
+
+@param(_SHAPE, {"ep8": SHAPES["ep8"]})
+@param("num_tokens, valid", {"v0": (512, 0), "v1": (512, 1), "v37": (512, 37),
+                             "v300": (512, 300), "v1500": (2048, 1500)})
+@param("fp8", {"bf16": False, "fp8": True})
+@param("act", ACTS, id="{}")
+def moe_dyn_test(model_dim, inter_dim, experts, experts_global, topk, expert_offset,
+                 num_tokens, valid, fp8=False, act="silu", seed=0):
+    """Inputs of ``moe_dyn_ref`` / ``a8w4_moe_dyn``: an EP all-to-all receive buffer of
+    ``num_tokens`` rows (the capacity). Rows [0, valid) are tokens with >= 1 local
+    route (global ids); the rows past them are stale (NaN x, random ids) and must not
+    be read. fp8: x in fp8 with per-(row, 128) scales (``quant_fp8_groups``)."""
+    x, tw, ti = make_routing(num_tokens, model_dim, experts_global, topk, seed=seed)
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    lo, hi = expert_offset, expert_offset + experts
+    forced = torch.randint(lo, hi, (num_tokens,), device="cuda", generator=g)
+    has_local = ((ti >= lo) & (ti < hi)).any(-1)
+    ti[:, 0] = torch.where(has_local, ti[:, 0], forced.to(torch.int32))
+    ti[valid:] = torch.randint(0, experts_global, ti[valid:].shape, device="cuda", generator=g,
+                               dtype=torch.int32)
+    x[valid:] = float("nan")
+    xs = None
+    if fp8:
+        x, xs = quant_fp8_groups(x)
+    return dict(x=x, W=_weights(experts, model_dim, inter_dim), topk_weights=tw, topk_ids=ti,
+                m_valid=torch.tensor([valid], dtype=torch.int32, device="cuda"), x_scale=xs,
+                expert_offset=expert_offset, num_experts=experts_global, act=act,
+                situ=SITU if act == "situv2" else None, est_tokens=max(valid, 1))
+
+
+def moe_dyn_check(result, expected, *, m_valid, **_):
+    """``moe_check`` on rows [0, m_valid[0]) (the rows past them are undefined). The
+    first parameter is not called ``out``: that is an argument of the interface."""
+    assert result.shape == expected.shape, (result.shape, expected.shape)
+    n = int(m_valid[0])
+    return moe_check(result[:n], expected[:n])
+
+
+def moe_dyn_dims(x, W, topk_weights, topk_ids, m_valid, *, x_scale=None, expert_offset=0,
+                 num_experts=None, act="silu", situ=None, est_tokens=None, out=None):
+    """``num_tokens`` is the capacity; ``valid`` stays unknown (m_valid is on the
+    device: reading it would sync)."""
+    return dict(moe_dims(x, W, topk_weights, topk_ids, expert_offset=expert_offset,
+                         num_experts=num_experts, act=act), fp8=x_scale is not None)
 
 
 # =============================================================================

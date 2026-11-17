@@ -23,9 +23,9 @@ import pytest
 __all__ = ["op_tests", "assert_close"]
 
 
-def assert_close(out, expected, **_):
+def assert_close(out, expected, /, **_):
     """The default ``<op>_check``: ``torch.testing.assert_close`` after casting
-    ``expected`` to ``out``'s dtype."""
+    ``expected`` to ``out``'s dtype (positional: an interface may have an ``out``)."""
     import torch
 
     if torch.is_tensor(out) and torch.is_tensor(expected):

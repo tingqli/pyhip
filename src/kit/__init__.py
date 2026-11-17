@@ -31,7 +31,8 @@ Conventions, checked when ``collect`` builds the ops:
   parameter names are the op's vocabulary, the names ``requires`` / ``meta`` / ``dims``
   speak; its ``@param`` grid gives the test cases.
 * ``<op>_check(out, expected, **inputs)`` raises when ``out`` is wrong; it may return a
-  dict of error metrics. Default: ``torch.testing.assert_close``.
+  dict of error metrics. Default: ``torch.testing.assert_close``. The first two
+  arguments come by position: name them apart from the interface's parameters.
 * ``<op>_dims(...)`` takes the ref's parameters and returns vocabulary values.
 * Suffixes ``ref``, ``test``, ``check``, ``dims`` are reserved. Names starting with
   ``_``, classes and kit marks are not collected.
@@ -45,6 +46,7 @@ The decorators only record themselves in ``f.kit_marks`` (in written order) and 
 
 import inspect
 import itertools
+import operator
 import re
 import string
 import types
@@ -70,11 +72,22 @@ def _marks(f, cls=_Mark):
     return [m for m in getattr(f, "kit_marks", ()) if isinstance(m, cls)]
 
 
+def _getter(names):
+    """ns -> tuple of ns[name] for ``names`` (C-level for 2+ names: limits are checked
+    on every dispatch)."""
+    if len(names) > 1:
+        return operator.itemgetter(*names)
+    if names:
+        one = operator.itemgetter(names[0])
+        return lambda ns: (one(ns),)
+    return lambda ns: ()
+
+
 class _Call:
     """A user function called with the values of its parameter names (``names``); a
     ``**kw`` parameter also receives the extras."""
 
-    __slots__ = ("f", "names", "pos", "varkw")
+    __slots__ = ("f", "names", "pos", "varkw", "plain", "get")
 
     def __init__(self, f):
         ps = inspect.signature(f).parameters.values()
@@ -82,6 +95,8 @@ class _Call:
         self.names = tuple(p.name for p in ps if p.kind not in (p.VAR_POSITIONAL, p.VAR_KEYWORD))
         self.pos = all(p.kind is not p.KEYWORD_ONLY for p in ps)
         self.varkw = any(p.kind is p.VAR_KEYWORD for p in ps)
+        self.plain = self.pos and not self.varkw  # f(*values)
+        self.get = _getter(self.names)
 
     def __call__(self, vals, extras):
         if self.pos:
@@ -415,15 +430,16 @@ class Op:
             return None
         ns = {**vocab, **knobs, "capturing": capturing}
         for r in imp.requires:
+            p = r.pred
             try:
-                vals = [ns[n] for n in r.pred.names]
+                vals = p.get(ns)
             except KeyError:
                 raise TypeError(f"{self.name}_{imp.kind}: {r!r} needs "
-                                f"{_unknown(r.pred.names, ns)}, missing from the vocabulary "
+                                f"{_unknown(p.names, ns)}, missing from the vocabulary "
                                 f"passed {sorted(vocab)}") from None
             if None in vals:
                 continue
-            if not r.pred(vals, extras):
+            if not (p.f(*vals) if p.plain else p(vals, extras)):
                 return r.reason.format_map({**ns, **extras})
         return None
 
