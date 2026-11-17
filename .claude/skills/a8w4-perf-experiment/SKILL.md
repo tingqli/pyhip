@@ -108,7 +108,8 @@ Needs all 8 GPUs idle (`rocm-smi --showuse`). Full-layer comparisons vs MORI: th
 ## 7. Landing checklist
 
 1. Kernel, `ep_gemm.CFGS` / `AUTO`, `moe.EP_CFGS`, and the `moe_<kind>` function in `moe.py`
-   (`@param` grid, `@requires` limits, `@meta`) as needed (README §9.3).
+   (`@op_register` outermost, then the `@param` grid, `@requires` limits, `@meta`) as needed
+   (README §9.3).
 2. `python -m pytest -q a8w4/tests/test_a8w4_ops.py a8w4/tests/test_a8w4_moe.py` (the ops file
    runs every config of every implementation); for megamoe / MORI / TP-layer changes
    also the three 8-GPU tests.

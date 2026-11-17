@@ -146,8 +146,9 @@ out = a8w4_moe_dyn(x, W, topk_weights, topk_ids, m_valid, x_scale=None,
 
 ```
 a8w4/
-  __init__.py                  公开接口
-  moe.py                       a8w4_moe / a8w4_moe_dyn；各族的实现函数 moe_<kind>（@param 网格、@requires 结构限制、@meta），由 pyhip.kit 收集成算子 MOE / MOE_DYN（9.3 节）；supported()、调优表查找（lookup_config / dyn_config）
+  __init__.py                  公开接口；另导出 ops（算子注册表，ops.moe / ops.moe_dyn）
+  _ops.py                      本包的算子注册表 ops = pyhip.kit.Registry() 和装饰器 op_register；ref.py 注册问题定义，moe.py 注册实现
+  moe.py                       a8w4_moe / a8w4_moe_dyn；各族的实现函数 moe_<kind>（@op_register 注册；@param 网格、@requires 结构限制、@meta），算子 MOE = ops.moe、MOE_DYN = ops.moe_dyn（9.3 节）；supported()、调优表查找（lookup_config / dyn_config）
   weights.py                   prepare_weights（fd2 权重）、shuffle_mxfp4、weight_shape
   tune.py                      调优 CLI：tune / merge / show / verify / candidates / tune-all / compare / readme / stats
   tables.py                    调优表报告：compare（两张表逐点的 winner）、readme（重新生成 / 检查 README 7.2–7.4）、stats（situv2 与 silu）
@@ -159,7 +160,7 @@ a8w4/
   experiments/                 历次实验：index.csv（一行一个实验）、log_YYYYMMDD.md、各实验目录；_launch.py 是旧实验脚本用的 _run_compiled
   configs/a8w4_moe_tuned.csv   调优表（每个点保存全部候选的耗时）
   configs/README.md            调优表的内容与生成命令
-  tests/test_a8w4_ops.py       pytest：每个实现的每个配置对参考实现，由算子生成（op_tests(OPS)）
+  tests/test_a8w4_ops.py       pytest：每个实现的每个配置对参考实现，由算子生成（op_tests(ops)）
   tests/test_a8w4_moe.py       pytest：参考实现、查表、CUDA graph 等其余性质
   tests/test_a8w4_mori_ep8.py  8 卡 EP8 整层（MORI dispatch → a8w4_moe_dyn → MORI combine）：pytest 查正确性，命令行测性能（8.1 节）
   tests/test_a8w4_mori_tp8.py  8 卡 TP8 整层（a8w4_moe → all-reduce），EP8 脚本的 TP 对照：pytest 查正确性，命令行测性能（8.2 节）
@@ -201,7 +202,7 @@ EP 族（`ep3k` / `ep1k`）和 `prepare_weights` 在运行时都不需要 aiter�
 
 - 整个目录复制过去即可，也可以放进别的包里。包内的绝对导入只有两处，其余全部是相对 import：
   - kernel 文件的 `from pyhip.contrib.flydsl.host_launch import flydsl_kernel`；
-  - `moe.py`、`ref.py` 的 `from pyhip.kit import ...`，以及 `tests/test_a8w4_ops.py` 的 `pyhip.kit.testing`。
+  - `_ops.py`、`moe.py`、`ref.py` 的 `from pyhip.kit import ...`，以及 `tests/test_a8w4_ops.py` 的 `pyhip.kit.testing`。
 
   用 `grep -rn "pyhip\.\(contrib\|kit\)" --include=*.py . | grep -v experiments/` 列出它们。不带 pyhip 时，把 `host_launch.py` 和 `pyhip.kit`（仓库里的 `src/kit/`：两个文件，只依赖标准库；`testing.py` 另需 pytest）一起复制过去并改这些 import。只有 `tests/` 和 `tune.py` 的命令行入口按顶层包名 `a8w4` 导入，改了包名要同步修改。
 - 调优表按 shape 存放，其他模型要先调优（第 6 节）。
@@ -646,7 +647,7 @@ profile 中的 kernel 名：
 ## 8. 正确性与测试
 
 - **参考实现**：`ref.moe_ref` / `moe_dyn_ref` 是 fp32 参考，参数与 `a8w4_moe` / `a8w4_moe_dyn` 相同（读 prepare 后的权重，用 `decode_fd2` 解码）；`ref_moe` 是读未 shuffle 的 mxfp4 张量的旧接口，三者共用一个 fp32 核心。它们按 kernel 的方式模拟 fp8 量化：x 每行量化一次，中间结果每（行, 128 列）量化一次。剩下的差别只来自累加顺序和 bf16 输出。阈值是 cos 差 < 5e-3，实测 1e-5 到 3.5e-4。
-- **`tests/test_a8w4_ops.py`**：由算子生成（`test_ops = op_tests(OPS)`，`pyhip.kit.testing`）。每个用例（`ref.moe_test` / `moe_dyn_test` 的网格）× 每个实现的每个配置跑一项：`MOE.run(cfg, **inputs)` 对 `moe_ref` / `moe_dyn_ref`，用 `moe_check` / `moe_dyn_check` 判（bf16、shape、cos 差 < 5e-3）。本机 506 项：360 passed、146 skipped，首次约 3 分钟（编译），之后约 20 秒。
+- **`tests/test_a8w4_ops.py`**：由算子生成（`test_ops = op_tests(ops)`，`pyhip.kit.testing`）。每个用例（`ref.moe_test` / `moe_dyn_test` 的网格）× 每个实现的每个配置跑一项：`MOE.run(cfg, **inputs)` 对 `moe_ref` / `moe_dyn_ref`，用 `moe_check` / `moe_dyn_check` 判（bf16、shape、cos 差 < 5e-3）。本机 506 项：360 passed、146 skipped，首次约 3 分钟（编译），之后约 20 秒。
   - `moe`：tp8 / tp4 / ep8 三个 shape（EP 用 rank 3、全局专家 id）× tokens 1 / 77 / 600 × silu / situv2，配置是全部实现的网格（tp2k / tp1k / tp1kq / ep3k 的 6 个预设 / ep1k）；
   - `moe_dyn`：EP8 接收缓冲区，容量 512 时有效行数 0 / 1 / 37 / 300，容量 2048 时 1500（TR epilogue）；无效行填 NaN 和随机 id；× bf16 / fp8 分组 scale 输入 × silu / situv2，ep3k 的 6 个预设；
   - 每个用例另有一项 `...-dims`：`moe_dims(**inputs)` 与用例一致；
@@ -809,7 +810,7 @@ python a8w4/tests/test_a8w4_mori_tp8.py --allreduce aiter --act silu situv2 \
 ### 9.3 加一个新 kernel 或新配置
 
 1. 在 `kernels/` 加 device 代码。host 封装用 `pyhip.contrib.flydsl.host_launch` 的 `@flydsl_kernel`，不再手写 `functools.cache` + `_run_compiled`：builder 的关键字参数是编译 key，op 直接传 tensor（`kern(x, out, n, H=...)`），常驻对象在构造时绑定 `kern.get(**key)`；写法见 skill `flydsl-host-launch`。
-2. 在 `moe.py` 写一个实现函数 `moe_<kind>`。`OPS = collect(globals())` 按名字前缀把它收进算子 `MOE`，不用注册。`moe_dyn_<kind>` 收进 `MOE_DYN`，但 `a8w4_moe_dyn` 目前只选 ep3k（`dyn_config`）。写法：
+2. 在 `moe.py` 写一个实现函数 `moe_<kind>`，最外层加 `@op_register`（`_ops.py`）：它按名字前缀把函数加进算子 `ops.moe`（`MOE`），并当场检查下面的写法，出错时报在这个函数上。`moe_dyn_<kind>` 加进 `ops.moe_dyn`（`MOE_DYN`），但 `a8w4_moe_dyn` 目前只选 ep3k（`dyn_config`）。写法：
    - 参数先与 `ref.moe_ref` 完全相同，后面是带默认值的 keyword-only knob；
    - 每个 knob 一个 `@param(name, values, id="bm{}")`：
      - `values` 是调优网格，也可以是 vocabulary 的函数，如 tp1k 的 `ksplit`；
@@ -823,6 +824,7 @@ python a8w4/tests/test_a8w4_mori_tp8.py --allreduce aiter --act silu situv2 \
    例如 tp1kq：
 
    ```python
+   @op_register
    @param("bcm", (1,))
    @tp_limits
    @requires(lambda inter_dim: inter_dim == 256,
