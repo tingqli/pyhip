@@ -8,9 +8,11 @@
     # EP on an all-to-all receive buffer (valid row count on device, e.g. MORI):
     out = a8w4_moe_dyn(x, W, topk_weights, topk_ids, m_valid, x_scale=..., ...)
 
+``ops.moe`` / ``ops.moe_dyn``: the ops (``pyhip.kit``) behind them, for tests and tools.
 See README.md.
 """
 
+from ._ops import ops  # noqa: F401
 from .moe import (  # noqa: F401
     DEFAULT_CSV,
     a8w4_moe,

@@ -672,19 +672,3 @@ class Registry(Mapping):
 
     def __repr__(self):
         return f"Registry({list(self._ops)})"
-
-
-def collect(namespace):
-    """Transition only (removed when a8w4 registers its functions): a Registry of the
-    functions of ``namespace`` named ``<op>_...`` for some ``<op>_ref`` in it, the refs
-    registered first, then the tests, then the rest in namespace order."""
-    fns = {k: f for k, f in namespace.items() if not k.startswith("_") and inspect.isfunction(f)}
-    reg = Registry()
-    refs = [f for k, f in fns.items() if k.endswith("_ref") and len(k) > 4]
-    for f in refs:
-        reg.register(f)
-    rest = [f for k, f in fns.items() if f not in refs
-            and any(k.startswith(o + "_") and len(k) > len(o) + 1 for o in reg)]
-    for f in sorted(rest, key=lambda f: not f.__name__.endswith("_test")):
-        reg.register(f)
-    return reg

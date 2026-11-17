@@ -10,10 +10,11 @@ References: ``moe_ref`` / ``moe_dyn_ref`` take the same arguments as ``a8w4_moe`
 ``a8w4_moe_dyn`` (the prepared weights, decoded by ``decode_fd2``); ``ref_moe`` is the
 older form on the unshuffled mxfp4 tensors. All share one fp32 core.
 
-The problem side of the ops ``moe`` and ``moe_dyn`` (``pyhip.kit``; the kernels are
-the implementations in ``moe.py``): ``<op>_ref`` the interface and the answer,
-``<op>_test`` the inputs of one test case (its parameters: the vocabulary of the
-kernels' limits), ``<op>_check`` the tolerance, ``<op>_dims`` the vocabulary of a call.
+The problem side of the ops ``moe`` and ``moe_dyn`` (``pyhip.kit``, registered into
+``_ops.ops``; the kernels are the implementations in ``moe.py``): ``<op>_ref`` the
+interface and the answer, ``<op>_test`` the inputs of one test case (its parameters:
+the vocabulary of the kernels' limits), ``<op>_check`` the tolerance, ``<op>_dims`` the
+vocabulary of a call.
 """
 
 import functools
@@ -22,6 +23,7 @@ import torch
 
 from pyhip.kit import param
 
+from ._ops import op_register
 from .weights import prepare_weights, shuffle_mxfp4, weight_shape
 
 ACTS = ("silu", "situv2")
@@ -205,6 +207,7 @@ def ref_moe(x, topk_weights, topk_ids, raw, expert_offset=0, act="silu", situ=No
                     act, situ, quant_x)
 
 
+@op_register
 def moe_ref(x, W, topk_weights, topk_ids, *, expert_offset=0, num_experts=None, act="silu",
             situ=None):
     """fp32 reference of ``a8w4_moe`` (same arguments), on the prepared weights ``W``."""
@@ -212,6 +215,7 @@ def moe_ref(x, W, topk_weights, topk_ids, *, expert_offset=0, num_experts=None, 
                     weight_shape(W)[0], expert_offset, act, situ, quant_x=True)
 
 
+@op_register
 def moe_dyn_ref(x, W, topk_weights, topk_ids, m_valid, *, x_scale=None, expert_offset=0,
                 num_experts=None, act="silu", situ=None, est_tokens=None, out=None):
     """fp32 reference of ``a8w4_moe_dyn`` (same arguments): rows [0, m_valid[0]) as
@@ -254,6 +258,7 @@ def _weights(experts, model_dim, inter_dim):
     return make_weights(experts, model_dim, inter_dim)[0]
 
 
+@op_register
 @param(_SHAPE, SHAPES)
 @param("num_tokens", (1, 77, 600), id="t{}")
 @param("act", ACTS, id="{}")
@@ -269,6 +274,7 @@ def moe_test(model_dim, inter_dim, experts, experts_global, topk, expert_offset,
                 situ=SITU if act == "situv2" else None)
 
 
+@op_register
 def moe_check(out, expected, **_):
     """bf16 output of the reference's shape within ``COS_TOL`` -> {"cos": cos diff}."""
     assert out.dtype == torch.bfloat16 and out.shape == expected.shape, (out.dtype, out.shape)
@@ -277,6 +283,7 @@ def moe_check(out, expected, **_):
     return {"cos": d}
 
 
+@op_register
 def moe_dims(x, W, topk_weights, topk_ids, *, expert_offset=0, num_experts=None, act="silu",
              situ=None):
     E, H, I = weight_shape(W)
@@ -285,6 +292,7 @@ def moe_dims(x, W, topk_weights, topk_ids, *, expert_offset=0, num_experts=None,
                 expert_offset=expert_offset, act=act)
 
 
+@op_register
 @param(_SHAPE, {"ep8": SHAPES["ep8"]})
 @param("num_tokens, valid", {"v0": (512, 0), "v1": (512, 1), "v37": (512, 37),
                              "v300": (512, 300), "v1500": (2048, 1500)})
@@ -314,6 +322,7 @@ def moe_dyn_test(model_dim, inter_dim, experts, experts_global, topk, expert_off
                 situ=SITU if act == "situv2" else None, est_tokens=max(valid, 1))
 
 
+@op_register
 def moe_dyn_check(result, expected, *, m_valid, **_):
     """``moe_check`` on rows [0, m_valid[0]) (the rows past them are undefined). The
     first parameter is not called ``out``: that is an argument of the interface."""
@@ -322,6 +331,7 @@ def moe_dyn_check(result, expected, *, m_valid, **_):
     return moe_check(result[:n], expected[:n])
 
 
+@op_register
 def moe_dyn_dims(x, W, topk_weights, topk_ids, m_valid, *, x_scale=None, expert_offset=0,
                  num_experts=None, act="silu", situ=None, est_tokens=None, out=None):
     """``num_tokens`` is the capacity; ``valid`` stays unknown (m_valid is on the

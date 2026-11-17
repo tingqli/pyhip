@@ -17,11 +17,11 @@ import torch
 from pyhip.kit.testing import op_tests
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-from a8w4.moe import OPS  # noqa: E402
+from a8w4 import ops  # noqa: E402
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
     or "gfx942" not in torch.cuda.get_device_properties(0).gcnArchName,
     reason="a8w4 kernels need gfx942 (fp8 FNUZ MFMA)")
 
-test_ops = op_tests(OPS)
+test_ops = op_tests(ops)

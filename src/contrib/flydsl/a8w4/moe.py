@@ -18,9 +18,10 @@ dispatch): capacity-sized inputs whose valid row count is a device tensor, x in 
 or in fp8 with per-(token, 128) scales; no host sync, CUDA-graph safe.
 
 Kernel families = the functions ``moe_<kind>`` below (all consume the same ``W``; see
-README.md). ``pyhip.kit`` collects them, with the reference / test functions of
-``ref.py``, into the ops ``MOE`` and ``MOE_DYN``: a config is ``{"kind": kind, knob:
-value, ...}``, its knobs' grid is the ``@param``s, its limits the ``@requires``.
+README.md). ``@op_register`` adds them, after the reference / test functions of
+``ref.py``, to the package's ops (``_ops.py``): ``MOE`` = ``ops.moe``, ``MOE_DYN`` =
+``ops.moe_dyn``. A config is ``{"kind": kind, knob: value, ...}``, its knobs' grid is
+the ``@param``s, its limits the ``@requires``.
   tp2k   prep -> gemm1 (q8s epilogue) -> gemm2 (atomic scatter)
   tp1k   prep -> one fused gemm1 + gemm2 kernel (BM 64)
   tp1kq  same, persistent work-queue kernel (inter_dim 256 only; NOT graph-safe)
@@ -38,8 +39,9 @@ import os
 
 import torch
 
-from pyhip.kit import collect, meta, param, requires, stack
+from pyhip.kit import meta, param, requires, stack
 
+from ._ops import op_register, ops
 from .kernels import ep_gemm as EG
 from .kernels import ep_small as ES
 from .kernels import tp_fmoe as F
@@ -48,17 +50,7 @@ from .kernels import tp_gemm1 as G1
 from .kernels import tp_gemm2 as G2
 from .kernels import tp_prep as TPP
 from .kernels.row_quant import quantize_rows
-from .ref import (  # noqa: F401 - the problem side of the ops (collect)
-    ACTS,
-    moe_check,
-    moe_dims,
-    moe_dyn_check,
-    moe_dyn_dims,
-    moe_dyn_ref,
-    moe_dyn_test,
-    moe_ref,
-    moe_test,
-)
+from .ref import ACTS  # importing ref.py registers the ops' ref / test / check / dims first
 from .weights import weight_shape
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -172,6 +164,7 @@ def _shape(W, topk_ids, num_experts):
     return H, I, E, num_experts or E, topk_ids.shape[1]
 
 
+@op_register
 @param("block_m", (32, 64), id="bm{}")
 @param("g1_bcm", (1, 2), id="g1bcm{}")
 @param("g2", ("base", "nt4"), id="g2{}")
@@ -204,6 +197,7 @@ def moe_tp2k(x, W, topk_weights, topk_ids, *, expert_offset=0, num_experts=None,
 
 # each CTA takes 256 / 384 / 512 inter columns (256: 2 waves/SIMD, best for small/medium
 # batches; 384-512: 1 wave/SIMD, best for large batches at large inter_dim)
+@op_register
 @param("bcm", (1, 2))
 @param("ksplit", lambda inter_dim: sorted({inter_dim // c for c in (256, 384, 512)
                                            if inter_dim % c == 0}), id="ks{}")
@@ -223,6 +217,7 @@ def moe_tp1k(x, W, topk_weights, topk_ids, *, expert_offset=0, num_experts=None,
                             ksplit=ksplit, act=act, **(situ or {}))
 
 
+@op_register
 @param("bcm", (1,))
 @tp_limits
 @requires(lambda inter_dim: inter_dim == 256,
@@ -239,6 +234,7 @@ def moe_tp1kq(x, W, topk_weights, topk_ids, *, expert_offset=0, num_experts=None
                              b_cache_mod=bcm, act=act, **(situ or {}))
 
 
+@op_register
 @ep3k_space
 def moe_ep3k(x, W, topk_weights, topk_ids, *, expert_offset=0, num_experts=None, act="silu",
              situ=None, cfg="t16", **over):
@@ -248,6 +244,7 @@ def moe_ep3k(x, W, topk_weights, topk_ids, *, expert_offset=0, num_experts=None,
                      act=act, **(situ or {}))
 
 
+@op_register
 @param("maxm", (EP_SMALL_MAXM,), id="m{}")
 @ep_limits
 @requires(lambda topk, inter_dim: topk == 8 and inter_dim % 2048 == 0,
@@ -265,6 +262,7 @@ def _est(M, est_tokens):
     return M if est_tokens is None else max(1, min(M, int(est_tokens)))
 
 
+@op_register
 @ep3k_space
 def moe_dyn_ep3k(x, W, topk_weights, topk_ids, m_valid, *, x_scale=None, expert_offset=0,
                  num_experts=None, act="silu", situ=None, est_tokens=None, out=None,
@@ -275,8 +273,7 @@ def moe_dyn_ep3k(x, W, topk_weights, topk_ids, m_valid, *, x_scale=None, expert_
                          cfg=ep_preset(cfg, over), act=act, **(situ or {}))
 
 
-OPS = collect(globals())
-MOE, MOE_DYN = OPS["moe"], OPS["moe_dyn"]
+MOE, MOE_DYN = ops.moe, ops.moe_dyn
 
 
 # =============================================================================
