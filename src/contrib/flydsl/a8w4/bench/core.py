@@ -17,7 +17,6 @@ copies matches a model (each layer reads other weights, so W is never left in th
   warm     no flush, the same weights
 """
 
-import copy
 import dataclasses
 import datetime
 import importlib
@@ -35,9 +34,7 @@ import torch
 
 from .. import ref as R
 from ..kernels import ep_gemm as EG
-from ..kernels import tp_fmoe as F
-from ..kernels import tp_fmoe_q as Q
-from ..moe import config_name, default_config, lookup_config, parse_config, run_config, supported
+from ..moe import MOE, config_name, default_config, lookup_config, parse_config, shape_vocab
 from ..tune import CASES, COS_TOL  # noqa: F401 - COS_TOL: re-exported for the tools
 
 PKG_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -250,46 +247,6 @@ def parse_variant(text):
     return v
 
 
-def ep_cfg(name, overrides):
-    """CFGS[name] with ``overrides`` ({"g2.pf": 1, "bm": 64, ...}) applied."""
-    c = copy.deepcopy(EG.CFGS[name])
-    for k, v in overrides.items():
-        d, key = (c[k[:2]], k[3:]) if k[:3] in ("g1.", "g2.") else (c, k)
-        if v == _DROP:
-            d.pop(key, None)
-        else:
-            d[key] = v
-    return c
-
-
-def _ep_cached(c):
-    return any(c[g].get("bcm", 2) != 2 or c[g].get("acm", 2) != 2 for g in ("g1", "g2"))
-
-
-def cached_loads(cfg):
-    """Whether ``cfg`` reads W (or A) with cached loads, i.e. gains from data a previous
-    call left in the caches (only a protocol with rotated weights times it fairly)."""
-    k = cfg["kind"]
-    if k == "tp2k":
-        return cfg["g1_bcm"] != 2
-    if k in ("tp1k", "tp1kq"):
-        return cfg["bcm"] != 2
-    if k == "ep3k":
-        return _ep_cached(EG.CFGS[cfg["cfg"]])
-    return False  # ep1k: nt W loads
-
-
-def block_m(cfg):
-    k = cfg["kind"]
-    if k == "tp2k":
-        return cfg["block_m"]
-    if k in ("tp1k", "tp1kq"):
-        return F.BM if k == "tp1k" else Q.BM
-    if k == "ep3k":
-        return EG.CFGS[cfg["cfg"]]["bm"]
-    return None
-
-
 @dataclasses.dataclass
 class Resolved:
     """A variant at one token count: ``run(x, W, tw, ti)`` -> bf16 out."""
@@ -297,37 +254,32 @@ class Resolved:
     spec: str
     config: str
     run: object
-    cfg: object = None  # the config dict (None: py variant)
-    bm: object = None
-    cached: object = None  # cached W / A loads (None: unknown)
+    cfg: object = None  # the config dict, overrides included (None: py variant)
+    bm: object = None  # the implementation's @meta tile_m (rows per block; None: none)
+    cached: object = None  # @meta cached_loads: reads W / A with cached loads (None: unknown)
 
 
 def resolve(v, case, tokens):
-    """-> Resolved, or a str: why ``v`` cannot run ``tokens`` on ``case``."""
-    H, I, E, EGl, K = case.shape
-    e0, act, situ = case.e0, case.act, case.situ
+    """-> Resolved, or a str: why ``v`` cannot run ``tokens`` on ``case``. The overrides
+    of an ep3k variant become config entries: ``moe_ep3k(**over)`` applies them, and its
+    ``@requires`` / ``@meta`` see them."""
+    kw = dict(expert_offset=case.e0, num_experts=case.shape[3], act=case.act, situ=case.situ)
     if v.func is not None:
         f = v.func
-        return Resolved(v.label, v.spec, v.spec, lambda x, W, tw, ti: f(
-            x, W, tw, ti, expert_offset=e0, num_experts=EGl, act=act, situ=situ))
+        return Resolved(v.label, v.spec, v.spec, lambda x, W, tw, ti: f(x, W, tw, ti, **kw))
     if v.base == "@table":
-        cfg = lookup_config(case.shape, tokens, act=act, routing=case.routing)
+        cfg = lookup_config(case.shape, tokens, act=case.act, routing=case.routing)
     elif v.base == "@auto":
-        cfg = default_config(case.shape, tokens, act)
+        cfg = default_config(case.shape, tokens, case.act)
     else:
         cfg = parse_config(v.base)
-    name = config_name(cfg)
-    if not supported(cfg, case.shape, act=act, tokens=tokens):
-        return f"{name}: not supported at this shape / act / token count"
-    if v.overrides:
-        c = ep_cfg(cfg["cfg"], v.overrides)
-        tail = ",".join(f"{k}={val}" for k, val in v.overrides.items())
-        return Resolved(v.label, v.spec, f"{name}:{tail}", lambda x, W, tw, ti: EG.ep_moe(
-            x, W, tw, ti, e0=e0, cfg=c, act=act, **(situ or {})),
-            cfg=cfg, bm=c["bm"], cached=_ep_cached(c))
-    return Resolved(v.label, v.spec, name, lambda x, W, tw, ti: run_config(
-        cfg, x, W, tw, ti, expert_offset=e0, num_experts=EGl, act=act, situ=situ),
-        cfg=cfg, bm=block_m(cfg), cached=cached_loads(cfg))
+    cfg = {**cfg, **v.overrides}
+    why = MOE.why_not(cfg, shape_vocab(case.shape, tokens, case.act))
+    if why:
+        return f"{config_name(cfg)}: {why}"
+    return Resolved(v.label, v.spec, config_name(cfg),
+                    lambda x, W, tw, ti: MOE.run(cfg, x, W, tw, ti, **kw), cfg=cfg,
+                    bm=MOE.meta(cfg, "tile_m"), cached=MOE.meta(cfg, "cached_loads"))
 
 
 def check_protocols(resolved, protocols, wcopies, allow_biased):
