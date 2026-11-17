@@ -13,7 +13,7 @@
 
 ### 0.1 当前状态（每次停下来前更新）
 
-- **迭代**：I1、I1b、I2、I3、I4 已完成。I3 的范围是用户看过 I2 后改的（见 3.4 节）：`_vendor` 只留真正用到的代码，迁到 `kernels/` 下的共享模块，删掉 `_vendor/`。用户看过 I4 后决定先跳过 I4b（NaN 传播，1.1 节），先做 I5（3.2 节）。I5 已完成。之后讨论出函数级 kit 的设计（`refactor6.md`），用户 2026-11-17 让开始实现：迭代 K（3.1 节）已完成。用户看过 K 后讨论了 `refactor7.md`：A 部分（op 注册表 `@op_register`）的迭代 R（3.0a 节）已完成。之后用户委托按推荐定下 B、C 部分的问题，并说明 sglang 现有代码不再考虑（冻结 API 取消）：迭代 D（3.0 节，查表分派进 kit）已完成。用户看过 D 后决定：只保证调优表里的 key，限制交给 kernel 的 assert，迭代 E（3.0e 节，去掉 `@requires`）已完成；用户让 E 之后直接做完 T1–T4（通用 tune / bench），每完成一个就提交并 push 到 tq2。I4b、I6 排在这些之后；另有一个待定问题：`ref_moe(raw)` 的调用方（`bench/core.py`、`bench/dist.py` 的 megamoe 参考、两个 MORI 测试）要不要改用 `moe_ref(W)`。
+- **迭代**：I1、I1b、I2、I3、I4 已完成。I3 的范围是用户看过 I2 后改的（见 3.4 节）：`_vendor` 只留真正用到的代码，迁到 `kernels/` 下的共享模块，删掉 `_vendor/`。用户看过 I4 后决定先跳过 I4b（NaN 传播，1.1 节），先做 I5（3.2 节）。I5 已完成。之后讨论出函数级 kit 的设计（`refactor6.md`），用户 2026-11-17 让开始实现：迭代 K（3.1 节）已完成。用户看过 K 后讨论了 `refactor7.md`：A 部分（op 注册表 `@op_register`）的迭代 R（3.0a 节）已完成。之后用户委托按推荐定下 B、C 部分的问题，并说明 sglang 现有代码不再考虑（冻结 API 取消）：迭代 D（3.0 节，查表分派进 kit）已完成。用户看过 D 后决定：只保证调优表里的 key，限制交给 kernel 的 assert，迭代 E（3.0e 节，去掉 `@requires`）已完成；用户让 E 之后直接做完 T1–T4（通用 tune / bench），每完成一个就提交并 push 到 tq2：T1–T4 已完成（3.0t 节），等用户看过。I4b、I6 排在这些之后；另有一个待定问题：`ref_moe(raw)` 的调用方（`bench/core.py`、`bench/dist.py` 的 megamoe 参考、两个 MORI 测试）要不要改用 `moe_ref(W)`。
 - **分支**：`/sgl-workspace/pyhip` 的 `refactor/a8w4`。
 - **已有提交**：
   - 迭代 0，安全网：`64ce77c`、`d17f502`（ISA 基线在这个提交上生成）、`4e256d9`。
@@ -31,6 +31,7 @@
   - T1：`bebaff3`。
   - T2：`3637665`。
   - T3：`ef107ba`。
+  - T4：`712fc05`。
 - **用户的文件**：未跟踪的 `refactory2.md` 属于用户，不要改，也不要提交。`refactor3.md`–`refactor7.md`（设计稿）同样不提交。
 
 ### 0.2 工作方式
@@ -100,14 +101,14 @@
 
 ## 3. 当前迭代
 
-### 3.0t T1–T4：通用 tune / bench（进行中，设计见 `refactor7.md` C 部分）
+### 3.0t T1–T4：通用 tune / bench（已完成，设计见 `refactor7.md` C 部分）
 
 用户 2026-11-17：E 之后直接做完 T1–T4，每完成一个就提交并 push 到 tq2。
 
 - [x] T1 `bebaff3`：`pyhip.kit.table`（标准库）——`read`、`identity`（`config` 及之前的列：同 identity 的行互相替换）、`write`（按 identity 去掉 config 后排序，数字按数值，再按 us；原子替换）、`merge`、`compare`。分派的读表、a8w4 tune 的 merge、`tables.compare` 都改用它。对照被替换的代码（原样拷贝）：把表打乱拆成 4 份再合并、把 300 行改时间后合并进表，得到的文件逐字节相同；compare 输出的 177 行相同；分派结果不变；`readme --check` 通过；kit 16、API 22 passed。去掉了旧部分文件“没有 act 列就当 silu”的补列（没有这样的文件了）。
 - [x] T2 `3637665`：`pyhip.kit.timing`（torch）——`flush_cache`、`copies`（原 `ref.weight_copies`，也接受单个 tensor）、`time_cold`、协议 `Timer`、ABBA 的 `interleaved`、`noise_band`、`verdict` 和常量。从 `ref.py`、`bench/core.py` 原样搬过来（AST 只差 docstring 和 `R.flush_cache` → `flush_cache`），旧名字在原处重新导出（实验脚本不用改）。冒烟：bench ab EP8 600 tokens（ep1k 被 kernel 的 assert 丢弃）、EP8 一个点的 tune；kit 16、API 22 passed。
 - [x] T3 `ef107ba`：`pyhip.kit.tune` + CLI `python -m pyhip.kit <cmd> <module>:<op>`（cases / candidates / tune / merge / show / verify / tune-all / compare）。声明在 `Registry(points=, unkeyed=, rotate=)`：调优点、不进表的词汇、计时轮换的输入。调优 case = `<op>_test` 的网格去掉分桶轴（`tp8-silu` 等），`--set` 改词汇；表头由词汇推出（为此 `moe_test` 把 routing 放到 act 前面）。a8w4 的 `tune.py` 变成薄包装（加 compare / readme / stats 报告），`tune.CASES` 并进 `ref.SHAPES`（EP8 的 case 用 rank 3，expert_offset 96；bench 仍认旧名字；ISA 快照仍用 0）。对照改前的包：candidates 三个 shape 相同；表头 = 旧 `FIELDS`；TP8 三个点新旧 tune 同卡先后跑，33 行相同、cos 相同、us 中位比 +0.00%（-1.3..+2.7%）；show 的 point / best / us / capture 选择在三个 shape 上相同（格式改为每个实现一列）；verify 选择和表中时间相同（EP8 加 `--set expert_offset=0` 复现旧结果）；tune-all 冒烟。ISA IDENTICAL；kit 17、API 22、单卡 413 passed。
-- [ ] T4 `kit.bench`
+- [x] T4 `712fc05`：`pyhip.kit.bench`（torch）——变体写法（`[label=]base[:k=v,...]`、`py:`、`@table`）、`resolve`（覆盖项成为配置项，`@meta` 读 tile_m / cached_loads）、cached-load 协议检查、运行记录（`Recorder`、`run_meta`、`md_table`）和两个引擎 `ab`、`check`；指标取 `<op>_check` 的第一项；CLI `python -m pyhip.kit ab|check <module>:<op> <case>`。a8w4 的 `bench/core.py` 只留用例、输入（`--local-experts-per-token`）、本地路由 / m-block 注释、裸 ep3k 预设名（`alias`）和 breakdown 用的 `resolve` 适配（`run(x, W, tw, ti)`）；`ab.py`、`check.py` 调 kit 引擎，命令行不变；记录字段 `wcopies` 改名 `copies`。对照改前的包（同一 EP8 shape、600 tokens、s32 / m64 / m64:g2.pf=1、`--bitwise`）：配置、本地路由、block 数、cos、verdict 相同，两张卡上时间差 1–2%；`check` tp8 1 / 77 / 600 加 `--graph` 结果相同；breakdown、py variant、2 个 sample × 2 个协议、`--out`、通用 CLI 冒烟；kit 18、单卡 413、8 卡 3 passed。只改 host 端。
 
 ### 3.0e E：去掉 `@requires`（已完成）
 
@@ -531,6 +532,7 @@ host 端（`moe._run_tp2k`，G1/G2 唯一的调用方）只用到 gemm1 的 `epi
 | 2026-11-17 | R op 注册表 | `pyhip.kit.Registry` + `@op_register` 逐个注册（名字定角色，注册时校验，失败回滚），取代 `collect`；a8w4 一包一个注册表 `_ops.ops`，ref.py 8 个、moe.py 6 个函数注册，`MOE = ops.moe`。冻结函数 golden 和 op 级 golden 全部相等；生成测试 ID 集合不变（顺序 moe 在前）；包被导入两次时两份注册表互不影响；ISA IDENTICAL；API 23 passed；kit 13 passed；单卡 pytest 391 passed、146 skipped | `716cc46` `8101410` `689e112` `8735b35` |
 | 2026-11-17 | D 查表分派进 kit，取消冻结 API | kit：`Registry(table=, bucket=, relax=)`、`Op.pick` / `points` / `__call__`、`<op>_fallback`；`op(...)` 按调用记住实现，mtime 每秒最多读一次。a8w4：`_ops.py` 声明表；两个兜底函数；`moe_dyn` 词汇改名（capacity / num_tokens）；删 7 个元组形式的函数；薄包装只留 M == 0，入参检查进 dims；工具和测试改用 op 的方法。K2 golden 只有三类有意差异；op golden 中 moe 相同、moe_dyn 只差改名；测试 ID 不变；ISA IDENTICAL；API 22、kit 15 passed；单卡 413 passed、146 skipped；8 卡 3 passed；查表路径的 host 时间在噪声内 | `056028b` `5d0b861` `4f51e94` `23a3e8f` `e60470a` |
 | 2026-11-17 | E 去掉 `@requires` | 限制只在 kernel 的 assert 里（164 种被拒绝的组合实测都是干净的 `AssertionError`）；只保证调优表里的 key，没调过的抛 `ValueError`；删兜底；`@no_capture`、`Op.tuned`、`Op.capturable`；生成的测试测调优过的配置（与原来没 skip 的 360 项相同）；ISA IDENTICAL；单卡 413、8 卡 3 passed | `e522ebe` |
+| 2026-11-17 | T1–T4 通用 tune / bench | `pyhip.kit.table`（表的读写、合并、比较）、`kit.timing`（冷 cache 协议、ABBA、噪声带）、`kit.tune` + `python -m pyhip.kit`（cases / candidates / tune / merge / show / verify / tune-all / compare）、`kit.bench`（ab / check）；a8w4 的 tune、bench 变成薄包装。表文件逐字节相同；tune 的候选、表头、选择相同，计时在噪声内；bench 新旧输出相同；ISA IDENTICAL；kit 18、单卡 413、8 卡 3 passed | `bebaff3` `3637665` `ef107ba` `712fc05` |
 
 **I4 的经验**：
 
@@ -551,6 +553,11 @@ host 端（`moe._run_tp2k`，G1/G2 唯一的调用方）只用到 gemm1 的 `epi
 - TP / EP kernel 都用 atomic，同一输入两次运行不逐位相同（TP 的 cos 差到 2e-5，EP 到 7e-7）。比较新旧输出前先量出“旧对旧”的噪声，cos 用 float64 算：float32 的 `cosine_similarity` 在 16M 个元素上会给出错误的值，甚至负数。
 - 生成的测试把原来的偶发失败暴露了出来（`test_cuda_graph` 比的其实是两个不同的 kernel）。偶发失败先查它比较的是不是同一个东西。
 - 限制写在实现函数上以后，原来绕过检查的路径（bench 的覆盖项）也被检查到了；这类行为变化要在提交信息里单独列出。
+
+**T1–T4 的经验**：
+
+- 工具类重构的新旧对照：把改前的提交 `git archive` 到 `/tmp`，同一条命令在两张空闲卡上并排跑。用例的默认值有意改了（EP8 的 expert_offset 0 → 96）时，对照要用 `--shape` / `--set` 把它固定住，否则差异来自输入而不是代码。
+- 分桶查表在没调过的点上会落到最近的点；“没有调优配置”只在 key（非分桶的词汇）不在表里时才出现。
 
 ## 5. 草图摘要：第 5–7 轮讨论（远期目标的素材，不是承诺）
 
