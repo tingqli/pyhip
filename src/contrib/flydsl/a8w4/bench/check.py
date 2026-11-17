@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Correctness of variants, and helpers for experiment scripts.
+"""Correctness of variants (``pyhip.kit.bench.check`` on an a8w4 case), and helpers for
+experiment scripts.
 
     python -m a8w4.bench check --case tp8 -t 1 77 600 4096 -v @table "tp1k bcm2 ks1" --graph
     python -m a8w4.bench check --shape 4096,2048,32,256,1 -t 64 4096 -v l128 "x=l128:g1.pf=1"
@@ -20,6 +21,8 @@ to write stand out), ``stability``, ``graph_replay``.
 import argparse
 
 import torch
+
+from pyhip.kit import bench as kb
 
 from .. import ref as R
 from ..moe import MOE
@@ -90,56 +93,11 @@ def main(argv=None):
     if not a.verbose:
         core.quiet()
     case = core.case_from_args(a)
-    variants = [core.parse_variant(s) for s in a.variants]
-    H, I, E, EGl, K = case.shape
     rec = core.Recorder(a.out, a.name, core.run_meta("check", a))
-    rec.text(case.describe() + "\n")
-    W, raw = R.make_weights(E, H, I)
-    rows, bad = [], 0
-    for T in a.tokens:
-        x, tw, ti = case.inputs(T, a.seed + T, a.local_experts_per_token)
-        ref = core.ref_out(case, x, tw, ti, raw)
-        base = None
-        for v in variants:
-            r = core.resolve(v, case, T)
-            if isinstance(r, str):
-                rows.append([T, v.label, "-", "n/a", "", "", "", "", r])
-                continue
-            fn = lambda r=r: r.run(x, W, tw, ti)  # noqa: E731
-            try:
-                out = fn()
-                torch.cuda.synchronize()
-                c = R.cos_diff(ref, out.float())
-                if base is None:
-                    base = out.clone()
-                cb = R.cos_diff(base.float(), out.float())
-                jit = stability(fn, a.repeats)
-                bw = bool(torch.equal(base, out)) if a.bitwise else None
-                g = None
-                if a.graph and r.cfg is not None and not MOE.capturable(r.cfg):
-                    g = "n/a (not graph-safe)"
-                elif a.graph:
-                    g = graph_replay(fn)
-                fails = [s for s, f in (("ref", not c < core.COS_TOL),
-                                        ("base", cb > core.DIFF_TOL), ("repeat", jit > core.DIFF_TOL),
-                                        ("graph", isinstance(g, float) and g > core.DIFF_TOL),
-                                        ("bitwise", a.bitwise and not bw)) if f]
-                ok = "OK" if not fails else "FAIL " + ",".join(fails)
-            except Exception as ex:  # noqa: BLE001
-                c = cb = jit = g = bw = None
-                ok = f"FAIL {type(ex).__name__}: {str(ex)[:160]}"
-            bad += ok != "OK"
-            rows.append([T, r.label, f"`{r.config}`", core.fmt_cos(c), core.fmt_cos(cb),
-                         core.fmt_cos(jit), "-" if bw is None else ("yes" if bw else "no"),
-                         core.fmt_cos(g) if isinstance(g, float) else (g or "-"), ok])
-            rec.row(T=T, variant=r.label, config=r.config, cos_ref=c, cos_base=cb, repeat=jit,
-                    bitwise=bw, graph=g, result=ok)
-        torch.cuda.empty_cache()
-    rec.text(core.md_table(["tokens", "variant", "config", "cos ref", "cos base", "repeat",
-                            "bitwise", "graph", "result"], [[str(c) for c in r] for r in rows],
-                           right=(0, 3, 4, 5)))
-    rec.text("\nALL OK" if not bad else f"\n{bad} FAILED")
-    rec.done()
+    bad = kb.check(MOE, case.vocab(), a.tokens, a.variants, seed=a.seed, repeats=a.repeats,
+                   graph=a.graph, bitwise=a.bitwise, diff_tol=core.DIFF_TOL, rec=rec,
+                   inputs=lambda T, seed: case.interface(T, seed, a.local_experts_per_token),
+                   alias=core.alias, unit="tokens", describe=case.describe())
     if bad:
         raise SystemExit(1)
 

@@ -158,7 +158,7 @@ a8w4/
   tables.py                    调优表报告：compare（`kit.table.compare`，按 shape / act / tokens 列出两张表逐点的 winner）、readme（重新生成 / 检查 README 7.2–7.4）、stats（situv2 与 silu）
   ref.py                       测试与调优用：算子的问题定义（moe_ref 参考实现、moe_test 测试输入、moe_check 判定、moe_dims 读词汇并检查输入；moe_dyn_* 同理）、随机权重和路由、模拟 fp8 量化的 fp32 参考、冷 cache 计时
   megamoe.py                   MegaMoeEpA8W4：EP8 整层（dispatch + 专家 + combine）的单 persistent kernel 封装，用于大 batch
-  bench/                       实验工具 python -m a8w4.bench：ab（A/B 计时）、breakdown（每个 kernel 的耗时）、check（正确性）、dist（megamoe 8 卡变体）；core.py 是用例、变体写法和记录（计时协议、ABBA、噪声带在 `pyhip.kit.timing`），dist.py 也是 8 卡测试共用的 helper
+  bench/                       实验工具 python -m a8w4.bench：ab（A/B 计时）、breakdown（每个 kernel 的耗时）、check（正确性）、dist（megamoe 8 卡变体）；core.py 是 a8w4 的用例、输入和变体别名（变体解析、A/B 和 check 的引擎、运行记录在 `pyhip.kit.bench`，计时协议、ABBA、噪声带在 `pyhip.kit.timing`），dist.py 也是 8 卡测试共用的 helper
   prof.py                      python -m a8w4.prof：counters（rocprofv3 计数器汇总）、isa（VGPR / spill / LDS）
   exp.py                       python a8w4/exp.py：实验登记 experiments/index.csv 的 grep / ls / add / new / lint / clean
   experiments/                 历次实验：index.csv（一行一个实验）、log_YYYYMMDD.md、各实验目录；_launch.py 是旧实验脚本用的 _run_compiled
@@ -695,7 +695,7 @@ profile 中的 kernel 名：
   - topk=1 时每个输出元素只被 atomic 加一次，tp2k / tp1k / tp1kq / ep3k 全部配置在 1 / 300 / 3000 tokens 下与原 kernel 逐位相同；
   - topk=8 时，新旧 kernel 之间的 cos 差与原 kernel 自身两次运行之间的差在同一量级（1e-7 – 1e-5）。
 - **与 sglang PR #45 的 `ep8_moe_dyn` 一致**：topk=1 时 t16 / s32 / l128、bf16 / fp8 输入逐位相同；topk=8 时 cos 差约 3e-7，与 PR 版自身两次运行之间的差相同。
-- **单个配置或实验变体的检查**：`python -m a8w4.bench check --case tp8 -t 1 77 4096 -v @table "tp1k bcm2 ks1" --graph`，逐个变体查对参考、对第一个变体、重复调用的稳定性和 graph 回放（`--bitwise` 配合 topk 1 的 `--shape` 查逐位一致）。kernel 跑不了的变体记为 FAIL 并写出异常；ep3k 带覆盖项的变体（`m64:g2.pf=1`）按覆盖后的配置检查（`bench ab` 把这些变体列在 dropped 里）。三个 8 卡测试的进程组、计时和 megamoe 参考检查共用 `bench/dist.py`。
+- **单个配置或实验变体的检查**：`python -m a8w4.bench check --case tp8 -t 1 77 4096 -v @table "tp1k bcm2 ks1" --graph`，逐个变体查对参考、对第一个变体、重复调用的稳定性和 graph 回放（`--bitwise` 配合 topk 1 的 `--shape` 查逐位一致）。kernel 跑不了的变体记为 FAIL 并写出异常；ep3k 带覆盖项的变体（`m64:g2.pf=1`）按覆盖后的配置检查（`bench ab` 把这些变体列在 dropped 里）。`bench ab` / `check` 是通用的 `pyhip.kit.bench` 套上 a8w4 的用例；`python -m pyhip.kit check a8w4:moe tp8-silu -t 1 77 -v @table "tp1k bcm2 ks1" --graph` 用调优的 case 跑同一个检查（`--diff-tol` 设对 base 的阈值）。三个 8 卡测试的进程组、计时和 megamoe 参考检查共用 `bench/dist.py`。
 
 ### 8.1 整层测试与性能（MORI EP8）
 

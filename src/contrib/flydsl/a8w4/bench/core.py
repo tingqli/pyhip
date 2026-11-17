@@ -1,24 +1,23 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Shared pieces of the bench tools: cases, variant specs, routing samples, run metadata,
-result files. Timing protocols, ABBA rounds, the noise band and verdicts are
-``pyhip.kit.timing`` (re-exported here: ``PROTOCOLS``, ``Timer``, ``interleaved``, ...).
+"""The a8w4 side of the bench tools, on top of ``pyhip.kit.bench`` (variants, A/B and
+check engines, run records) and ``pyhip.kit.timing`` (protocols, ABBA rounds, noise band;
+both re-exported here): the cases (``ref.SHAPES`` or a shape tuple) and their inputs
+(``--local-experts-per-token``), the routing annotation of a sample (local routes,
+m-blocks per ``@meta`` tile_m), bare ep3k preset names in variant specs, and the
+``resolve`` adapter (``run(x, W, tw, ti)``) breakdown and experiment scripts use.
 """
 
 import dataclasses
-import datetime
-import importlib
-import importlib.util
-import json
 import logging
 import os
-import shlex
-import socket
-import subprocess
-import sys
 
 import torch
 
+from pyhip.kit import bench as kb
+from pyhip.kit.bench import Recorder, md_table, meta_line  # noqa: F401 - re-exported
+from pyhip.kit.bench import check_protocols  # noqa: F401
+from pyhip.kit.bench import fmt as fmt_cos  # noqa: F401
 from pyhip.kit.timing import (  # noqa: F401 - re-exported for the bench tools
     MIN_COPIES,
     MIN_NOISE,
@@ -46,6 +45,10 @@ def quiet():
     logging.getLogger("aiter").setLevel(logging.ERROR)
 
 
+def run_meta(tool, args=None):
+    return kb.run_meta(tool, args, prog="python -m a8w4.bench", path=PKG_DIR)
+
+
 # =============================================================================
 # cases and inputs
 # =============================================================================
@@ -71,6 +74,23 @@ class Case:
         if local:
             return local_routing(tokens, H, EGl, E, K, local, seed, self.e0)
         return R.make_routing(tokens, H, EGl, K, seed=seed, routing=self.routing)
+
+    def kwargs(self):
+        """The interface's keyword arguments of the case."""
+        return dict(expert_offset=self.e0, num_experts=self.shape[3], act=self.act,
+                    situ=self.situ)
+
+    def interface(self, tokens, seed, local=0):
+        """The interface arguments of one sample (``moe_ref`` / ``a8w4_moe``): the routing
+        of ``inputs``, the cached random weights of the shape (``ref.moe_test``'s)."""
+        H, I, E, EGl, K = self.shape
+        x, tw, ti = self.inputs(tokens, seed, local)
+        return dict(x=x, W=R._weights(E, H, I), topk_weights=tw, topk_ids=ti, **self.kwargs())
+
+    def vocab(self, tokens=None):
+        """The ``ops.moe`` vocabulary of the case at ``tokens``."""
+        return dict(shape_vocab(self.shape, tokens, self.act, self.routing), expert_offset=self.e0,
+                    seed=0)
 
     def describe(self):
         H, I, E, EGl, K = self.shape
@@ -145,13 +165,25 @@ def route_blocks(ti, case, bms):
                               for bm in sorted({b for b in bms if b})}
 
 
+def annotate(case):
+    """``kit.bench.ab``'s annotation of a sample: local routes and the m-blocks of every
+    tile_m of the variants."""
+    def f(inputs, resolved):
+        bms = [MOE.meta(r.cfg, "tile_m") if r.cfg is not None else None for r in resolved]
+        routes, blocks = route_blocks(inputs["topk_ids"], case, bms)
+        return (f": {routes} local routes" + "".join(f", {n} blocks of {bm}"
+                                                     for bm, n in blocks.items()),
+                dict(routes=routes, blocks=blocks))
+    return f
+
+
 # =============================================================================
 # variants
 # =============================================================================
 
 VARIANT_HELP = """\
 variant spec: [label=]<base>[:<override>,...]  or  [label=]py:<module | file.py>:<func>
-  base      a config name (python -m a8w4.tune candidates --case ...), e.g. "tp1k bcm1 ks1",
+  base      a config name (python -m a8w4.tune candidates <case>), e.g. "tp1k bcm1 ks1",
             "ep3k l128"; a bare ep_gemm.CFGS name ("l128" = "ep3k l128"); "@table" (the
             tuned table's pick at each token count)
   override  ep3k only: g1.<k>=v / g2.<k>=v (ep_gemm1 / ep_gemm2 kwargs: pf, bcm, acm, sch,
@@ -163,83 +195,19 @@ variant spec: [label=]<base>[:<override>,...]  or  [label=]py:<module | file.py>
 examples: "ep3k m64"  "pf1=m64:g2.pf=1"  "c=l128:g1.bcm=0,g2.bcm=0"
 """
 
-_DROP = "-"
 
-
-@dataclasses.dataclass
-class Variant:
-    label: str
-    spec: str
-    base: str = ""
-    overrides: dict = dataclasses.field(default_factory=dict)
-    func: object = None
-
-
-def _value(v):
-    v = v.strip()
-    if v == _DROP:
-        return _DROP
-    if v.lower() in ("true", "false"):
-        return v.lower() == "true"
-    if v.lower() == "none":
-        return None
-    if "/" in v:
-        return tuple(_value(p) for p in v.split("/"))
-    for t in (int, float):
-        try:
-            return t(v)
-        except ValueError:
-            pass
-    return v
-
-
-def _load_func(target):
-    mod, _, fn = target.rpartition(":")
-    if not mod or not fn:
-        raise SystemExit(f"py variant {target!r}: expected py:<module | file.py>:<function>")
-    if mod.endswith(".py"):
-        path = os.path.abspath(mod)
-        sys.path.insert(0, os.path.dirname(path))  # the script's sibling imports
-        # a private module name: a script called e.g. profile.py must not shadow the stdlib
-        name = "a8w4_bench_user_" + os.path.splitext(os.path.basename(path))[0]
-        spec = importlib.util.spec_from_file_location(name, path)
-        m = importlib.util.module_from_spec(spec)
-        sys.modules[name] = m
-        spec.loader.exec_module(m)
-    else:
-        m = importlib.import_module(mod)
-    return getattr(m, fn)
+def alias(base):
+    """A bare ep_gemm.CFGS name is that ep3k preset; an unknown ep3k preset is refused."""
+    base = f"ep3k {base}" if base in EG.CFGS else base
+    kind, _, cfg = base.partition(" ")
+    if kind == "ep3k" and cfg not in EG.CFGS:
+        raise SystemExit(f"{base!r} is not a config name: no preset {cfg!r} in "
+                         f"ep_gemm.CFGS\n\n{VARIANT_HELP}")
+    return base
 
 
 def parse_variant(text):
-    text = text.strip()
-    label = None
-    eq, colon = text.find("="), text.find(":")
-    if eq > 0 and (colon < 0 or eq < colon):
-        label, text = text[:eq].strip(), text[eq + 1:].strip()
-    if text.startswith("py:"):
-        func = _load_func(text[3:])
-        return Variant(label or text, text, base="py", func=func)
-    base, _, ov = text.partition(":")
-    base = base.strip()
-    if base in EG.CFGS:
-        base = f"ep3k {base}"
-    if base != "@table":
-        try:
-            cfg = MOE.parse(base)
-        except (IndexError, KeyError, ValueError):
-            cfg = None
-        if cfg is None or (cfg["kind"] == "ep3k" and cfg["cfg"] not in EG.CFGS):
-            raise SystemExit(f"variant {text!r}: {base!r} is not a config name\n\n{VARIANT_HELP}")
-    v = Variant(label or text, text, base=base)
-    for item in filter(None, (s.strip() for s in ov.split(","))):
-        k, eq2, val = item.partition("=")
-        if not eq2:
-            raise SystemExit(f"variant {text!r}: override {item!r} is not key=value")
-        v.overrides[k.strip()] = _value(val)
-    if v.overrides and not base.startswith("ep3k"):
-        raise SystemExit(f"variant {text!r}: overrides apply to ep3k configs only")
-    return v
+    return kb.parse_variant(MOE, text, alias)
 
 
 @dataclasses.dataclass
@@ -255,140 +223,15 @@ class Resolved:
 
 
 def resolve(v, case, tokens):
-    """-> Resolved, or a str: why ``v`` has no config for ``tokens`` on ``case`` (an
-    untuned key for ``@table``). The overrides of an ep3k variant become config
-    entries: ``moe_ep3k(**over)`` applies them, and its ``@meta`` sees them. A config
-    the kernels cannot run raises at its first run."""
-    kw = dict(expert_offset=case.e0, num_experts=case.shape[3], act=case.act, situ=case.situ)
-    if v.func is not None:
-        f = v.func
-        return Resolved(v.label, v.spec, v.spec, lambda x, W, tw, ti: f(x, W, tw, ti, **kw))
-    try:
-        if v.base == "@table":
-            cfg = MOE.pick(shape_vocab(case.shape, tokens, case.act, case.routing))
-        else:
-            cfg = MOE.parse(v.base)
-    except ValueError as e:  # no tuned config for the case
-        return str(e)
-    cfg = {**cfg, **v.overrides}
-    return Resolved(v.label, v.spec, MOE.name_of(cfg),
-                    lambda x, W, tw, ti: MOE.run(cfg, x, W, tw, ti, **kw), cfg=cfg,
-                    bm=MOE.meta(cfg, "tile_m"), cached=MOE.meta(cfg, "cached_loads"))
-
-
-def check_protocols(resolved, protocols, wcopies, allow_biased):
-    """Refuse to time configs with cached loads under protocols that keep the weights
-    in the MALL only (the 20261115 mistake: a whole retune on a biased protocol)."""
-    safe = "coldrot" in protocols and wcopies >= MIN_COPIES
-    risky = sorted({r.label for r in resolved if r.cached is not False})
-    if safe or not risky:
-        return
-    msg = (f"variants {risky} read W / A with cached loads (or are py variants: unknown), "
-           f"but no protocol of {list(protocols)} rotates >= {MIN_COPIES} weight copies "
-           f"(coldrot, --wcopies {wcopies}): the MALL keeps the weights between calls and "
-           "favors cached loads by 5-13% (experiments/log_20261115.md 3.3)")
-    if not allow_biased:
-        raise SystemExit(msg + ". Add coldrot, or pass --allow-biased to measure the bias.")
-    print("WARNING: " + msg, flush=True)
-
-
-# =============================================================================
-# run metadata and result files
-# =============================================================================
-
-
-def git_rev(path=PKG_DIR):
-    """Short HEAD of the repo holding ``path`` (+dirty: uncommitted changes outside
-    experiments/)."""
-    try:
-        run = lambda *a: subprocess.run(["git", "-C", path, *a], capture_output=True,  # noqa: E731
-                                        text=True, timeout=10).stdout.strip()
-        rev = run("rev-parse", "--short", "HEAD")
-        if not rev:
-            return None
-        dirty = run("status", "--porcelain", "--", ".", ":(exclude)experiments")
-        return rev + ("+dirty" if dirty else "")
-    except (OSError, subprocess.SubprocessError):
-        return None
-
-
-def power_cap():
-    vis = (os.environ.get("HIP_VISIBLE_DEVICES") or os.environ.get("ROCR_VISIBLE_DEVICES")
-           or "0").split(",")[0]
-    try:
-        out = subprocess.run(["rocm-smi", "-d", vis, "--showmaxpower", "--json"],
-                             capture_output=True, text=True, timeout=30).stdout
-        for card in json.loads(out).values():
-            for k, v in card.items():
-                if "Max Graphics Package Power" in k:
-                    return float(v)
-    except (OSError, ValueError, subprocess.SubprocessError, AttributeError):
-        pass
-    return None
-
-
-def run_meta(tool, args=None):
-    import flydsl
-
-    p = torch.cuda.get_device_properties(torch.cuda.current_device())
-    return dict(
-        tool=tool, time=datetime.datetime.now().isoformat(timespec="seconds"),
-        cmd=shlex.join(["python", "-m", "a8w4.bench", tool]
-                       + sys.argv[1 + (sys.argv[1:2] == [tool]):]),
-        cwd=os.getcwd(), host=socket.gethostname(), git=git_rev(),
-        torch=torch.__version__, flydsl=getattr(flydsl, "__version__", "?"),
-        gpu=p.name, arch=p.gcnArchName.split(":")[0], cus=p.multi_processor_count,
-        visible=os.environ.get("HIP_VISIBLE_DEVICES"), power_cap_w=power_cap(),
-        args=dict(vars(args)) if args is not None else {})
-
-
-def meta_line(m):
-    cap = f", cap {m['power_cap_w']:.0f} W" if m.get("power_cap_w") else ""
-    return (f"> {m['time']} | git {m['git']} | FlyDSL {m['flydsl']} | torch {m['torch']} | "
-            f"{m['gpu']} ({m['arch']}, {m['cus']} CU{cap}) | HIP_VISIBLE_DEVICES "
-            f"{m['visible']}\n> `{m['cmd']}`")
-
-
-class Recorder:
-    """Prints text; with ``out``: also appends it to <out>/<name>.md and the measurement
-    records to <out>/<name>.jsonl (each run starts with a {"meta": ...} line)."""
-
-    def __init__(self, out, name, meta):
-        self.md = self.jl = None
-        if out:
-            os.makedirs(out, exist_ok=True)
-            self.md = os.path.join(out, f"{name}.md")
-            self.jl = os.path.join(out, f"{name}.jsonl")
-            with open(self.jl, "a") as f:
-                f.write(json.dumps({"meta": meta}, default=str) + "\n")
-        self.text("\n" + meta_line(meta) + "\n")
-
-    def text(self, s):
-        print(s, flush=True)
-        if self.md:
-            with open(self.md, "a") as f:
-                f.write(s + "\n")
-
-    def row(self, **rec):
-        if self.jl:
-            with open(self.jl, "a") as f:
-                f.write(json.dumps(rec, default=str) + "\n")
-
-    def done(self):
-        if self.md:
-            print(f"(written: {self.md}, {self.jl})", flush=True)
-
-
-def md_table(head, rows, right=()):
-    """Markdown table; columns whose index is in ``right`` are right-aligned."""
-    out = ["| " + " | ".join(head) + " |",
-           "|" + "|".join("---:" if i in right else "---" for i in range(len(head))) + "|"]
-    out += ["| " + " | ".join(str(c) for c in r) + " |" for r in rows]
-    return "\n".join(out)
-
-
-def fmt_cos(c):
-    return "-" if c is None else ("0" if c == 0 else f"{c:.1e}")
+    """``kit.bench.resolve`` on the case -> Resolved with ``run(x, W, tw, ti)``, or a str
+    (no tuned config for ``@table``)."""
+    r = kb.resolve(MOE, v, case.vocab(tokens))
+    if isinstance(r, str):
+        return r
+    kw = case.kwargs()
+    run = (lambda x, W, tw, ti, r=r: r.run(dict(x=x, W=W, topk_weights=tw, topk_ids=ti, **kw)))
+    bm = MOE.meta(r.cfg, "tile_m") if r.cfg is not None else None
+    return Resolved(r.label, r.spec, r.config, run, r.cfg, bm, r.cached)
 
 
 def ref_out(case, x, tw, ti, raw):

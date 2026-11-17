@@ -365,6 +365,93 @@ def test_tune(tmp_path, monkeypatch):
         "loop", "tiled b2", "queue fast", "queue slow"]  # the dispatch reads what tune wrote
 
 
+def test_bench(tmp_path, monkeypatch):
+    import json
+    import types
+
+    import torch
+
+    from pyhip.kit import bench as kb
+
+    src = TOY.replace("ops = Registry()", "ops = Registry(table=TABLE, bucket='n', points=(4, 6), "
+                                          "unkeyed=('seed',))")
+    mod = types.ModuleType("kit_toy_bench")
+    mod.TABLE = str(tmp_path / "tuned.csv")
+    with open(mod.TABLE, "w") as f:
+        f.write("alpha,n,config,us,err\n1.0,4,loop,2.0,0\n1.0,4,tiled b4,1.0,0\n")
+    exec(compile(src, "toy.py", "exec"), mod.__dict__)
+    op = mod.ops.axpy
+    case = dict(n=None, alpha=1.0, seed=0)
+
+    # variants: [label=]base[:k=v,...] and py:<file>:<func>
+    v = kb.parse_variant(op, "t=tiled b2:block=4,mode=x/1")
+    assert (v.label, v.base, v.overrides) == ("t", "tiled b2", {"block": 4, "mode": ("x", 1)})
+    assert kb.parse_variant(op, "b4", alias=lambda b: "tiled " + b).base == "tiled b4"
+    with pytest.raises(SystemExit, match="unknown knob"):
+        kb.parse_variant(op, "loop:block=4")
+    with pytest.raises(SystemExit, match="cannot parse config name"):
+        kb.parse_variant(op, "nope")
+    (tmp_path / "mine.py").write_text("def f(x, y, *, alpha=1.0):\n    return list(y)\n")
+    py = kb.parse_variant(op, f"m=py:{tmp_path / 'mine.py'}:f")
+    r = kb.resolve(op, py, dict(case, n=4))
+    assert (r.config, r.cfg, r.cached) == (py.spec, None, None)
+    assert r.run(dict(x=[1.0], y=[2.0], alpha=3.0)) == [2.0]
+
+    # resolve: the overrides become config entries; @table: the fastest tuned config
+    r = kb.resolve(op, kb.parse_variant(op, "tiled b2:block=4"), dict(case, n=4))
+    assert r.config == "tiled b4" and op.meta(r.cfg, "rows") == 32
+    assert r.run(dict(x=[1.0] * 4, y=[1.0] * 4, alpha=2.0)) == [3.0] * 4
+    table = kb.parse_variant(op, "@table")
+    assert kb.resolve(op, table, dict(case, n=4)).config == "tiled b4"
+    assert kb.resolve(op, table, dict(case, n=6)).config == "tiled b4"  # the nearest point
+    assert "no tuned config" in kb.resolve(op, table, dict(case, n=4, alpha=3.0))
+
+    # protocol check: unknown cached loads need coldrot with >= MIN_COPIES copies
+    kb.check_protocols([r], ["coldrot"], kb.MIN_COPIES, False)
+    with pytest.raises(SystemExit, match="cached loads"):
+        kb.check_protocols([r], ["cold"], kb.MIN_COPIES, False)
+    kb.check_protocols([r], ["cold"], kb.MIN_COPIES, True)  # warns
+
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    meta = dict(time="t", git="g", flydsl="f", torch="t", gpu="gpu", arch="a", cus=1,
+                visible="0", power_cap_w=None, cmd="cmd")
+
+    def records(name):
+        with open(tmp_path / "out" / f"{name}.jsonl") as f:
+            return [json.loads(line) for line in f][1:]
+
+    # check: FAIL for a config the impl can't run (the first variant that runs is the base),
+    # n/a (not a failure) for @table without a tuned config
+    bad = kb.check(op, case, [4, 6], ["@table", "loop", "tiled b4"], diff_tol=1e-9,
+                   rec=kb.Recorder(str(tmp_path / "out"), "check", meta))
+    assert bad == 2
+    got = [(r["T"], r["variant"], r["result"][:19]) for r in records("check")]
+    assert got == [(4, "@table", "OK"), (4, "loop", "OK"), (4, "tiled b4", "OK"),
+                   (6, "@table", "FAIL AssertionError"), (6, "loop", "OK"),
+                   (6, "tiled b4", "FAIL AssertionError")]
+    assert kb.check(op, dict(case, alpha=3.0), [4], ["loop", "@table"],
+                    rec=kb.Recorder(None, None, meta)) == 0
+
+    # ab: timing stubbed; the base timed twice; the verdict beyond the noise band
+    us = {"loop": 15.0, "tiled b4": 10.0, "tiled b4#2": 10.0, "tiled b2": 10.01}
+
+    def interleaved(fns, protocols, timer, rounds, iters):
+        for fn in fns.values():
+            fn({})
+        return {(p, lab): [us[lab]] * rounds for p in protocols for lab in fns}
+
+    monkeypatch.setattr(kb, "Timer", lambda Ws: None)
+    monkeypatch.setattr(kb, "interleaved", interleaved)
+    kb.ab(op, case, [4], ["tiled b4", "loop", "tiled b2"], rounds=2, diff_tol=1e-9,
+          rec=kb.Recorder(str(tmp_path / "out"), "ab", meta))
+    got = {r["variant"]: (r["verdict"], r["err_ref"], r["err_base"]) for r in records("ab")}
+    assert got == {"tiled b4": ("base", 0.0, 0.0), "tiled b4#2": ("noise floor", 0.0, 0.0),
+                   "loop": ("slower", 0.0, 0.0), "tiled b2": ("~", 0.0, 0.0)}
+    with pytest.raises(SystemExit, match="the base at n 4: axpy: no tuned config"):
+        kb.ab(op, dict(case, alpha=3.0), [4], ["@table", "loop"],
+              rec=kb.Recorder(None, None, meta))
+
+
 def test_marks_return_the_function_in_written_order():
     a, b, c = param("p", (1,)), no_capture("r"), meta(k=1)
 
