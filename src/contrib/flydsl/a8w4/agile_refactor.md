@@ -13,7 +13,7 @@
 
 ### 0.1 当前状态（每次停下来前更新）
 
-- **迭代**：I1、I1b、I2、I3、I4 已完成。I3 的范围是用户看过 I2 后改的（见 3.4 节）：`_vendor` 只留真正用到的代码，迁到 `kernels/` 下的共享模块，删掉 `_vendor/`。用户看过 I4 后决定先跳过 I4b（NaN 传播，1.1 节），先做 I5（3.2 节）。I5 已完成。之后讨论出函数级 kit 的设计（`refactor6.md`），用户 2026-11-17 让开始实现：迭代 K（3.1 节）已完成，等用户 review。I4b、I6 排在 K 之后；另有一个待定问题：`ref_moe(raw)` 的调用方（`bench/core.py`、`bench/dist.py` 的 megamoe 参考、两个 MORI 测试）要不要改用 `moe_ref(W)`。
+- **迭代**：I1、I1b、I2、I3、I4 已完成。I3 的范围是用户看过 I2 后改的（见 3.4 节）：`_vendor` 只留真正用到的代码，迁到 `kernels/` 下的共享模块，删掉 `_vendor/`。用户看过 I4 后决定先跳过 I4b（NaN 传播，1.1 节），先做 I5（3.2 节）。I5 已完成。之后讨论出函数级 kit 的设计（`refactor6.md`），用户 2026-11-17 让开始实现：迭代 K（3.1 节）已完成。用户看过 K 后讨论了 `refactor7.md`：A 部分（op 注册表 `@op_register`）已定，正在做迭代 R（3.0 节）；B 部分（查表分派进 kit）还有 Q77–Q85 待定。I4b、I6 排在这些之后；另有一个待定问题：`ref_moe(raw)` 的调用方（`bench/core.py`、`bench/dist.py` 的 megamoe 参考、两个 MORI 测试）要不要改用 `moe_ref(W)`。
 - **分支**：`/sgl-workspace/pyhip` 的 `refactor/a8w4`。
 - **已有提交**：
   - 迭代 0，安全网：`64ce77c`、`d17f502`（ISA 基线在这个提交上生成）、`4e256d9`。
@@ -61,6 +61,7 @@
 | I4b | 量化的 amax 改成传播 NaN（PyTorch 要求算子尽量传播 NaN）。I4 第 4 步实测：输入 x 的一个元素是 NaN 时，ep3k 的 3 个 tr 配置（`m64`、`l128`、`l128c`）、`ep1k`，以及对应的 dyn 配置输出有限的错误值；ref 和其他配置是整行 NaN。原因是 gemm1→gemm2 的重量化用 `maxnumf` 求 amax，忽略了 NaN：`ep_gemm` 的 tr epilogue（约 376–396 行）、`_kloop.quant_chunk`（ep1k 的 gemm2 输入）。同样写法的还有 megamoe 的 `ep_mega` epilogue 和 `ep_mega_comm.mega_quant_kernel`（量化原始 x），多卡，测试脚本还没覆盖。改成 `fx.max`，pack 函数不用动 | 用户 2026-11-16 | 每个配置注入 NaN / ±Inf 后输出和 ref 一样整行 NaN、其他行不受影响（加进 pytest）；ISA 只在这几处变；性能 A/B；单卡 pytest |
 | I5 | host 封装改用 `@flydsl_kernel`，替代 `_run_compiled` 和 `functools.cache`；每个 kernel 文件一个公开入口；同时删掉 I1 留下的无用 kernel 参数（标了 `# unused` 的那些）。已完成，见 3.2 节 | Q13，Phase 3 | ISA IDENTICAL（kernarg 偏移变化要逐个解释）；pytest |
 | K | 函数级 kit：op 写成一族函数（`moe_ref`、`moe_test`、`moe_tp1k` …），配置空间和限制写在函数的装饰器上，测试和 tune 由 `pyhip.kit` 生成或驱动。已完成，见 3.1 节 | `refactor6.md`（Q66–Q76）；用户 2026-11-17 | 见 3.1 节 |
+| R | op 注册表：`@op_register` 逐个注册，取代 `collect(globals())`；每个包一个 `Registry`（`a8w4.ops.moe`）。见 3.0 节 | `refactor7.md` A 部分；用户 2026-11-17 | 见 3.0 节 |
 | I6 | 新建 `workspace.py`，统一管理每张卡一份的缓冲区 | Q19 | ISA IDENTICAL；pytest |
 
 ### 1.2 中期：方向清楚，细节做到时再定
@@ -89,6 +90,24 @@
 - 删完后，剩下的 kernel 的 ISA 必须完全不变。不在快照矩阵里的配置，本来就走不到。
 
 ## 3. 当前迭代
+
+### 3.0 R：op 注册表（进行中，设计见 `refactor7.md` A 部分）
+
+**目标**：用装饰器 `@op_register` 逐个注册 op 的函数，取代一次性的 `collect(globals())`。
+
+- 每个包一个注册表（`pyhip.kit.Registry`）。a8w4 的在 `_ops.py`：`ops.moe`、`ops.moe_dyn`。
+- ref、test、check、dims 和实现函数全部注册；`@op_register` 写在最外层。
+- 角色仍由名字推断，校验内容和 `collect` 相同，只是改成在每个函数注册时做。
+- 不用全局的 `pyhip.kit.ops`：同一个包会被导入两次（`a8w4` 和 `pyhip.contrib.flydsl.a8w4`，已实测），`moe` 这个名字在 pyhip 里也太泛。
+
+**步骤**（每步一个提交）：
+
+| 步 | 内容 | 验收 |
+|---|---|---|
+| R0 | kit：`Registry`、`Registry.register`；`Op` 改成逐个追加；标签检查“已注册”；删 `collect`；`tests/kit` 改写，并加注册规则的测试 | `pytest tests/kit` 通过；不碰 a8w4 |
+| R1 | a8w4：`_ops.py`；`ref.py` 8 个、`moe.py` 6 个函数加 `@op_register`；`moe.py` 去掉 `collect` 和 F401 导入；`__init__` 导出 `ops`；`test_a8w4_ops.py` 用 `op_tests(ops)`；README | 改前存的 golden（K2 的冻结函数 golden，加 op 级 golden：词汇表、实现顺序、用例、每个用例的配置和原因、meta）逐项相同；生成测试的 ID 不变（`test_a8w4_ops` 加 API 共 529 项）；API 测试；kit 测试；ISA IDENTICAL；单卡 pytest |
+
+改前的基线和脚本在 session 的 `files/r/`（`golden_ops.py`；冻结函数用 `files/k2/golden.py`）。
 
 ### 3.1 K：函数级 kit（已完成，设计见 `refactor6.md`）
 
