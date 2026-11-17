@@ -13,7 +13,7 @@
 
 ### 0.1 当前状态（每次停下来前更新）
 
-- **迭代**：I1、I1b、I2、I3、I4 已完成。I3 的范围是用户看过 I2 后改的（见 3.4 节）：`_vendor` 只留真正用到的代码，迁到 `kernels/` 下的共享模块，删掉 `_vendor/`。用户看过 I4 后决定先跳过 I4b（NaN 传播，1.1 节），先做 I5（3.2 节）。I5 已完成。之后讨论出函数级 kit 的设计（`refactor6.md`），用户 2026-11-17 让开始实现：迭代 K（3.1 节）已完成。用户看过 K 后讨论了 `refactor7.md`：A 部分（op 注册表 `@op_register`）已定，正在做迭代 R（3.0 节）；B 部分（查表分派进 kit）还有 Q77–Q85 待定。I4b、I6 排在这些之后；另有一个待定问题：`ref_moe(raw)` 的调用方（`bench/core.py`、`bench/dist.py` 的 megamoe 参考、两个 MORI 测试）要不要改用 `moe_ref(W)`。
+- **迭代**：I1、I1b、I2、I3、I4 已完成。I3 的范围是用户看过 I2 后改的（见 3.4 节）：`_vendor` 只留真正用到的代码，迁到 `kernels/` 下的共享模块，删掉 `_vendor/`。用户看过 I4 后决定先跳过 I4b（NaN 传播，1.1 节），先做 I5（3.2 节）。I5 已完成。之后讨论出函数级 kit 的设计（`refactor6.md`），用户 2026-11-17 让开始实现：迭代 K（3.1 节）已完成。用户看过 K 后讨论了 `refactor7.md`：A 部分（op 注册表 `@op_register`）已定，迭代 R（3.0 节）已完成，等用户 review；B 部分（查表分派进 kit）还有 Q77–Q85 待定。I4b、I6 排在这些之后；另有一个待定问题：`ref_moe(raw)` 的调用方（`bench/core.py`、`bench/dist.py` 的 megamoe 参考、两个 MORI 测试）要不要改用 `moe_ref(W)`。
 - **分支**：`/sgl-workspace/pyhip` 的 `refactor/a8w4`。
 - **已有提交**：
   - 迭代 0，安全网：`64ce77c`、`d17f502`（ISA 基线在这个提交上生成）、`4e256d9`。
@@ -25,7 +25,8 @@
   - I4：`47bde29`（计划）、`6c8434c`、`4b9eb2f`、`5e5d9e3`、`e565657`（合并 fp8x4 pack）、`f9d0ca1`（`tp_fmoe` 的 `NUM_XCD`）、`f95a9e6`（文档）。
   - I5：`97eb73e`（计划）、`d306c51`、`3067a2d`、`af9f077`、`89bf081`、`06d3875`（删 `kernels/_launch.py`）、`ff82c3d`（删无用 kernel 参数，有意改 ISA）、`0e7eaee`（文档）、`1d9f8e6`（skills）。
   - K：`77aa77d`（计划）、`3361672`（K0）、`a6862e8`（K1）、`6acef65`（K2）、`b92ecc4`（K3）、`2a8e774`（修 `test_cuda_graph`）、`9859360`（K4）、`2ee2a19`（K5）、`4cb1ded`（文档、skill）。
-- **用户的文件**：未跟踪的 `refactory2.md` 属于用户，不要改，也不要提交。`refactor3.md`–`refactor6.md`（设计稿）同样不提交。
+  - R：`716cc46`（计划）、`8101410`（R0）、`689e112`（R1）、`8735b35`（文档、skill）。
+- **用户的文件**：未跟踪的 `refactory2.md` 属于用户，不要改，也不要提交。`refactor3.md`–`refactor7.md`（设计稿）同样不提交。
 
 ### 0.2 工作方式
 
@@ -108,6 +109,24 @@
 | R1 | a8w4：`_ops.py`；`ref.py` 8 个、`moe.py` 6 个函数加 `@op_register`；`moe.py` 去掉 `collect` 和 F401 导入；`__init__` 导出 `ops`；`test_a8w4_ops.py` 用 `op_tests(ops)`；README | 改前存的 golden（K2 的冻结函数 golden，加 op 级 golden：词汇表、实现顺序、用例、每个用例的配置和原因、meta）逐项相同；生成测试的 ID 不变（`test_a8w4_ops` 加 API 共 529 项）；API 测试；kit 测试；ISA IDENTICAL；单卡 pytest |
 
 改前的基线和脚本在 session 的 `files/r/`（`golden_ops.py`；冻结函数用 `files/k2/golden.py`）。
+
+**实现时定下的细节**（不对再改）：
+
+- R0 留了一个过渡用的 `collect`（建在 `Registry` 上：先 ref、再 test、再其余），让 R0 的提交里 a8w4 仍能用；R1 删掉。
+- `@op_register` 只注册普通函数（`inspect.isfunction`）。注册后函数上有 `kit_op`（op 名）；标签遇到它就报“不是最外层”。
+- 实现名不能以 `_test` / `_check` / `_dims` 结尾：这样 `moe_dyn_test` 早于 `moe_dyn_ref` 时报“先注册 `moe_dyn_ref`”，而不是签名不符。
+- 生成测试的顺序变了：`moe` 的在前（ref.py 里 `moe_ref` 先注册），原来 `collect` 按 `moe.py` 的 import 列表把 `moe_dyn` 放在前面。ID 集合不变。
+
+**结果**：
+
+- [x] R0 `8101410`：`Registry`、`Registry.register`；`Op` 拆成 `_add_test` / `_add_helper` / `_add_impl`，校验失败时回滚。`tests/kit` 13 passed（新增注册规则、两个互不影响的注册表）。a8w4 在过渡的 `collect` 上：K2 golden 和 op 级 golden 都与改前相同；API 测试通过。
+- [x] R1 `689e112`：`_ops.py`；`ref.py` 8 个、`moe.py` 6 个函数加 `@op_register`；删 `collect` 和 `moe.py` 的 F401 导入。验证：
+  - K2 golden（`supported` 20088 点、候选、名字、`lookup_config` 4608、`default_config` 1152、`dyn_config` 1152）与 op 级 golden（词汇表、实现顺序和函数、用例、每个用例的配置和原因、meta）都与改前相同；
+  - 生成测试的 ID 集合相同（529 项）；三个测试文件在一个进程里收集（包被导入两次）得 560 项；
+  - ISA IDENTICAL（558 次编译、177 个 ISA，4 个已有错误）；
+  - API 23 + kit 13 passed；单卡 `test_a8w4_moe.py` + `test_a8w4_ops.py` 391 passed、146 skipped；`tune readme --check` 通过。
+- [x] 文档 `8735b35`：README（文件表、复制到其他工程、8 节、9.3 节）、skill `a8w4-perf-experiment`。设计并进 `refactor7.md` A 部分（不提交）。
+- **验收**：都已满足。
 
 ### 3.1 K：函数级 kit（已完成，设计见 `refactor6.md`）
 
@@ -420,6 +439,7 @@ host 端（`moe._run_tp2k`，G1/G2 唯一的调用方）只用到 gemm1 的 `epi
 | 2026-11-16 | I4 kernel 文件之间不再互相 import | 新增共享模块 `_mma`、`_hw`、`_atomic`、`_kloop`、`_protocol`，扩充 `_cvt`、`_mem`、`_act`；kernel 之间只剩 host 端 `ep_gemm` → `ep_prep`；重复的 helper 和硬件常量各只一份。第 1–3 步和补漏 ISA IDENTICAL；第 4 步有意改 ISA（合并 fp8x4 pack，指令更少，输出逐位相同，NaN 不变、±Inf 更接近 ref，快 0–1.6%）；API 测试 23 passed；单卡 pytest 94 passed、1 skipped | `6c8434c` `4b9eb2f` `5e5d9e3` `e565657` `f9d0ca1` |
 | 2026-11-16 | I5 host 封装改用 `@flydsl_kernel` | 16 个编译函数改成 kernel 对象（`<文件名>_kernel`），op 直接传 tensor，去掉 `_run_compiled`、`current_stream()`、`.data_ptr()`、`functools.cache`；megamoe 构造时绑定 `kern.get()`；删除 `kernels/_launch.py`（实验脚本改用 `experiments/_launch.py`）；删除 TP kernel 的 9 个无用参数。第 1–5 步 ISA IDENTICAL；第 6 步有意改 ISA（kernarg 变短、标量 load 合并），TP4 / TP8 A/B 在噪声内；host 开销每次调用少 6–13 µs；API 测试 23 passed；单卡 pytest 94 passed、1 skipped（含 CHECK 模式）；8 卡 pytest 3 passed | `d306c51` `3067a2d` `af9f077` `89bf081` `06d3875` `ff82c3d` |
 | 2026-11-17 | K 函数级 kit | 新增 `pyhip.kit`（op = 一族同前缀的函数，`@param` / `@requires` / `@meta` / `stack`、`collect`、`op_tests`）；`ref.py` 定义问题（`moe_ref` 读 prepare 后的权重、`moe_test`、`moe_check`、`moe_dims`、`moe_dyn_*`），`moe.py` 的 runner 表改成 6 个实现函数；测试由 op 生成（506 项），tune / verify / bench 都改走 op。冻结 API 的 golden JSON 全部相等；ISA IDENTICAL；查表路径 host 时间少 1–3 µs；tune 候选逐字相同、计时不变；bench 只有 skip 原因变具体、覆盖项受 `@requires` 检查。API 测试 23 passed；单卡 pytest 391 passed、146 skipped；kit 12 passed | `3361672` `a6862e8` `6acef65` `b92ecc4` `2a8e774` `9859360` `2ee2a19` `4cb1ded` |
+| 2026-11-17 | R op 注册表 | `pyhip.kit.Registry` + `@op_register` 逐个注册（名字定角色，注册时校验，失败回滚），取代 `collect`；a8w4 一包一个注册表 `_ops.ops`，ref.py 8 个、moe.py 6 个函数注册，`MOE = ops.moe`。冻结函数 golden 和 op 级 golden 全部相等；生成测试 ID 集合不变（顺序 moe 在前）；包被导入两次时两份注册表互不影响；ISA IDENTICAL；API 23 passed；kit 13 passed；单卡 pytest 391 passed、146 skipped | `716cc46` `8101410` `689e112` `8735b35` |
 
 **I4 的经验**：
 
