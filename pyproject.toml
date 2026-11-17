@@ -22,6 +22,7 @@ fallback_version = "1.0.0"
 packages = [
     "pyhip",
     "pyhip.core",
+    "pyhip.kit",
     "pyhip.contrib",
     "pyhip.contrib.common",
     "pyhip.contrib.gluon",
