@@ -45,7 +45,7 @@ out = a8w4_moe_dyn(x8, W, topk_weights, topk_ids, m_valid, x_scale=x8_scale,
 在包含 `a8w4/` 的目录下运行：
 
 ```bash
-pytest -q a8w4/tests/test_a8w4_moe.py                        # 正确性（gfx942）
+pytest -q a8w4/tests/test_a8w4_ops.py a8w4/tests/test_a8w4_moe.py   # 正确性（gfx942）
 python -m a8w4.tune show   --case mimo-v2.6-flash-tp8         # 查看调优表：每个 token 数选中的配置
 python -m a8w4.tune verify --case mimo-v2.6-flash-ep8         # 按表实际调用：耗时、正确性、与未调优默认值对比
 pytest -q a8w4/tests/test_a8w4_mori_ep8.py                   # 8 卡 EP8 整层：MORI dispatch + a8w4_moe_dyn + MORI combine 对参考实现
@@ -159,7 +159,8 @@ a8w4/
   experiments/                 历次实验：index.csv（一行一个实验）、log_YYYYMMDD.md、各实验目录；_launch.py 是旧实验脚本用的 _run_compiled
   configs/a8w4_moe_tuned.csv   调优表（每个点保存全部候选的耗时）
   configs/README.md            调优表的内容与生成命令
-  tests/test_a8w4_moe.py       pytest
+  tests/test_a8w4_ops.py       pytest：每个实现的每个配置对参考实现，由算子生成（op_tests(OPS)）
+  tests/test_a8w4_moe.py       pytest：参考实现、查表、CUDA graph 等其余性质
   tests/test_a8w4_mori_ep8.py  8 卡 EP8 整层（MORI dispatch → a8w4_moe_dyn → MORI combine）：pytest 查正确性，命令行测性能（8.1 节）
   tests/test_a8w4_mori_tp8.py  8 卡 TP8 整层（a8w4_moe → all-reduce），EP8 脚本的 TP 对照：pytest 查正确性，命令行测性能（8.2 节）
   kernels/                     FlyDSL device 代码
@@ -641,18 +642,21 @@ profile 中的 kernel 名：
 ## 8. 正确性与测试
 
 - **参考实现**：`ref.ref_moe` 是 fp32 参考，按 kernel 的方式模拟 fp8 量化：x 每行量化一次，中间结果每（行, 128 列）量化一次。剩下的差别只来自累加顺序和 bf16 输出。阈值是 cos 差 < 5e-3，实测 1e-5 到 3.5e-4。
-- **`tests/test_a8w4_moe.py`**：本机结果为 94 passed、1 skipped（ep1k 在 600 tokens 时不支持）。覆盖范围：
-  - 每类 kernel 对参考实现，用 TP8 和 EP8 shape；EP 用 rank 3、全局专家 id，tokens 取 1 / 77 / 600；
+- **`tests/test_a8w4_ops.py`**：由算子生成（`test_ops = op_tests(OPS)`，`pyhip.kit.testing`）。每个用例（`ref.moe_test` / `moe_dyn_test` 的网格）× 每个实现的每个配置跑一项：`MOE.run(cfg, **inputs)` 对 `moe_ref` / `moe_dyn_ref`，用 `moe_check` / `moe_dyn_check` 判（bf16、shape、cos 差 < 5e-3）。本机 506 项：360 passed、146 skipped，首次约 3 分钟（编译），之后约 20 秒。
+  - `moe`：tp8 / tp4 / ep8 三个 shape（EP 用 rank 3、全局专家 id）× tokens 1 / 77 / 600 × silu / situv2，配置是全部实现的网格（tp2k / tp1k / tp1kq / ep3k 的 6 个预设 / ep1k）；
+  - `moe_dyn`：EP8 接收缓冲区，容量 512 时有效行数 0 / 1 / 37 / 300，容量 2048 时 1500（TR epilogue）；无效行填 NaN 和随机 id；× bf16 / fp8 分组 scale 输入 × silu / situv2，ep3k 的 6 个预设；
+  - 每个用例另有一项 `...-dims`：`moe_dims(**inputs)` 与用例一致；
+  - skip 的配置是 `@requires` 拒绝的组合，`pytest -rs` 列出原因（如 `g2nt4 needs inter_dim == 256`、`num_tokens=600 > maxm 512`）；
+  - 用 `-k` 挑子集：`-k "ep8 and ep3k"`、`-k tp1k`、`-k situv2`。
+- **`tests/test_a8w4_moe.py`**：本机 31 passed。覆盖生成的测试之外的性质：
+  - 参考实现：`decode_fd2` 还原 fd2 权重（丢弃的低指数组为 0）；`moe_ref` / `moe_dyn_ref`（读 prepare 后的权重）与 `ref_moe`（读 mxfp4 张量）逐位相等；
+  - `w2_exp` 确实是 `w2_scale` 尾部的 view；
   - `a8w4_moe` 查表调用，tokens 包括不在调优点上的值；
   - 调优表的 act key：`lookup_config` 和 `dyn_config` 分别查 silu、situv2 的行；没有 situv2 行的 shape，以及没有 act 列的旧表，退回 silu 行；
+  - situv2 查表用 situv2 的行（EP shape 选中 EP 族），`a8w4_moe` 端到端正确，且 clamp 确实生效；β = 0 时抛 `ValueError`；
   - CUDA graph：capture 期间只选 graph-safe 配置，多次 replay 的结果与 eager 一致；
-  - situv2：
-    - 两个 shape 上的全部配置（tp2k / tp1k / tp1kq，ep3k 的 5 个配置，ep1k）对参考实现；
-    - 查表用 situv2 的行（EP shape 选中 EP 族），`a8w4_moe` 端到端正确；β = 0 时抛 `ValueError`；
-    - `a8w4_moe_dyn`：s16（非 TR）和 m64（TR）两种 epilogue，bf16 / fp8 输入；
-  - `w2_exp` 确实是 `w2_scale` 尾部的 view；
-  - `a8w4_moe_dyn` 对参考实现：bf16 输入和 fp8 分组 scale 输入，容量 512，有效行数 0 / 1 / 37 / 300，无效行填 NaN 和随机 id；
-  - `a8w4_moe_dyn` 的 CUDA graph：估计值 128，一次 capture 后依次用有效行数 64 / 1 / 400 / 0 / 512 replay，结果与 eager 一致；
+  - `a8w4_moe_dyn` 的 CUDA graph：估计值 128，一次 capture 后依次用有效行数 64 / 1 / 400 / 0 / 512 replay，结果正确；
+  - `tp_prep` 对 aiter moe_sorting + quantize_rows；
   - `dyn_config`：只返回支持的 ep3k 配置；TP8 shape（256 个本地专家）抛 `ValueError`。
 - **`tests/test_a8w4_mori_ep8.py`**（8 张 gfx942，需要 mori）：按 sglang `--moe-a2a-backend mori`（normal 模式，IntraNode kernel）的步骤跑一整层 EP8 MoE：aiter 每（token, 128）fp8 量化 → MORI dispatch → `a8w4_moe_dyn` → MORI combine。
   - 参考值：每卡用 fp32 算本卡专家在所有卡 token 上的结果（x 用 dispatch 出去的 fp8 反量化值），再跨卡求和；
