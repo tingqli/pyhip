@@ -436,16 +436,16 @@ ARB 是每个 K-tile 每行 A 的字节数，默认 256。`t16` 的 gemm2 用窄
 
 ### 6.3 tuner（`tune.py`）
 
-- **候选**（`candidates(shape)`，再经 `supported` 过滤）：
+- **候选**（`candidates(shape)`，即 `MOE.candidates`：各实现的网格减去 `@requires` 不支持的点；每个 token 数再按 token 数和 act 过滤一次）：
   - tp2k：bm × g1bcm × g2，共 8 个；
   - tp1k：bcm × ksplit，ksplit 取每个 CTA 256 / 384 / 512 列对应的值；
   - tp1kq；
-  - ep3k 的 6 个配置（`tune.EP_CFGS`）；
+  - ep3k 的 6 个配置（`moe.EP_CFGS`）；
   - ep1k。
   
   过滤后 TP8 有 11 个候选，TP4 有 8 个，EP8 有 15 个。
-- **流程**：每个 token 数跑 `--rounds`（默认 3）轮，每轮重新抽一次路由。小 batch 时本卡的工作量取决于抽到的路由，例如 EP8 1 token 时约 1/3 的抽样没有本地专家。每轮对每个候选：
-  - 先与参考实现比 cos，≥ 5e-3 的判为 BAD 并剔除；
+- **流程**：每个 token 数跑 `--rounds`（默认 3）轮，每轮重新抽一次路由。小 batch 时本卡的工作量取决于抽到的路由，例如 EP8 1 token 时约 1/3 的抽样没有本地专家。每轮的输入由 `ref.moe_test` 生成（`seed` = 101 × token 数 + 轮次），参考结果由 `moe_ref` 算出。每轮对每个候选：
+  - 先 `MOE.run` 跑一次，出错的判为 FAIL；再用 `moe_check` 检查（bf16、shape、cos 差 < 5e-3），不通过的判为 BAD。两者都剔除；
   - 再计时（冷 cache，`--iters` 次取中位数）；
   - 同一轮内各候选交错执行，时钟和功耗的漂移会均匀落到每个候选上。
   

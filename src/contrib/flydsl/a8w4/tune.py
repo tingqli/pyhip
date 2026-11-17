@@ -56,10 +56,7 @@ from .moe import (  # noqa: E402
     config_name,
     default_config,
     lookup_config,
-    parse_config,
-    run_config,
     shape_vocab,
-    supported,
 )
 from .ref import COS_TOL  # noqa: E402
 
@@ -81,11 +78,6 @@ def candidates(shape):
     """Every config worth measuring on ``shape``: the grids of the kernel families
     (``moe.MOE``) minus the structurally unsupported points."""
     return MOE.candidates(shape_vocab(shape))
-
-
-def _situ(act):
-    """SiTUv2 parameters of the tuner (``ref.SITU``); None for SiLU."""
-    return R.SITU if act == "situv2" else None
 
 
 def _key(r):
@@ -130,44 +122,43 @@ def _case(args):
 def tune(shape, e0, tokens, out_path, routing="uniform", iters=20, rounds=3, log=print,
          act="silu", wcopies=R.WCOPIES):
     """Per token count, ``rounds`` rounds, each with a fresh routing draw (at small
-    batches the per-rank work depends on the draw): check every candidate against
-    the reference, time it (candidates interleaved, so clock / power drift hits all
+    batches the per-rank work depends on the draw): run every candidate (``MOE.run``)
+    on the ``ref.moe_test`` inputs, check it against ``moe_ref`` (``moe_check``: a
+    failure is BAD), time it (candidates interleaved, so clock / power drift hits all
     of them; each timed call reads the next of ``wcopies`` weight copies); store the
     median per candidate. ``act``: the experts' activation (its rows are stored under
     that act)."""
     H, I, E, EGl, K = shape
-    situ = _situ(act)
-    W, raw = R.make_weights(E, H, I)
-    nxt = itertools.cycle(R.weight_copies(W, wcopies)).__next__
-    cands = candidates(shape)
-    log(f"shape H{H} I{I} E{E}/{EGl} top{K} e0 {e0} act {act}: {len(cands)} candidates, "
-        f"{wcopies} weight copies")
+    log(f"shape H{H} I{I} E{E}/{EGl} top{K} e0 {e0} act {act}: {len(candidates(shape))} "
+        f"candidates, {wcopies} weight copies")
+    copies = None
     for tok in tokens:
-        names = [config_name(c) for c in cands if supported(c, shape, act=act, tokens=tok)]
-        times = {n: [] for n in names}
-        cos = dict.fromkeys(names, 0.0)
+        cfgs = MOE.candidates(shape_vocab(shape, tok, act))  # the ones that run tok rows of act
+        times = {config_name(c): [] for c in cfgs}
+        cos = dict.fromkeys(times, 0.0)
         bad = {}
         for rnd in range(rounds):
-            x, tw, ti = R.make_routing(tok, H, EGl, K, seed=101 * tok + rnd, routing=routing)
-            ref = R.ref_moe(x, tw, ti, raw, e0, act, situ)
-            for name in names:
+            inputs = R.moe_test(*shape, e0, tok, act=act, routing=routing, seed=101 * tok + rnd)
+            if copies is None:  # moe_test's (cached) weights first, then wcopies - 1 clones
+                copies = itertools.cycle(R.weight_copies(inputs["W"], wcopies)).__next__
+            expected = R.moe_ref(**inputs)
+            for cfg, name in zip(cfgs, times):
                 if name in bad:
                     continue
-                fn = lambda name=name, W=W: run_config(name, x, W, tw, ti,  # noqa: E731
-                                                       expert_offset=e0, num_experts=EGl,
-                                                       act=act, situ=situ)
+                run = lambda W, cfg=cfg: MOE.run(cfg, **dict(inputs, W=W))  # noqa: E731
                 try:
-                    c = R.cos_diff(ref, fn().float())
+                    out = run(inputs["W"])
                 except Exception as ex:  # noqa: BLE001
                     bad[name] = f"FAIL {type(ex).__name__}: {str(ex)[:120]}"
                     continue
-                if not c < COS_TOL:
-                    bad[name] = f"BAD cos {c:.1e}"
+                try:
+                    cos[name] = max(cos[name], R.moe_check(out, expected, **inputs)["cos"])
+                except AssertionError as ex:
+                    bad[name] = f"BAD {ex}"
                     continue
-                cos[name] = max(cos[name], c)
-                times[name].append(R.time_cold(lambda fn=fn: fn(W=nxt()), iters=iters))
+                times[name].append(R.time_cold(lambda run=run: run(copies()), iters=iters))
         rows = []
-        for name in names:
+        for name in times:
             if name in bad:
                 continue
             us = sorted(times[name])[len(times[name]) // 2]
@@ -211,23 +202,20 @@ def verify(shape, e0, tokens, csv_path, routing="uniform", iters=20, log=print, 
            wcopies=R.WCOPIES):
     """``a8w4_moe`` (table lookup) at each token count, also between tuned points:
     cos vs the reference, time vs the table entry and vs the untuned default."""
-    H, I, E, EGl, K = shape
-    situ = _situ(act)
-    W, raw = R.make_weights(E, H, I)
-    nxt = itertools.cycle(R.weight_copies(W, wcopies)).__next__
     pts = dict(_points(csv_path, shape, routing, act))
+    copies = None
     for tok in tokens:
-        x, tw, ti = R.make_routing(tok, H, EGl, K, seed=7 + tok, routing=routing)
-        ref = R.ref_moe(x, tw, ti, raw, e0, act, situ)
+        inputs = R.moe_test(*shape, e0, tok, act=act, routing=routing, seed=7 + tok)
+        if copies is None:
+            copies = itertools.cycle(R.weight_copies(inputs["W"], wcopies)).__next__
+        expected = R.moe_ref(**inputs)
         cfg = lookup_config(shape, tok, act=act, routing=routing, csv_path=csv_path)
-        fn = lambda W=W: a8w4_moe(x, W, tw, ti, expert_offset=e0,  # noqa: E731
-                                  num_experts=EGl, act=act, situ=situ, routing=routing,
-                                  csv_path=csv_path)
-        c = R.cos_diff(ref, fn().float())
-        us = R.time_cold(lambda: fn(nxt()), iters=iters)
+        fn = lambda W=inputs["W"]: a8w4_moe(**dict(inputs, W=W), routing=routing,  # noqa: E731
+                                            csv_path=csv_path)
+        c = R.cos_diff(expected, fn().float())
+        us = R.time_cold(lambda: fn(copies()), iters=iters)
         dflt = default_config(shape, tok, act)
-        dus = R.time_cold(lambda: run_config(dflt, x, nxt(), tw, ti, expert_offset=e0,
-                                             num_experts=EGl, act=act, situ=situ), iters=iters)
+        dus = R.time_cold(lambda: MOE.run(dflt, **dict(inputs, W=copies())), iters=iters)
         n = next((p for p in sorted(pts) if p >= tok), max(pts))
         tus = next(u for u, cc in pts[n] if cc == cfg)
         log(f"tok {tok:6d} -> point {n:6d}: {config_name(cfg):24s} {us:8.1f} us (table {tus:8.1f})"
