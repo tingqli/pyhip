@@ -154,8 +154,8 @@ a8w4/
   _ops.py                      本包的算子注册表 ops = pyhip.kit.Registry("a8w4", table=DEFAULT_CSV, bucket="num_tokens", relax={"act": "silu"}) 和装饰器 op_register；ref.py 注册问题定义，moe.py 注册实现
   moe.py                       a8w4_moe / a8w4_moe_dyn（只处理 M == 0，其余交给算子）；各族的实现函数 moe_<kind>（@op_register 注册；@param 网格、@meta，tp1kq 另有 @no_capture；限制由 kernel 的 assert 检查），算子 MOE = ops.moe、MOE_DYN = ops.moe_dyn（9.3 节）；shape_vocab（工具用：由 shape 元组构造词汇）
   weights.py                   prepare_weights（fd2 权重）、shuffle_mxfp4、weight_shape
-  tune.py                      调优 CLI：tune / merge / show / verify / candidates / tune-all / compare / readme / stats
-  tables.py                    调优表报告：compare（两张表逐点的 winner）、readme（重新生成 / 检查 README 7.2–7.4）、stats（situv2 与 silu）
+  tune.py                      调优 CLI：tune / merge / show / verify / candidates / tune-all / compare / readme / stats；表的读、写、合并、比较在 `pyhip.kit.table`（分派和 tune 共用）
+  tables.py                    调优表报告：compare（`kit.table.compare`，按 shape / act / tokens 列出两张表逐点的 winner）、readme（重新生成 / 检查 README 7.2–7.4）、stats（situv2 与 silu）
   ref.py                       测试与调优用：算子的问题定义（moe_ref 参考实现、moe_test 测试输入、moe_check 判定、moe_dims 读词汇并检查输入；moe_dyn_* 同理）、随机权重和路由、模拟 fp8 量化的 fp32 参考、冷 cache 计时
   megamoe.py                   MegaMoeEpA8W4：EP8 整层（dispatch + 专家 + combine）的单 persistent kernel 封装，用于大 batch
   bench/                       实验工具 python -m a8w4.bench：ab（A/B 计时）、breakdown（每个 kernel 的耗时）、check（正确性）、dist（megamoe 8 卡变体）；core.py 是计时协议和变体写法，dist.py 也是 8 卡测试共用的 helper

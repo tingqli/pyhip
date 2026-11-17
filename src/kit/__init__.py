@@ -104,7 +104,6 @@ The decorators only record themselves in ``f.kit_marks`` (in written order) and 
 ``f`` unchanged. ``pyhip.kit.testing`` turns the ops into pytest tests.
 """
 
-import csv
 import functools
 import inspect
 import itertools
@@ -115,6 +114,8 @@ import sys
 import time
 import types
 from collections.abc import Mapping
+
+from . import table as _table
 
 __all__ = ["param", "no_capture", "meta", "stack", "Registry", "Op"]
 
@@ -232,10 +233,7 @@ def _version(path):
 def _read_table(path, version):
     """(header, rows) of a table file; ``version`` (its mtime) only keys the cache."""
     del version
-    with open(path, newline="") as fh:
-        reader = csv.DictReader(fh)
-        rows = list(reader)
-    return tuple(reader.fieldnames or ()), rows
+    return _table.read(path)
 
 
 _cuda = None  # torch.cuda once CUDA is initialized

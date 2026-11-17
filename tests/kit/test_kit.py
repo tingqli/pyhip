@@ -294,6 +294,37 @@ def test_dispatch(tmp_path):
         pick(n=4, dt="a", table=str(nocols))
 
 
+def test_table(tmp_path):
+    from pyhip.kit import table
+
+    path = str(tmp_path / "t.csv")
+    fields = ("dt", "n", "config", "us", "err")
+    rows = [dict(dt="b", n="16", config="k1", us="2.0", err="0"),
+            dict(dt="a", n="16", config="k1", us="3.0", err="0"),
+            dict(dt="a", n="4", config="k2", us="2.0", err="0"),
+            dict(dt="a", n="4", config="k1", us="1.0", err="0")]
+    table.merge(path, rows, fields)
+    got_fields, got = table.read(path)
+    assert got_fields == fields
+    # sorted by identity without config (numbers as numbers: 4 < 16), then us
+    assert [(r["dt"], r["n"], r["config"]) for r in got] == [
+        ("a", "4", "k1"), ("a", "4", "k2"), ("a", "16", "k1"), ("b", "16", "k1")]
+    table.merge(path, [dict(dt="a", n="4", config="k2", us="0.5", err="1")])  # replaces
+    _, got = table.read(path)
+    assert [(r["config"], r["us"], r["err"]) for r in got[:2]] == [("k2", "0.5", "1"),
+                                                                   ("k1", "1.0", "0")]
+    assert len(got) == 4 and table.identity(fields) == ("dt", "n", "config")
+    with pytest.raises(ValueError, match="config column"):
+        table.identity(("dt", "us"))
+    new = str(tmp_path / "new.csv")
+    table.merge(new, [dict(dt="a", n="4", config="k1", us="0.4", err="0"),
+                      dict(dt="c", n="4", config="k3", us="1.0", err="0")], fields)
+    lines = []
+    assert table.compare(path, new, out=lines.append) == 1
+    assert lines[0].startswith("dt=a n=4  old k2") and "*" in lines[0]
+    assert "(no old row)" in lines[1]
+
+
 def test_marks_return_the_function_in_written_order():
     a, b, c = param("p", (1,)), no_capture("r"), meta(k=1)
 

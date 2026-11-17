@@ -27,7 +27,6 @@ the time). See configs/README.md for the commands that produced the shipped tabl
 """
 
 import argparse
-import csv
 import fcntl
 import glob
 import itertools
@@ -45,6 +44,8 @@ if __package__ in (None, ""):  # run as a script: make the package importable
     __package__ = "a8w4"
 
 import torch  # noqa: E402
+
+from pyhip.kit import table  # noqa: E402
 
 from . import ref as R  # noqa: E402
 from .moe import DEFAULT_CSV, MOE, a8w4_moe, shape_vocab  # noqa: E402
@@ -75,35 +76,10 @@ def candidates(shape):
     return MOE.configs(shape_vocab(shape))
 
 
-def _key(r):
-    return tuple(str(r[k]) for k in ("model_dim", "inter_dim", "experts", "experts_global",
-                                     "topk", "routing", "act", "num_tokens", "config"))
-
-
-def _read_rows(path):
-    """Rows of a table file; rows of files written before the act column are SiLU."""
-    with open(path) as fh:
-        rows = list(csv.DictReader(fh))
-    for r in rows:
-        r["act"] = r.get("act") or "silu"
-    return rows
-
-
-def write_rows(path, new_rows):
-    """Merge rows into ``path`` (same shape / act / point / config replaced), sorted."""
-    old = _read_rows(path) if os.path.exists(path) else []
-    keys = {_key(r) for r in new_rows}
-    rows = [r for r in old if _key(r) not in keys] + list(new_rows)
-    rows.sort(key=lambda r: (int(r["model_dim"]), int(r["inter_dim"]), int(r["experts"]),
-                             int(r["experts_global"]), int(r["topk"]), r["routing"], r["act"],
-                             int(r["num_tokens"]), float(r["us"])))
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w", newline="") as fh:
-        w = csv.DictWriter(fh, fieldnames=FIELDS)
-        w.writeheader()
-        w.writerows(rows)
-    os.replace(tmp, path)
+def merge_rows(path, rows):
+    """Merge rows into the table ``path`` (``kit.table.merge``: a row of the same shape /
+    act / point / config is replaced; sorted)."""
+    table.merge(path, rows, FIELDS)
 
 
 def _case(args):
@@ -163,7 +139,7 @@ def tune(shape, e0, tokens, out_path, routing="uniform", iters=20, rounds=3, log
         msgs = [f"{n}: {m}" for n, m in bad.items()]
         rows.sort(key=lambda r: float(r["us"]))
         if rows:
-            write_rows(out_path, rows)
+            merge_rows(out_path, rows)
         top = " | ".join(f"{r['config']} {r['us']}" for r in rows[:3])
         kinds = sorted(set(na.values()))
         log(f"tok {tok:6d}: {top}" + (f"  [{'; '.join(msgs)}]" if msgs else "")
@@ -217,10 +193,8 @@ def verify(shape, e0, tokens, csv_path, routing="uniform", iters=20, log=print, 
 
 
 def merge(parts, csv_path):
-    rows = []
-    for p in parts:
-        rows += _read_rows(p)
-    write_rows(csv_path, rows)
+    rows = [r for p in parts for r in table.read(p)[1]]
+    merge_rows(csv_path, rows)
     print(f"merged {len(rows)} rows from {len(parts)} files into {csv_path}")
 
 
@@ -267,7 +241,7 @@ def _lock(gpus):
 def tune_all(jobs, gpus, per_job, tokens, out_dir, args, force=False, log=print):
     """Every (act, case) job of ``jobs`` on ``per_job`` GPUs (GPU g of the group takes
     tokens[g::per_job]); groups of ``gpus`` take the next job when they free up. Then the
-    BAD / FAIL lines of all logs and a merged <out_dir>/a8w4_moe_tuned.new.csv."""
+    BAD lines of all logs and a merged <out_dir>/a8w4_moe_tuned.new.csv."""
     if len(gpus) < per_job:
         raise SystemExit(f"--per-job {per_job} needs at least that many --gpus ({gpus})")
     for j in jobs:

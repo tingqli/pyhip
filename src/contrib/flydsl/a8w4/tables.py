@@ -21,6 +21,8 @@ import statistics
 import sys
 from collections import defaultdict
 
+from pyhip.kit import table
+
 from .moe import DEFAULT_CSV, MOE, shape_vocab
 
 README = os.path.join(os.path.dirname(os.path.abspath(__file__)), "README.md")
@@ -35,35 +37,14 @@ def _shape_name(inter, experts, experts_global):
     return f"I{inter}xE{experts}/{experts_global}"
 
 
-def _load(path):
-    """{(H, I, E, E_g, topk, routing, act, tokens): {config: us}}"""
-    t = defaultdict(dict)
-    with open(path) as fh:
-        for r in csv.DictReader(fh):
-            k = (r["model_dim"], r["inter_dim"], r["experts"], r["experts_global"], r["topk"],
-                 r["routing"], r.get("act") or "silu", int(r["num_tokens"]))
-            t[k][r["config"]] = float(r["us"])
-    return t
-
-
 def compare(old_path, new_path):
-    old, new = _load(old_path), _load(new_path)
-    changed = 0
-    for k in sorted(new, key=lambda k: (_shape_name(k[1], k[2], k[3]), k[5], k[6], k[7])):
-        case = _shape_name(k[1], k[2], k[3])
-        nw = min(new[k], key=new[k].get)
-        if k not in old:
-            print(f"{case} {k[6]:6s} {k[7]:5d}  new {nw:28s} {new[k][nw]:8.1f}  (no old row)")
-            continue
-        ow = min(old[k], key=old[k].get)
-        keep = new[k].get(ow)
-        gain = f"{(new[k][nw] / keep - 1) * 100:+5.1f}%" if keep else "  n/a"
-        changed += ow != nw
-        print(f"{case} {k[6]:6s} {k[7]:5d}  old {ow:28s} {old[k][ow]:8.1f}  new {nw:28s} "
-              f"{new[k][nw]:8.1f}  old-cfg-now {keep or float('nan'):8.1f} {gain}"
-              + ("  *" if ow != nw else ""))
-    print(f"\n{changed} of {len(new)} points changed winner (*); old-cfg-now: the old winner's "
-          "time in the new table, the % is what the new winner gains over it")
+    """``kit.table.compare``, points named and ordered by shape, act and tokens."""
+    return table.compare(
+        old_path, new_path,
+        label=lambda p: (f"{_shape_name(p['inter_dim'], p['experts'], p['experts_global'])} "
+                         f"{p['act']:6s} {int(p['num_tokens']):5d}"),
+        order=lambda p: (_shape_name(p["inter_dim"], p["experts"], p["experts_global"]),
+                         p["routing"], p["act"], int(p["num_tokens"])))
 
 
 # =============================================================================
