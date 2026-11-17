@@ -60,12 +60,6 @@ def main():
     # Two EPMoEGfx942 and the MORI op for 16384 tokens/rank outgrow MORI's default symmetric heap.
     os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", "16GiB")
     rank, world = bench.setup()
-    from pyhip.contrib.flydsl import ep_moe_gfx942
-
-    if rank == 0:
-        ep_moe_gfx942.build_kernels()
-    dist.barrier()
-    ep_moe_gfx942.build_kernels()
     layer = bench.make_layer(rank, world, 32, 0)
     mega = bench.Mega(rank, world, layer, args.capacity)
     step1 = bench.Mega(rank, world, layer, args.capacity, mode="step1")

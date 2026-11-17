@@ -309,13 +309,6 @@ def main():
     args = parser.parse_args()
 
     rank, world = setup()
-    if args.mode != "baseline":
-        from pyhip.contrib.flydsl import ep_moe_gfx942
-
-        if rank == 0:
-            ep_moe_gfx942.build_kernels()
-        dist.barrier()
-        ep_moe_gfx942.build_kernels()
     layer = make_layer(rank, world, args.tokens, args.seed, args.routing)
     report, outputs = {}, {}
     if args.mode in ("baseline", "both"):

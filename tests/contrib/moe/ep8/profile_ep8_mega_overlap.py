@@ -56,13 +56,8 @@ def main():
     parser.add_argument("--ep-mode", default="mega", choices=["mega", "step1"])
     args = parser.parse_args()
     rank, world = bench.setup()
-    from pyhip.contrib.flydsl import ep_moe_gfx942
     from pyhip.contrib.flydsl.ep_moe_mega_gfx942 import trace_entries
 
-    if rank == 0:
-        ep_moe_gfx942.build_kernels()
-    dist.barrier()
-    ep_moe_gfx942.build_kernels()
     layer = bench.make_layer(rank, world, args.tokens, args.seed, args.routing)
     mega = bench.Mega(rank, world, layer, args.tokens, args.ep_mode, combine=args.combine)
     op = mega.op

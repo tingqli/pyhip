@@ -23,6 +23,9 @@ ATT 分析和后续优化方向见 [mega_moe_ep8_att.md](mega_moe_ep8_att.md)。
 - 2026-11-13 接入sglang跑MiMo-V2.6-Flash（EP8 prefill，第9节）：输入吞吐比MORI高9.5%–13.6%（fake路由）、
   9.9%–10.7%（真实路由），平均TTFT低9%–11%；GSM8K和MORI一致（0.897对0.902，在同一实现几次运行的波动内）。
   过程中修了`send_info`行号位宽的bug（每卡要收的行超过2^17时卡死）。
+- 2026-11-17 通信kernel（`ep_prep`、`ep_plan`、`ep_dispatch`、`ep_finish`、`ep_combine_fp8`）从HIP换成FlyDSL（第10节）：
+  输出和HIP相同（FP8 combine逐位相同）；每卡4096 token时`ep_prep`快约3 µs，每卡256 token时三个通信kernel合计多不到
+  1 µs（主要是内存模型要求的等待）；8卡一层的差在多次运行之间的波动以内。
 
 ![时间线](images/mega_moe_timeline.png)
 
@@ -264,7 +267,7 @@ ATT 分析和后续优化方向见 [mega_moe_ep8_att.md](mega_moe_ep8_att.md)。
 代码：
 
 - [src/contrib/flydsl/ep_moe_gfx942.py](../../src/contrib/flydsl/ep_moe_gfx942.py)
-- [src/contrib/flydsl/ep_moe_comm_gfx942.cpp](../../src/contrib/flydsl/ep_moe_comm_gfx942.cpp)
+- [src/contrib/flydsl/ep_moe_comm_gfx942.py](../../src/contrib/flydsl/ep_moe_comm_gfx942.py)（当时是HIP的`.cpp`，2026-11-17换成FlyDSL，见第10节）
 - GateUp新增`a_scale_token_major`。
 - Down新增`remote_token_shift`和`moe_down_remote_a8w8_blockscale_gfx942_lds`。
 
@@ -329,7 +332,7 @@ torchrun --nproc_per_node=8 tests/contrib/moe/ep8/bench_ep8_mori_flydsl.py --mod
 
 ### 5.4 step 3实现
 
-代码：[src/contrib/flydsl/ep_moe_mega_gfx942.py](../../src/contrib/flydsl/ep_moe_mega_gfx942.py)，`ep_prep`/`ep_plan`在[ep_moe_comm_gfx942.cpp](../../src/contrib/flydsl/ep_moe_comm_gfx942.cpp)。
+代码：[src/contrib/flydsl/ep_moe_mega_gfx942.py](../../src/contrib/flydsl/ep_moe_mega_gfx942.py)，`ep_prep`/`ep_plan`在[ep_moe_comm_gfx942.py](../../src/contrib/flydsl/ep_moe_comm_gfx942.py)。
 
 每次调用3个kernel：`ep_prep`（1个WG，交换计数、算各expert的起点和每个发送key的起始位置）→ `ep_plan`（128个WG，排好全局发送顺序、写`gu_ids`/`expert_ids`/每个block的期望路由数）→ mega kernel。和第4节设计不同的地方，以及每一步的效果：
 
@@ -488,7 +491,7 @@ torchrun --nproc_per_node=8 tests/contrib/moe/ep8/profile_ep8_mega_overlap.py   
   每个producer wave只在自己那段里按key（目标block在目标队列里的位置）排序。均匀路由下每段只装各expert的同一个block，
   队列位置0的block要等每个wave发完前8个chunk，第一个block的数据约321 µs才到齐（转置之前的trace）。同一个SIMD上第二个
   wave还慢约40%，producer WG要多占CU约200 µs（ATT文档3.5、3.6节）。
-- **做法**（实现文档1.6、3.4、6.2–6.4节；`ep_moe_comm_gfx942.cpp`的`mega_row`、`route_key`、`PLAN_KEY_BASE` /
+- **做法**（实现文档1.6、3.4、6.2–6.4节；`ep_moe_comm_gfx942.py`的`_mega_row`、`_route_key`、`PLAN_KEY_BASE` /
   `PLAN_KEY_CURSOR`，`ep_moe_mega_gfx942.py`的`produce`）：
   - `ep_prep`：本卡发给expert g的路由，行号随序号递增，每个目标block对应一段连续的序号（前`fewest`条有闭式，
     之后二分）；按段把路由数加到key的直方图，前缀和写进`plan`。
@@ -523,8 +526,9 @@ torchrun --nproc_per_node=8 tests/contrib/moe/ep8/profile_ep8_mega_overlap.py   
 - 旧、新版本按ABBA顺序各跑两次：`bench_ep8_mori_flydsl.py --mode mega --iters 300 --warmup 20`，取每个rank的中位数、
   再取最慢的rank，两次平均。两次之间差5–10 µs很常见，小于约5 µs的差别当作没变。
 - 每次运行前后用`amd-smi monitor`确认8卡GFX利用率 ≤ 5%、显存 ≤ 20%：同机另一个容器会间歇地占满GPU。
-- 旧版本用`git archive <提交> src`解到别的目录，用它自己的`PYTHONPATH`，并且设单独的`PYHIP_CACHE_DIR`：pyhip的HIP
-  模块（`ep_moe_comm_gfx942.cpp`）按文件名缓存在`~/.pyhip`，只在源文件更新时重编，不分开的话旧版本会加载新版本编出的`.co`。
+- 旧版本用`git archive <提交> src`解到别的目录，用它自己的`PYTHONPATH`，并且设单独的`PYHIP_CACHE_DIR`：2026-11-17之前
+  的版本里pyhip的HIP模块（`ep_moe_comm_gfx942.cpp`）按文件名缓存在`~/.pyhip`，只在源文件更新时重编，不分开的话旧版本
+  会加载新版本编出的`.co`。
 - 正确性用`--check-alt`（A、B两组输入交替，和step1路径比）：FP8 combine要求逐位相同，BF16允许原子加顺序带来的约1e-5。
 
 ### 8.5 没有采纳的尝试
@@ -654,6 +658,110 @@ cd <sglang fork>/evaluation && BENCHMARK_PRESET=customer_pressure TOKEN_LIST_OVE
 # 精度：用PERFORMANCE_MODE=0启动，然后
 python -m sglang.test.few_shot_gsm8k --data-path <GSM8K test.jsonl> --num-questions 1319 --parallel 128 \
   --host 127.0.0.1 --port 30001
+```
+
+
+## 10. 通信kernel换成FlyDSL（2026-11-17）
+
+`ep_moe_comm_gfx942.cpp`里的5个HIP kernel换成了[ep_moe_comm_gfx942.py](../../src/contrib/flydsl/ep_moe_comm_gfx942.py)里的
+FlyDSL kernel：`ep_prep`、`ep_plan`、`ep_dispatch`（只有step1用）、`ep_finish`、`ep_combine_fp8`。算法、线程数、LDS大小
+和同步协议都不变：
+
+- 全局内存用LLVM的load / store / atomic（i64地址），内存序和HIP一样：计数行是系统范围relaxed store，flag是系统范围
+  release store和acquire load（没等到就`s_sleep 1`），`__threadfence_system()`对应系统范围seq_cst fence，
+  `__syncthreads()`对应workgroup release fence + `s_barrier` + acquire fence。LDS计数是`ds_add_rtn_u32`。
+- `ep_prep`编号时一次发8个`topk_ids`的buffer load（越界读0），代替HIP里带条件的load。HIP每条LDS原子之前的
+  `s_waitcnt vmcnt(0)`还要等上一条`route_idx`的store完成（gfx942的vmcnt也数store），FlyDSL一轮只在第8条之前等一次，
+  每卡4096 token时编号快约3 µs。副作用是各wave不再一步一步齐头并进：同一个expert的编号和token顺序的平均偏差从约1
+  变成约4（两边都只保证是0..n−1的排列），mega kernel的时间看不出差别（见下）。
+- `ep_dispatch`、`ep_combine_fp8`的hidden和topk是编译期常量。FP8 combine用`fx.fma`，和HIP的`v_pk_fma_f32`逐位相同。
+- FlyDSL把`Int32`的`//`展开成有符号除法加向下取整的修正，除数是2的幂也一样，每次多几条指令。算术右移本身就是
+  向下取整的除法，热循环里（expert基址的累加、send key、二分查找）改用移位和掩码（`_div_pow2`、`_round_block`）；
+  照搬`//`时`ep_prep`建表比HIP慢约0.9 µs。
+- `ws`、`sched`、`plan`的布局常量只在这个模块里定义，mega kernel和`EPMoEGfx942`从这里import。没有`build_kernels()`
+  了：FlyDSL kernel在第一次调用时编译或从缓存加载。kernel读的常量都在kernel函数体或模块级helper里
+  （不在kernel里的嵌套函数里），FlyDSL的缓存key包含它们的值，改了会重编（第9.2节第3条的坑）。
+
+验证（FlyDSL 0.4.0；0.3.2即sglang环境也跑了bench和小token测试）：
+
+- **表**：8个rank、均衡和随机路由，`ep_prep` / `ep_plan`的输出和HIP版本逐项相同：计数、`plan`全部976项、`num_valid`、
+  所需行数、`expert_ids`、每个block的expected、`gu_ids`。`route_idx`的编号顺序两边本来就不确定（LDS原子的先后），
+  都是每个expert里0..n−1的排列；[ep_prep_plan.md](ep_prep_plan.md)第5.1节的模型（`--check-model`）逐条路由检查
+  `send_info`和key区间也通过。
+- **FP8 combine**：和HIP逐位相同（每卡1 / 7 / 255 / 4096 token，随机FP8字节，含0和NaN）。
+- **端到端**：和换之前一样。mega和step1（A、B输入交替）比：BF16 combine 1.16e-5，FP8 combine逐位相同；和MORI基线比：
+  BF16 8.9e-6，FP8 6.85e-4；每卡16384 token（行数超过2^17）1.16e-5；小token测试（每卡0–256、空rank）通过。
+- **ISA**：`ep_prep` 978条指令、28 VGPR（HIP 1290条、58），`ep_plan` 772条、35（939条、41），LDS一样大。
+  `ep_combine_fp8`用148 VGPR（HIP 82），每个SIMD只放得下3个wave，但它受带宽限制，实测不慢（见下）。FlyDSL 0.3.2
+  编出的`ep_prep`、`ep_plan`、`ep_finish`、`ep_combine_fp8`和0.4.0逐条相同。
+- **性能**：FlyDSL 0.4.0，HIP版本是上一个提交的git worktree。每次测量前后都查8卡空闲（GFX ≤ 5%、显存 ≤ 20%；
+  这台MI300X上PTL查询返回不支持）。另一个容器的作业经常占卡，测量中途它开始的那次作废重测，原始记录都保留。
+  - 单卡kernel（只有本卡：peer表都指向本卡的`ws`，flag预先置好，交换不等人，只比kernel自己的时间；连续发射200次取平均，
+    两边交替8轮取中位数，µs）。输出和HIP相同（`num_valid`、`expert_ids`、`send_base`、`plan`逐项，`gu_ids`排序后）：
+
+    | 每卡token | `ep_prep` HIP → FlyDSL | `ep_plan` | `ep_finish` |
+    |---|---|---|---|
+    | 64 | 11.82 → 12.03 | 6.64 → 6.68 | 1.66 → 1.84 |
+    | 256 | 12.28 → 12.46 | 6.73 → 6.91 | 1.85 → 2.03 |
+    | 1024 | 13.60 → 13.17 | 6.61 → 6.67 | 1.88 → 2.05 |
+    | 4096 | 18.50 → 15.39 | 6.86 → 6.91 | 1.80 → 2.01 |
+
+    每卡1024 token起FlyDSL更快（编号少等store），4096时`ep_prep`快3.1 µs。每卡 ≤ 256 token时`ep_prep`和`ep_finish`各多约
+    0.2 µs：系统范围的release store和fence里，FlyDSL（LLVM 24）在`buffer_wbl2 sc0 sc1`之后先`s_waitcnt vmcnt(0)`再
+    store或invalidate，这是LLVM AMDGPU内存模型GFX942表里的序列；HIP（ROCm 7.2.4的clang）省掉了这个等待。
+    `ep_plan`多0.04–0.18 µs。
+    FP8 combine（每卡256 / 1024 / 4096 / 16384 token）：7.8 → 7.8、13.8 → 13.6、43.9 → 43.5、193.2 → 192.9 µs，
+    VGPR多不影响。
+  - 8卡一层（第8.4节的方法：ABBA各2次、300次迭代、每个rank取中位数、取最慢的rank、两次平均；这一组是改`//`之前测的，
+    那时`ep_prep`还多约0.9 µs）：
+
+    | 每卡token，配置 | 一层 HIP → FlyDSL（µs） | [prep] | [finish] | 其他 |
+    |---|---|---|---|---|
+    | 4096，随机 | 2413.1 → 2395.6（−17.5） | 71.0 → 68.9（−2.1） | 257.2 → 255.0（−2.2） |  |
+    | 4096，均衡 | 2138.2 → 2143.2（+4.9） | 62.3 → 60.8（−1.5） | 118.8 → 128.4（+9.6） |  |
+    | 4096，随机，FP8 combine | 2383.6 → 2383.0（−0.6） | 62.9 → 60.7（−2.1） | 317.4 → 305.4（−12.0） | combine 80.4 → 80.0 |
+    | 4096，随机，step1（各3次，跨改`//`前后） | 4115.2 → 4073.7（−41.5） | 53.7 → 51.8（−1.8） | 372.9 → 327.7（−45.2） | dispatch 732.9 → 689.7（−43.2） |
+    | 1024，随机 | 872.7 → 873.0（+0.3） | 43.8 → 46.0（+2.2） | 62.9 → 63.9（+1.0） |  |
+    | 1024，均衡 | 746.2 → 736.1（−10.2） | 40.7 → 41.8（+1.1） | 26.9 → 27.7（+0.8） |  |
+    | 256，随机 | 530.1 → 524.3（−5.8） | 39.9 → 41.8（+1.9） | 35.5 → 25.3（−10.2） |  |
+    | 256，均衡 | 510.8 → 525.5（+14.7） | 38.2 → 41.0（+2.8） | 21.3 → 35.3（+14.0） |  |
+
+    一层的差正负都有，和同一实现多次运行之间的差同一量级（每卡256 token均衡时HIP四次相差26 µs）。bench里迭代
+    之间GPU会空等host（loop比total多60–1100 µs，两边都有），各rank开始的时间不齐，[prep]、[mega]、[finish]里
+    等其他rank的时间因此波动。step1的dispatch三次都快（HIP 727.0 / 727.8 / 743.7，FlyDSL 693.4 / 683.6 / 692.2 µs）。
+    改`//`之后在每卡256 token上
+    两边交替各再测4次（FlyDSL均衡有1次三次重试都碰上另一个作业开始，作废）：均衡521.9 → 512.4 µs（HIP 504.6–530.7，
+    FlyDSL 496.1–525.1），[prep] 38.7 → 38.7；随机519.9 → 521.8 µs（HIP 510.3–528.1，FlyDSL 506.8–531.2），
+    [prep] 39.8 → 40.9。上表256均衡的+14.7 µs是波动。FlyDSL 0.3.2（sglang环境，改`//`之后，ABBA各2次）：
+    每卡4096 token随机2389.1 → 2385.1 µs（[prep] 70.4 → 67.1），256 token随机514.3 → 526.5 µs（[prep] 39.2 → 41.0，
+    两边两次各自相差11和3 µs，和上面256 token的波动同一量级）。所有运行的原始记录（含作废的）和单卡数据在
+    [comm_flydsl_ab.json](images/data/comm_flydsl_ab.json)。
+  - 8卡kernel trace（rocprofv3，每次100次迭代，改`//`之后，两边交替各4次）：`ep_prep`、`ep_finish`要等其他rank，
+    取每次调用8个rank里最短的那个（最后到的rank基本不等），另两个kernel同样统计，各次平均，µs，HIP → FlyDSL：
+
+    | 每卡token | `ep_prep` | `ep_plan` | `ep_finish` | mega kernel |
+    |---|---|---|---|---|
+    | 256，均衡 | 18.81 → 19.64 | 7.64 → 7.68 | 4.05 → 4.03 | 424.2 → 425.8 |
+    | 4096，随机 | 43.90 → 40.80 | 9.33 → 9.56 | 4.60 → 4.63 | 2013.6 → 2017.4 |
+
+    mega kernel两边是同一份代码，差在各次之间的波动以内（256均衡HIP 421.5–427.4、FlyDSL 419.7–430.3；4096随机
+    2008.2–2026.8、2004.8–2028.9），编号顺序不同没有可见影响。`ep_prep`在每卡256 token时多0.8 µs（四次都多），
+    比单卡多出的0.2 µs大，4096 token时快3.1 µs；`ep_plan`在4096 token时多0.2 µs。
+
+复现：
+
+```bash
+# 表：每个rank一次调用后的表（ep_prep_plan.md第6节第3步的脚本），和模型逐项比
+python docs/megamoe_ep8_942/images/ep_prep_plan.py /tmp/fonts --check-model <表所在目录>
+# 端到端（再加--combine fp8、--routing balanced、--tokens 16384）
+torchrun --nproc_per_node=8 tests/contrib/moe/ep8/bench_ep8_mori_flydsl.py --mode both --check-alt
+torchrun --nproc_per_node=8 tests/contrib/moe/ep8/test_ep8_small_tokens.py
+# 性能：HIP版本用git worktree检出上一个提交，两边按第8.4节的方法跑
+torchrun --nproc_per_node=8 tests/contrib/moe/ep8/bench_ep8_mori_flydsl.py --mode mega --iters 300 --warmup 20 \
+    --tokens <T> --routing <random|balanced> [--combine fp8] [--ep-mode step1] --json <out>
+# kernel trace：kt.sh是 exec rocprofv3 --kernel-trace --output-format csv -d $KT_DIR/kt_rank$LOCAL_RANK -o kt -- python "$@"
+KT_DIR=<out> torchrun --nproc_per_node=8 --no-python kt.sh tests/contrib/moe/ep8/bench_ep8_mori_flydsl.py --mode mega \
+    --iters 100 --warmup 20 --tokens <T> --routing <random|balanced>
 ```
 
 

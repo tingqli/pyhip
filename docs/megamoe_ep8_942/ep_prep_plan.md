@@ -1,6 +1,6 @@
 # gfx942 EP8 mega MoE：`ep_prep` 和 `ep_plan`
 
-mega kernel 之前有两个小的 HIP kernel：`ep_prep` 和其他 rank 交换路由计数、算出接收端的布局，`ep_plan` 排出 producer 的
+mega kernel 之前有两个小 kernel：`ep_prep` 和其他 rank 交换路由计数、算出接收端的布局，`ep_plan` 排出 producer 的
 发送顺序和本卡的 block 表。本文按步骤画出它们做什么、跨 rank 怎么同步、写出的表给谁用，以及实测耗时（MiMo，8 卡，
 每卡 4096 token × top-8 = 32768 条路由，BF16 combine，2026-11-12）。整体实现见
 [mega_moe_ep8_impl.md](mega_moe_ep8_impl.md)：buffer 在第 1.4–1.6 节，接收端的行布局在第 2.1 节，producer 在第 3.4 节。
@@ -8,8 +8,8 @@ mega kernel 之前有两个小的 HIP kernel：`ep_prep` 和其他 rank 交换�
 
 | 文件 | 内容 |
 |---|---|
-| [ep_moe_comm_gfx942.cpp](../../src/contrib/flydsl/ep_moe_comm_gfx942.cpp) | `mega_row`（[第 49 行](../../src/contrib/flydsl/ep_moe_comm_gfx942.cpp#L49)）、`route_key`（[第 63 行](../../src/contrib/flydsl/ep_moe_comm_gfx942.cpp#L63)）、`ep_prep`（[第 80 行](../../src/contrib/flydsl/ep_moe_comm_gfx942.cpp#L80)）、`ep_plan`（[第 219 行](../../src/contrib/flydsl/ep_moe_comm_gfx942.cpp#L219)） |
-| [ep_moe_gfx942.py](../../src/contrib/flydsl/ep_moe_gfx942.py) | `EPMoEGfx942.forward()`（[第 134 行](../../src/contrib/flydsl/ep_moe_gfx942.py#L134)）：依次下发 `out` 清零、`ep_prep`、`ep_plan`、mega kernel |
+| [ep_moe_comm_gfx942.py](../../src/contrib/flydsl/ep_moe_comm_gfx942.py) | FlyDSL：`_mega_row`（[第 172 行](../../src/contrib/flydsl/ep_moe_comm_gfx942.py#L172)）、`_route_key`（[第 189 行](../../src/contrib/flydsl/ep_moe_comm_gfx942.py#L189)）、`ep_prep`（[第 216 行](../../src/contrib/flydsl/ep_moe_comm_gfx942.py#L216)）、`ep_plan`（[第 399 行](../../src/contrib/flydsl/ep_moe_comm_gfx942.py#L399)）。2026-11-17 之前是 HIP（`ep_moe_comm_gfx942.cpp`），本文的实测时间都是 HIP 版本测的；换成 FlyDSL 后同样输入的表逐项相同，耗时见[设计文档](mega_moe_ep8_design.md)第 10 节 |
+| [ep_moe_gfx942.py](../../src/contrib/flydsl/ep_moe_gfx942.py) | `EPMoEGfx942.forward()`（[第 107 行](../../src/contrib/flydsl/ep_moe_gfx942.py#L107)）：依次下发 `out` 清零、`ep_prep`、`ep_plan`、mega kernel |
 | [images/ep_prep_plan.py](images/ep_prep_plan.py) | 本文的图（`python docs/megamoe_ep8_942/images/ep_prep_plan.py /tmp/fonts`），数据在 [images/data/prep_plan.json](images/data/prep_plan.json) |
 
 步骤编号全文统一：①–⑩ 是 `ep_prep`，⑪–⑯ 是 `ep_plan`。第一次读可以先看第 5.1 节的缩小例子（2 个 rank、每个数都能手算）
@@ -59,14 +59,14 @@ sequenceDiagram
     participant M as rank r 的 mega kernel
     H->>P: quant、out 清零之后（同一个 stream）
     P->>W: ① arrived[ ] = 0
-    P->>P: ② route_idx[r] = atomicAdd(hist[g])（LDS）
+    P->>P: ② route_idx[r] = fetch-add(hist[g])（LDS）
     par 本卡写计数行
         P->>W: ③ C[r][ ] = hist
         P->>O: ③ 同一行也写到它们的 ws
     and 其他 rank 同时写
         O->>W: ③ 它们的 C[s][ ]
     end
-    P->>P: ④ __threadfence_system()
+    P->>P: ④ 系统范围 fence
     par 本卡发 CFLAG
         P->>W: ⑤ CFLAG[r] = epoch（release）
         P->>O: ⑤ CFLAG[r] = epoch
@@ -150,17 +150,18 @@ T = 4096 时 s_cap = 2 × 4096 × 8 + 32 × 256 = 73728（288 个 block）。`pl
 ### 3.1 步骤
 
 1. ① 进入：`status[3]` 记时间戳，LDS 里的 `hist[256]` 清零，本卡 `ws.arrived[0..288)` 清零。
-2. ② 编号（[第 97 行](../../src/contrib/flydsl/ep_moe_comm_gfx942.cpp#L97)）：每轮 8192 条，每个线程 8 条——先发 8 个
-   `topk_ids` 的 load，再依次做 8 次 LDS `atomicAdd(&hist[g], 1)`（`ds_add_rtn_u32`），返回值写到 `route_idx[r]`。
-   32768 条要 4 轮。同一个 expert 的编号大致按 token 顺序，同一轮里的先后不确定；只要求 0 .. C[me][g] − 1 不重不漏。
+2. ② 编号（[第 242 行](../../src/contrib/flydsl/ep_moe_comm_gfx942.py#L242)）：每轮 8192 条，每个线程 8 条——先发 8 个
+   `topk_ids` 的 buffer load（越界读到 0），再依次做 8 次 LDS fetch-add `hist[g]`（`ds_add_rtn_u32`），返回值写到
+   `route_idx[r]`。32768 条要 4 轮。同一个 expert 的编号大致按 token 顺序，同一轮里的先后不确定；只要求
+   0 .. C[me][g] − 1 不重不漏。
 3. ③ 写计数行：2048 次系统范围的 relaxed store（每个线程 2 次），把 `hist[e]` 写到 rank p 的 `ws.C[me][e]`，p = 0..7
-   （包括自己，也走 peer 指针）。ISA 是 `flat_store_dword … sc0 sc1`。
-4. ④ `__threadfence_system()`：`buffer_wbl2 sc0 sc1`（写回本 XCD 的 L2）、等所有 store 完成、`buffer_inv sc0 sc1`；
-   然后 `__syncthreads`。
+   （包括自己，也走 peer 指针）。ISA 是 `global_store_dword … sc0 sc1`。
+4. ④ 系统范围的 seq_cst fence（`_fence_system()`）：`buffer_wbl2 sc0 sc1`（写回本 XCD 的 L2）、等所有 store 完成、
+   `buffer_inv sc0 sc1`；然后 workgroup 屏障（`_sync_threads()`：workgroup release fence、`s_barrier`、acquire fence）。
 5. ⑤ 线程 t（t < 8）：对 rank t 的 `ws.CFLAG[me]` 做系统范围 release store，值是本次的 epoch（又一次 `buffer_wbl2`，
-   再 `flat_store_dword sc0 sc1`）。
+   再 `global_store_dword … sc0 sc1`）。
 6. ⑥ 线程 t（t < 8）：轮询本卡的 `ws.CFLAG[t]` 直到等于 epoch（系统范围 acquire load，之后 `buffer_inv sc0 sc1`，没等到
-   就 `s_sleep 1`）。`__syncthreads` 之后 `status[2]` 记交换完成的时间戳。
+   就 `s_sleep 1`）。屏障之后 `status[2]` 记交换完成的时间戳。
 7. ⑦ 把 8×256 计数读进 LDS。线程 g（g < 256）算 total[g]、fewest[g]，以及排在本卡之前的源发给 g 的路由数 sbase[g]；
    再算 base[g] = 同一目标 rank 上前面各 expert 的 ⌈total / 256⌉ · 256 之和（逐项累加，最多 31 项），每个目标 rank 的最后
    一个 expert 顺便写 rows[d]；`send_base[g] = base[g] + sbase[g]`（step1 路径用的连续排布）。
@@ -250,11 +251,11 @@ T = 4096 时 s_cap = 2 × 4096 × 8 + 32 × 256 = 73728（288 个 block）。`pl
 2. ⑫ WG j 处理本卡路由 [per·j, per·j + per)，per = ⌈路由数 / 128⌉（32768 条时 256，每个线程 1 条；最多 1024，
    `forward()` 里有 assert）。每条路由：g = `topk_ids[r]`；row = `mega_row(g, route_idx[r], me)`（慢路径直接读显存里的
    `ws.C`）；info = row | g << 19，row ≥ s_cap 时是 −1（这条路由丢掉）；key = `route_key(g, row)`。
-3. ⑬ rank = `atomicAdd(&key_count[key], 1)`（LDS）：这条路由在本 WG 这个 key 里的序号。
+3. ⑬ rank = LDS fetch-add `key_count[key]`：这条路由在本 WG 这个 key 里的序号。
 4. ⑭ 线程 k（k < 64）：本 WG 在 key k 有 n > 0 条，就对全局的 `key_cursor[k]` 原子加 n；返回值加上 `key_base[k]` 是本 WG
    在 key k 里那一段的起点。
 5. ⑮ at = 起点 + rank；`send_route[at] = r`，`send_info[at] = info`。
-6. ⑯ 本卡的 block（[第 258 行](../../src/contrib/flydsl/ep_moe_comm_gfx942.cpp#L258)）：blocks = min(rows[me], s_cap) / 256，
+6. ⑯ 本卡的 block（[第 460 行](../../src/contrib/flydsl/ep_moe_comm_gfx942.py#L460)）：blocks = min(rows[me], s_cap) / 256，
    WG j 做 b = j, j + 128, …（128 个 block 时每个 WG 一个）。逐项扫 base 找 block 属于哪个本地 expert e；
    n = min(256, total[g] − (256b − base[g]))；线程 0 写 `expert_ids[b] = e`、`expected[b] = n`；每个线程一行：`gu_ids` 是
    行号或 −1，padding 行的 `down_ids` 写 −1。
@@ -388,12 +389,12 @@ torchrun --nproc_per_node=8 --no-python /tmp/prep/kt_all.sh tests/contrib/moe/ep
 python docs/megamoe_ep8_942/images/ep_prep_plan.py /tmp/fonts --from-dir /tmp/prep --check-model /tmp/prep
 ```
 
-- 第 2 步（脚本不在仓库里）：复制 `ep_moe_comm_gfx942.cpp`，在 `ep_prep` 里加 3 个时间戳：编号循环后的 `__syncthreads()`
-  之后 `status[5]`，④ 的 `__syncthreads()` 之后 `status[6]`，建表后的 `__syncthreads()`（⑨ 之前）之后 `status[7]`，都是
-  `if (tid == 0) status[i] = __builtin_amdgcn_s_memrealtime();`。用 `@pyhip.module` 编译这个副本，替换
-  `ep_moe_gfx942.ep_prep` 后跑 bench 的 `Mega`（预热 10 次、测 60 次），每次调用后取 `status`，以 `status[2]`（交换完成）
-  为 0 换算成 µs（100 MHz）。JSON 是 `{"routing", "iters", "ranks": [8 个 rank 的 [{entry, route_idx, counts, exchange,
-  tables, exit}, …]]}`。
+- 第 2 步（脚本不在仓库里）：在 `_compile_ep_prep` 的一个副本里加 3 个时间戳：编号循环后的 `_sync_threads()` 之后
+  `status[5]`，④ 的 `_sync_threads()` 之后 `status[6]`，建表后的 `_sync_threads()`（⑨ 之前）之后 `status[7]`，都是
+  `if tid == 0: _store(_addr(pStatus, i), _clock())`。替换 `ep_moe_gfx942.ep_prep` 后跑 bench 的 `Mega`（预热 10 次、测 60
+  次），每次调用后取 `status`，以 `status[2]`（交换完成）为 0 换算成 µs（100 MHz）。JSON 是 `{"routing", "iters", "ranks":
+  [8 个 rank 的 [{entry, route_idx, counts, exchange, tables, exit}, …]]}`。本文的数据是 HIP 版本时这样测的（复制 `.cpp`、
+  用 `@pyhip.module` 编译）。
 - 第 3 步（脚本不在仓库里）：跑 3 次调用后，每个 rank 把 `topk_ids`、`ws[:2048]`（计数）、`plan`、`route_idx`、
   `send_route`、`send_info`、`num_valid`、`expert_ids`、`sched`、`gu_ids`、`status` 拷到 CPU，`all_gather_object` 后 rank 0
   用 `torch.save` 存成 8 个 dict 的 list。

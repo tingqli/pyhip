@@ -29,7 +29,7 @@ KERNELS = (("dynamic_per_group_scaled_quant", "quant"), ("FillFunctor", "fill"),
            ("ep_plan", "ep_plan"), ("mega_kernel", "mega"))
 PHASES = ("entry", "route_idx", "counts", "exchange", "tables", "exit")
 PLAN_KEY_BASE = 3 * 256 + 8 + 8 * 9
-# send_info = destination row | global expert << ROW_BITS (ep_moe_comm_gfx942.cpp).
+# send_info = destination row | global expert << ROW_BITS (ep_moe_comm_gfx942.py).
 ROW_BITS = 19
 DARK = "#333333"
 COL = dict(quant="#9E9E9E", fill="#C9C9C9", plan="#F5A623", mega="#4C9BE8")

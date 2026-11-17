@@ -18,43 +18,15 @@ import mori.shmem as ms
 import torch
 from mori.shmem import mori_shmem_create_tensor
 
-import pyhip
-
-from .ep_moe_mega_gfx942 import ARRIVED, ROW_BITS, SCHED_EXPECTED, ep_mega
+from .ep_moe_comm_gfx942 import (
+    ARRIVED, E_LOCAL, NPES, PLAN_INTS, ROW_BITS, SCHED_EXPECTED, ep_combine_fp8, ep_dispatch, ep_finish, ep_plan,
+    ep_prep,
+)
+from .ep_moe_mega_gfx942 import ep_mega
 from .moe_down_a8w8_blockscale_gfx942_lds import moe_down_remote_a8w8_blockscale_gfx942_lds
 from .moe_gateup_a8w8_blockscale_gfx942_lds import SORT_BLOCK_M, moe_gateup_a8w8_blockscale_gfx942_lds
 
-_SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ep_moe_comm_gfx942.cpp")
-NPES, E_LOCAL = 8, 32
 GATEUP_LAYOUT, DOWN_LAYOUT = "2x4_pf1", "4x2_pf1"
-
-
-@pyhip.module(_SRC)
-def ep_prep(topk_ids, num_routes, me, epoch, route_idx, ws, ws_peers, send_base, num_valid, s_cap, status, sched, plan): ...
-
-
-@pyhip.module(_SRC)
-def ep_plan(topk_ids, route_idx, num_routes, me, s_cap, plan, ws, send_route, send_info, gu_ids, down_ids, expert_ids,
-            sched): ...
-
-
-@pyhip.module(_SRC)
-def ep_dispatch(x, x_scale, topk_ids, topk_w, route_idx, send_base, num_routes, topk, hidden, me, epoch, token_shift, s_cap,
-                a_peers, s_peers, id_peers, w_peers, ws, ws_peers, status): ...
-
-
-@pyhip.module(_SRC)
-def ep_finish(me, epoch, ws, ws_peers): ...
-
-
-@pyhip.module(_SRC)
-def ep_combine_fp8(comb, comb_scale, out, num_tokens, topk, hidden): ...
-
-
-def build_kernels():
-    """Compile the HIP kernels once (call on one rank before the others load them)."""
-    for k in (ep_prep, ep_plan, ep_dispatch, ep_finish, ep_combine_fp8):
-        k.build()
 
 
 class EPMoEGfx942:
@@ -113,7 +85,7 @@ class EPMoEGfx942:
         self.send_route = torch.empty(self.tcap * topk, dtype=torch.int32, device=dev)
         self.send_info = torch.empty(self.tcap * topk, dtype=torch.int32, device=dev)
         # ep_prep -> ep_plan tables, then the base and the cursor of each of the 64 send keys.
-        self.plan = torch.empty(3 * NPES * E_LOCAL + NPES + NPES * 9 + 2 * 64, dtype=torch.int32, device=dev)
+        self.plan = torch.empty(PLAN_INTS, dtype=torch.int32, device=dev)
         # ep_plan: one workgroup per slice of up to 1024 routes.
         self.slices = producers * 8
         assert self.tcap * topk <= self.slices * 1024, "too many routes per ep_plan slice"
@@ -144,21 +116,21 @@ class EPMoEGfx942:
         if self.combine == "bf16":
             out.zero_()
         routes = T * self.topk
-        ep_prep([1], [1024], topk_ids, routes, self.rank, self.epoch, self.route_idx, self.ws, t["ws"], self.send_base,
+        ep_prep(topk_ids, routes, self.rank, self.epoch, self.route_idx, self.ws, t["ws"], self.send_base,
                 self.num_valid, self.s_cap, self.status, self.sched, self.plan)
-        ep_plan([self.slices], [256], topk_ids, self.route_idx, routes, self.rank, self.s_cap, self.plan, self.ws,
+        ep_plan(self.slices, topk_ids, self.route_idx, routes, self.rank, self.s_cap, self.plan, self.ws,
                 self.send_route, self.send_info, self.gu_ids, self.down_ids, self.expert_ids, self.sched)
         self._mark("prep")
         if self.mode == "mega":
             ep_mega(self, x_fp8, x_scale, topk_w, self.producers, self.lag, self.xcd_queues, self.relaxed, self.persistent,
                     self.queue_order, self.tasks_per_wg, self.trace, self.transpose_scales)
             self._mark("mega")
-            ep_finish([1], [64], self.rank, self.epoch, self.ws, t["ws"])
+            ep_finish(self.rank, self.epoch, self.ws, t["ws"])
             self._mark("finish")
             return self._combine(out)
-        ep_dispatch([self.dispatch_wgs], [256], x_fp8, x_scale, topk_ids, topk_w, self.route_idx, self.send_base, routes,
-                    self.topk, self.hidden, self.rank, self.epoch, self.token_shift, self.s_cap, t["recv_a"], t["recv_scale"],
-                    t["down_ids"], t["recv_w"], self.ws, t["ws"], self.status)
+        ep_dispatch(self.dispatch_wgs, x_fp8, x_scale, topk_ids, topk_w, self.route_idx, self.send_base, routes,
+                    self.topk, self.hidden, self.rank, self.epoch, self.token_shift, self.s_cap, t["recv_a"],
+                    t["recv_scale"], t["down_ids"], t["recv_w"], self.ws, t["ws"], self.status)
         self._mark("dispatch")
         fp8 = x_fp8.dtype
         recv_a, recv_scale, out_table = self.recv_a, self.recv_scale, t["out"]
@@ -182,7 +154,7 @@ class EPMoEGfx942:
             scale_table=t["comb_scale"] if self.combine == "fp8" else None,
         )
         self._mark("down")
-        ep_finish([1], [64], self.rank, self.epoch, self.ws, t["ws"])
+        ep_finish(self.rank, self.epoch, self.ws, t["ws"])
         self._mark("finish")
         return self._combine(out)
 
@@ -190,7 +162,7 @@ class EPMoEGfx942:
         """FP8 combine: sum each token's slots into out (every route's row is in comb once ep_finish returned)."""
         if self.combine == "fp8":
             T, H = out.shape
-            ep_combine_fp8([-(-T * H // 16 // 256)], [256], self.comb, self.comb_scale, out, T, self.topk, H)
+            ep_combine_fp8(self.comb, self.comb_scale, out, T, self.topk, H)
             self._mark("combine")
         return out
 

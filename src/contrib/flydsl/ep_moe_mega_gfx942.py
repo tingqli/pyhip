@@ -3,7 +3,7 @@
 
 """gfx942 EP8 MoE mega kernel: dispatch, GateUp and Down (with the combine) in one launch.
 
-See docs/megamoe_ep8_942/mega_moe_ep8_design.md. ep_prep (ep_moe_comm_gfx942.cpp) runs first and builds the plan.
+See docs/megamoe_ep8_942/mega_moe_ep8_design.md. ep_prep and ep_plan (ep_moe_comm_gfx942) run first and build the plan.
 Workgroups take task tickets from per-XCD queues (persistent: one workgroup per CU taking tickets until the queues
 are empty). A workgroup takes a ticket only when it is running and its current task (if any) waits for nothing more,
 and a task only waits for lower tickets of its queue or for data that sources push without waiting, so the grid
@@ -30,16 +30,11 @@ from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
+from .ep_moe_comm_gfx942 import ARRIVED, E_LOCAL, NPES, ROW_BITS, SCHED_EXPECTED
 from .helpers import atomic_add_i32, buffer_rsrc_at, fence, load_i32_atomic, run_compiled, spin_wait_ge
 from .moe_down_a8w8_blockscale_gfx942_lds import down_task_emitter
 from .moe_gateup_a8w8_blockscale_gfx942_lds import OOB_OFFSET, SORT_BLOCK_M, _load_i32, _rsrc_of, _uniform, gateup_task_emitter
 
-# Must match ep_moe_comm_gfx942.cpp. ws: ... then arrived [blocks]; sched: tickets, expected [blocks], done [blocks],
-# scaled [blocks].
-NPES, E_LOCAL = 8, 32
-ARRIVED = NPES * NPES * E_LOCAL + 3 * NPES
-SCHED_EXPECTED = 16
-ROW_BITS = 19
 # Routes per producer wave between two signals.
 CHUNK = 8
 # sc0 nt sc1: written through to the destination, so a vmcnt wait covers visibility before the signal.

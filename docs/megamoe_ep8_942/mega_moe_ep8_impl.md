@@ -10,7 +10,7 @@
 | 文件 | 内容 |
 |---|---|
 | [ep_moe_gfx942.py](../../src/contrib/flydsl/ep_moe_gfx942.py) | `EPMoEGfx942`：分配对称堆 buffer，`forward()` 按顺序发各个 kernel |
-| [ep_moe_comm_gfx942.cpp](../../src/contrib/flydsl/ep_moe_comm_gfx942.cpp) | HIP kernel：`ep_prep`（交换计数）、`ep_plan`（发送顺序、block 表）、`ep_finish`、`ep_combine_fp8` |
+| [ep_moe_comm_gfx942.py](../../src/contrib/flydsl/ep_moe_comm_gfx942.py) | 通信 kernel（FlyDSL，2026-11-17 之前是 HIP）：`ep_prep`（交换计数）、`ep_plan`（发送顺序、block 表）、`ep_dispatch`（只有 step1）、`ep_finish`、`ep_combine_fp8`；`ws` / `sched` / `plan` 的布局常量也在这里 |
 | [ep_moe_mega_gfx942.py](../../src/contrib/flydsl/ep_moe_mega_gfx942.py) | mega kernel（FlyDSL）：领票、producer、GateUp 任务、Down 任务 |
 | [moe_gateup_a8w8_blockscale_gfx942_lds.py](../../src/contrib/flydsl/moe_gateup_a8w8_blockscale_gfx942_lds.py) / [moe_down_a8w8_blockscale_gfx942_lds.py](../../src/contrib/flydsl/moe_down_a8w8_blockscale_gfx942_lds.py) | 一个 GateUp / Down 任务的代码（`gateup_task_emitter` / `down_task_emitter`），和单独跑的 kernel 共用 |
 | [tests/contrib/moe/ep8/](../../tests/contrib/moe/ep8/) | bench、trace、通信遮盖 profile、ATT 分析脚本 |
@@ -362,13 +362,13 @@ K 循环、LDS 布局、两组 wave 错开一个 barrier 的流水线和单独�
 | 变量 | 含义 | 清零 / 初值 | 谁写（怎么写） | 谁等 | 等到多少 | 说明 |
 |---|---|---|---|---|---|---|
 | `ws.C[s][g]` | 源 rank s 发给 global expert g 的路由数 | 每次覆盖 | rank s 的 `ep_prep`：对 8 个 rank 的 `ws` 做 relaxed 系统范围 store | 不直接等，由 CFLAG 保护 | — | 每个 rank 读全矩阵算行号和 block 表 |
-| `ws.CFLAG[s]` | rank s 的计数行已经写到我这里 | 不清零，存 epoch | rank s 的 `ep_prep`：`__threadfence_system` 后系统范围 release store | 每个 rank 的 `ep_prep`（1 个 WG，8 个线程各等一个 s） | == epoch（8 个都到） | 也给 `out` 清零加了顺序：`ep_prep` 的系统 fence 把清零写回显存，别的 rank 看到 CFLAG 之后才可能往 `out` 加 |
+| `ws.CFLAG[s]` | rank s 的计数行已经写到我这里 | 不清零，存 epoch | rank s 的 `ep_prep`：系统范围 seq_cst fence 后系统范围 release store | 每个 rank 的 `ep_prep`（1 个 WG，8 个线程各等一个 s） | == epoch（8 个都到） | 也给 `out` 清零加了顺序：`ep_prep` 的系统 fence 把清零写回显存，别的 rank 看到 CFLAG 之后才可能往 `out` 加 |
 | `ws.arrived[b]` | 本卡 block b 已写到的路由数 | 本卡 `ep_prep` 写 0，在发 CFLAG 之前 | 8 个源 rank 的 producer：一个 chunk 的 P2P store `s_waitcnt vmcnt(0)` 之后，每条路由一次系统范围原子加 1 | 本卡 GateUp(b, 0) 的 wave 0：系统范围 load 自旋（`s_sleep 2`），等到后 `buffer_inv sc0`，WG barrier | ≥ `expected[b]`（满 block 为 256） | 源 rank 要先等齐 8 个 CFLAG 才会启动 mega kernel，所以不会加在清零之前 |
 | `sched.ticket[q]` | 队列 q 的下一张票 | `ep_prep` 写 0 | 任何 WG 的 wave 0 lane 0：设备范围原子加 1（领票和预领） | 没人等；领票前用普通 load 看哪些队列还有票 | < 514 才有效 | 每个 XCD 一个计数，避免全卡一个热点 |
 | `sched.expected[b]` | block b 应收的路由数 | `ep_plan` 写 | `ep_plan`（普通 store） | GateUp 任务读（不等） | — | 只等自己这个 block，不等整个 expert |
 | `sched.done[b]` | block b 已完成的 GateUp tile 数 | `ep_prep` 写 0 | GateUp(b, n) 的 wave 0 lane 0：`a2` 写穿透、`s_waitcnt vmcnt(0)`、barrier 之后，设备范围原子加 1 | 本卡 Down(b, *) 的 wave 0：设备范围 load 自旋，等到后 `buffer_inv sc0`，WG barrier | ≥ 16（NG） | 数据都在本卡显存，本卡 L2 对本卡显存靠 probe 保持一致，所以只需失效 L1 |
 | `sched.scaled[b]` | block b 的 A scale 已转置到 `recv_scale_t` | `ep_prep` 写 0 | GateUp(b, 0) 的 wave 0 lane 0：转置写穿透、`s_waitcnt vmcnt(0)`、barrier 之后，设备范围原子加 1 | 本卡 GateUp(b, 1..15) 的 wave 0：设备范围 load 自旋，等到后 `buffer_inv sc0`，WG barrier | ≥ 1 | tile 0 置位前已经等到 `arrived[b]`，所以其余 tile 不用再等 `arrived` |
-| `ws.FFLAG[s]` | rank s 的 mega kernel 已结束（它往各卡 `out` 的原子加都完成了） | 不清零，存 epoch | rank s 的 `ep_finish`：`__threadfence_system` 后对 8 个 rank 系统范围 release store | 每个 rank 的 `ep_finish`（8 个线程） | == epoch（8 个都到） | 之后 `out` 可以用 |
+| `ws.FFLAG[s]` | rank s 的 mega kernel 已结束（它往各卡 `out` 的原子加都完成了） | 不清零，存 epoch | rank s 的 `ep_finish`：系统范围 seq_cst fence 后对 8 个 rank 系统范围 release store | 每个 rank 的 `ep_finish`（8 个线程） | == epoch（8 个都到） | 之后 `out` 可以用 |
 | LDS 票号 | WG 内广播 (队列, 票号) | — | wave 0 写 LDS | 全部 wave | barrier | 前后各一个 barrier，避免和任务的 LDS 冲突 |
 | `ws.DFLAG[s]`、`status[0]` | step1 的 dispatch 完成标志、完成的 WG 数 | | `ep_dispatch` | `ep_dispatch` 的最后一个 WG | | mega 路径不用 |
 
@@ -578,7 +578,7 @@ rank 0 一次调用的 trace，304 个 CU 的平均（kernel span 2119 µs）：
 
 两种 combine 只在 Down 的 epilogue 和之后的求和上不同。dispatch、GateUp、Down 的主循环一样，路由权重也都在 Down 的
 epilogue 里乘上（× `recv_w`）。代码在 [moe_down_a8w8_blockscale_gfx942_lds.py](../../src/contrib/flydsl/moe_down_a8w8_blockscale_gfx942_lds.py)
-epilogue 的 `atomic` / `fp8_routes` 两个分支，以及 [ep_moe_comm_gfx942.cpp](../../src/contrib/flydsl/ep_moe_comm_gfx942.cpp) 的
+epilogue 的 `atomic` / `fp8_routes` 两个分支，以及 [ep_moe_comm_gfx942.py](../../src/contrib/flydsl/ep_moe_comm_gfx942.py) 的
 `ep_combine_fp8`。
 
 | | BF16 combine（默认） | FP8 combine（`--combine fp8`） |
