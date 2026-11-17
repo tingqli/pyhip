@@ -45,9 +45,9 @@ returns it unchanged, after checking it against the conventions below:
 * The name gives the role. ``<op>_ref`` defines op ``<op>`` and is registered first.
   Any other ``<op>_<suffix>`` joins the registered op with the longest such prefix
   (``moe_dyn_ep3k`` belongs to ``moe_dyn`` once ``moe_dyn_ref`` is registered): suffix
-  ``test`` / ``check`` / ``dims`` is that role, any other suffix an implementation.
-  ``<op>_test`` comes before the implementations (their limits are checked against its
-  vocabulary).
+  ``test`` / ``check`` / ``dims`` / ``fallback`` is that role, any other suffix an
+  implementation. ``<op>_test`` comes before the implementations and ``<op>_fallback``
+  (they are checked against its vocabulary).
 * One registry per package (a small module holding ``ops = Registry()``, imported by
   the modules that register): a package imported under two names keeps two registries.
 
@@ -66,30 +66,57 @@ Conventions:
   dict of error metrics. Default: ``torch.testing.assert_close``. The first two
   arguments come by position: name them apart from the interface's parameters.
 * ``<op>_dims(...)`` takes the ref's parameters and returns vocabulary values.
-* Suffixes ``ref``, ``test``, ``check``, ``dims`` are reserved; an implementation name
-  does not end in ``_test`` / ``_check`` / ``_dims`` either. Names starting with ``_``
-  are not registered.
+* ``<op>_fallback(...)`` (optional) takes vocabulary names (and ``capturing``) and
+  returns configs (dicts or names) in order of preference, tried when the tuned table
+  has none that can run. Default: the grid points in definition order.
+* Suffixes ``ref``, ``test``, ``check``, ``dims``, ``fallback`` are reserved; an
+  implementation name does not end in ``_test`` / ``_check`` / ``_dims`` / ``_fallback``
+  either. Names starting with ``_`` are not registered.
 
 A config is a dict ``{"kind": kind, knob: value, ...}``. Its name joins the kind and the
 ``@param`` ids with spaces (``"tiled b64"``), overrides appended as ``":k=v,k=v"``.
+
+Dispatch: ``Registry(name, table=path, bucket=name, relax={name: value})`` declares a
+tuned table for its ops. ``op(*args, **kwargs)`` reads the vocabulary of the call
+(``<op>_dims``, plus keyword arguments that are vocabulary names: hints such as
+``routing=``), picks a config (``op.pick``) and runs it; ``config=`` forces one
+(unchecked), ``table=`` another table (None: none). ``op.pick(vocab, table=,
+capturing=)``:
+
+* The table is a CSV. Columns that are vocabulary names are keys, except the bucket
+  column; ``config`` holds a config name, ``us`` its time; other columns are ignored.
+  Rows of kinds that are not implementations of the op are skipped. A key that is None
+  in ``vocab`` matches the ``<op>_test`` default.
+* The rows of ``vocab``'s key (if none: the key with ``relax`` substituted), at the first
+  tuned point of the bucket >= ``vocab[bucket]`` (the largest point beyond): the first
+  config, fastest first, that meets its limits (``capturing`` included); then the
+  ``<op>_fallback`` configs; else ValueError with the reasons.
+* Memoized per (table, its mtime, vocabulary values, capturing): the returned dict is
+  shared, do not modify it.
 
 The decorators only record themselves in ``f.kit_marks`` (in written order) and return
 ``f`` unchanged. ``pyhip.kit.testing`` turns the ops into pytest tests.
 """
 
+import csv
+import functools
 import inspect
 import itertools
 import operator
+import os
 import re
 import string
+import sys
 import types
 from collections.abc import Mapping
 
 __all__ = ["param", "requires", "meta", "stack", "Registry", "Op"]
 
-ROLES = ("ref", "test", "check", "dims")
+ROLES = ("ref", "test", "check", "dims", "fallback")
 _FIELD = re.compile(r"\{[^{}]*\}")
 _NAMED = (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+_DEFAULT = object()  # table=: the registry's
+_MEMO_MAX = 4096
 
 
 class _Mark:
@@ -162,6 +189,40 @@ def _convert(s, default):
 
 def _unknown(names, known):
     return sorted(set(names) - set(known))
+
+
+def _cell(s, default):
+    """A table cell, typed like the ``<op>_test`` default (int / float / str without)."""
+    try:
+        return _convert(s, default)
+    except (TypeError, ValueError):
+        return _guess(s)
+
+
+def _version(path):
+    """Cache key of a table file: its mtime (None: no table)."""
+    try:
+        return os.stat(path).st_mtime if path else None
+    except OSError:
+        return None
+
+
+@functools.lru_cache(maxsize=16)
+def _read_table(path, version):
+    """(header, rows) of a table file; ``version`` (its mtime) only keys the cache."""
+    del version
+    with open(path, newline="") as fh:
+        reader = csv.DictReader(fh)
+        rows = list(reader)
+    return tuple(reader.fieldnames or ()), rows
+
+
+def _capturing():
+    """Whether the current CUDA stream is capturing a graph (False without torch or
+    before CUDA is initialized: nothing can capture then)."""
+    torch = sys.modules.get("torch")
+    return bool(torch is not None and torch.cuda.is_initialized()
+                and torch.cuda.is_current_stream_capturing())
 
 
 class param(_Mark):
@@ -359,35 +420,46 @@ class Op:
     """One op: its functions and the queries tools need. Built by ``Registry.register``
     one function at a time; read-only otherwise.
 
-    Attributes: ``name``, ``ref``, ``test``, ``check``, ``dims`` (None when absent),
-    ``impls`` ({kind: function}), ``vocab`` (the ``<op>_test`` parameter names). A
+    Attributes: ``name``, ``ref``, ``test``, ``check``, ``dims``, ``fallback`` (None when
+    absent), ``impls`` ({kind: function}), ``vocab`` (the ``<op>_test`` parameter names). A
     ``vocab`` argument is a dict {name: value} holding every vocabulary name (None:
     unknown; the limits that need it are skipped).
     """
 
-    __slots__ = ("name", "ref", "test", "check", "dims", "impls", "vocab", "_imp", "_fns",
-                 "_axes", "_test_defaults", "_ref_params")
+    __slots__ = ("name", "ref", "test", "check", "dims", "fallback", "impls", "vocab", "_imp",
+                 "_fns", "_axes", "_test_defaults", "_ref_params", "_ref_names", "_registry",
+                 "_fallback", "_vget", "_blank", "_tables", "_memo")
 
-    def __init__(self, name, ref):
+    def __init__(self, name, ref, registry=None):
         ref_params = list(inspect.signature(ref).parameters.values())
         if not all(p.kind in _NAMED for p in ref_params):
             raise TypeError(f"{_sig(name, 'ref', ref)}: the interface takes named parameters "
                             "only (no '/', *args, **kwargs)")
         if _marks(ref):
             raise TypeError(f"{name}_ref: only implementations and {name}_test take kit marks")
+        taken = [p.name for p in ref_params if p.name in ("config", "table")]
+        if taken:
+            raise TypeError(f"{_sig(name, 'ref', ref)}: {taken} are reserved (op(...) takes "
+                            "config= and table=)")
         fns = {}
-        for k, v in dict(name=name, ref=ref, test=None, check=None, dims=None,
+        for k, v in dict(name=name, ref=ref, test=None, check=None, dims=None, fallback=None,
                          impls=types.MappingProxyType(fns), vocab=(), _imp={}, _fns=fns,
-                         _axes=(), _test_defaults={}, _ref_params=ref_params).items():
+                         _axes=(), _test_defaults={}, _ref_params=ref_params,
+                         _ref_names=frozenset(p.name for p in ref_params),
+                         _registry=registry if registry is not None else Registry(),
+                         _fallback=None, _vget=_getter(()), _blank={}, _tables={},
+                         _memo={}).items():
             object.__setattr__(self, k, v)
 
     def _add(self, suffix, f):
-        """Add ``f`` as role ``suffix`` (test / check / dims) or as implementation
-        ``suffix``; the op is unchanged when ``f`` breaks a convention."""
+        """Add ``f`` as role ``suffix`` (test / check / dims / fallback) or as
+        implementation ``suffix``; the op is unchanged when ``f`` breaks a convention."""
         if suffix in ROLES and getattr(self, suffix) is not None:
             raise TypeError(f"{self.name}_{suffix} is already registered")
         if suffix == "test":
             self._add_test(f)
+        elif suffix == "fallback":
+            self._add_fallback(f)
         elif suffix in ROLES:
             self._add_helper(suffix, f)
         else:
@@ -395,9 +467,9 @@ class Op:
 
     def _add_test(self, test):
         name = self.name
-        if self._imp:
+        if self._imp or self.fallback is not None:
             raise TypeError(f"{name}_test: register it before the implementations "
-                            f"{list(self._imp)} (their limits use its vocabulary)")
+                            f"{list(self._imp)} and {name}_fallback (they use its vocabulary)")
         tps = list(inspect.signature(test).parameters.values())
         if not all(p.kind in _NAMED for p in tps):
             raise TypeError(f"{_sig(name, 'test', test)}: named parameters only (their "
@@ -416,8 +488,25 @@ class Op:
         if missing:
             raise TypeError(f"{name}_test: parameter(s) {missing} need a default or a @param")
         defaults = {p.name: p.default for p in tps if p.default is not p.empty}
-        for k, v in dict(test=test, vocab=vocab, _axes=axes, _test_defaults=defaults).items():
+        for k, v in dict(test=test, vocab=vocab, _axes=axes, _test_defaults=defaults,
+                         _vget=_getter(vocab), _blank=dict.fromkeys(vocab)).items():
             object.__setattr__(self, k, v)
+
+    def _add_fallback(self, f):
+        """``<op>_fallback``: no marks; its parameters are vocabulary names (or
+        ``capturing``)."""
+        name = self.name
+        if _marks(f):
+            raise TypeError(f"{name}_fallback: only implementations and {name}_test take kit "
+                            "marks")
+        call = _Call(f)
+        bad = _unknown(call.names, (*self.vocab, "capturing"))
+        if bad:
+            raise TypeError(f"{_sig(name, 'fallback', f)} uses name(s) {bad} outside the "
+                            f"vocabulary {list(self.vocab)} (register {name}_test first)")
+        object.__setattr__(self, "_fallback", call)
+        object.__setattr__(self, "fallback", f)
+        self._memo.clear()
 
     def _add_helper(self, role, f):
         """``<op>_check`` / ``<op>_dims``: no marks; they take the ref's arguments."""
@@ -442,6 +531,8 @@ class Op:
         except Exception:
             del self._imp[kind], self._fns[kind]
             raise
+        self._tables.clear()  # the table rows of this kind count from now on
+        self._memo.clear()
 
     def __setattr__(self, k, v):
         raise AttributeError(f"Op is read-only ({k})")
@@ -593,16 +684,159 @@ class Op:
                             f"{_unknown(v.names, ns)}") from None
         return v(vals, extras)
 
+    # ---- dispatch -----------------------------------------------------------------
+
+    def __call__(self, *args, config=None, table=_DEFAULT, **kwargs):
+        """Run the op on the interface arguments: ``config`` (a dict or a name;
+        unchecked) if given, else ``pick`` on the vocabulary of the call (``<op>_dims``
+        and the keyword arguments that are vocabulary names, e.g. ``routing=``)."""
+        hints = {k: kwargs.pop(k) for k in [k for k in kwargs if k not in self._ref_names]}
+        bad = _unknown(hints, self.vocab)
+        if bad:
+            raise TypeError(f"{self.name}: unknown argument(s) {bad}: neither parameters of "
+                            f"{self.name}_ref nor vocabulary names {list(self.vocab)}")
+        if config is None:
+            if self.dims is None:
+                raise TypeError(f"{self.name}: picking a config needs {self.name}_dims; "
+                                "pass config=")
+            vocab = dict(self._blank)
+            vocab.update(self.dims(*args, **kwargs))
+            vocab.update(hints)
+            config = self.pick(vocab, table=table, capturing=_capturing())
+        elif isinstance(config, str):
+            config = self.parse(config)
+        return self.run(config, *args, **kwargs)
+
+    def pick(self, vocab, *, table=_DEFAULT, capturing=False):
+        """The config ``op(...)`` runs for ``vocab`` (see the module docstring): from the
+        tuned table (``table``: a path, None for none; default the registry's), else
+        ``<op>_fallback``; ValueError when none can run."""
+        path = self._registry.table if table is _DEFAULT else table
+        version = _version(path)
+        try:
+            key = (path, version, bool(capturing), self._vget(vocab))
+        except KeyError:
+            raise TypeError(f"{self.name}: the vocabulary passed lacks "
+                            f"{_unknown(self.vocab, vocab)}") from None
+        cfg = self._memo.get(key)
+        if cfg is None:
+            if len(self._memo) >= _MEMO_MAX:
+                self._memo.clear()
+            cfg = self._memo[key] = self._pick(vocab, path, version, bool(capturing))
+        return cfg
+
+    def points(self, vocab, *, table=_DEFAULT):
+        """[(bucket value, [(us, cfg), ...] fastest first)] of the table rows of
+        ``vocab``'s key (no relax; [] without rows)."""
+        path = self._registry.table if table is _DEFAULT else table
+        version = _version(path)
+        if version is None:
+            return []
+        cols, _, index = self._index(path, version)
+        return index.get(self._key(cols, vocab), [])
+
+    def _key(self, cols, vocab):
+        d = self._test_defaults
+        return tuple(d.get(c) if vocab[c] is None else vocab[c] for c in cols)
+
+    def _index(self, path, version):
+        """(key columns, bucket column or None, {key: [(bucket value, [(us, cfg), ...]
+        fastest first), ...] by bucket value}) of the rows of ``path`` this op runs."""
+        got = self._tables.get((path, version))
+        if got is not None:
+            return got
+        header, rows = _read_table(path, version)
+        if "config" not in header or "us" not in header:
+            raise ValueError(f"{path}: a tuned table has the columns config and us; this one "
+                             f"has {list(header)}")
+        reg, d = self._registry, self._test_defaults
+        bucket = reg.bucket if reg.bucket in header and reg.bucket in self.vocab else None
+        cols = tuple(n for n in self.vocab if n in header and n != bucket)
+        pts = {}
+        for i, r in enumerate(rows, 2):
+            name = r["config"]
+            if re.match(r"[^\s:]*", name)[0] not in self._imp:
+                continue  # another op's implementation
+            try:
+                cfg = self.parse(name)
+            except ValueError as e:
+                raise ValueError(f"{path}:{i}: {e}") from None
+            key = tuple(_cell(r[c], d.get(c)) for c in cols)
+            b = _cell(r[bucket], d.get(bucket)) if bucket else None
+            pts.setdefault(key, {}).setdefault(b, []).append((float(r["us"]), cfg))
+        index = {k: sorted((b, sorted(c, key=lambda t: t[0])) for b, c in v.items())
+                 for k, v in pts.items()}
+        if len(self._tables) >= 8:
+            self._tables.clear()
+        got = self._tables[path, version] = (cols, bucket, index)
+        return got
+
+    def _table_configs(self, vocab, path, version):
+        """The candidates of the tuned point for ``vocab``, fastest first."""
+        if version is None:
+            return []
+        cols, bucket, index = self._index(path, version)
+        key = self._key(cols, vocab)
+        pts = index.get(key)
+        relax = self._registry.relax
+        if not pts and relax:
+            pts = index.get(tuple(relax.get(c, v) for c, v in zip(cols, key)))
+        if not pts:
+            return []
+        if bucket is not None:
+            n = vocab[bucket]
+            if n is None:
+                raise ValueError(f"{self.name}: picking from {path} needs {bucket}")
+            pts = [next((p for p in pts if p[0] >= n), pts[-1])]
+        return [cfg for _, cfg in pts[0][1]]
+
+    def _fallbacks(self, vocab, capturing):
+        if self._fallback is None:
+            return [cfg for cfg, _ in self.configs(vocab, capturing=capturing)]
+        f = self._fallback
+        out = f(f.get({**vocab, "capturing": capturing}), {})
+        return [self.parse(c) if isinstance(c, str) else c for c in out]
+
+    def _pick(self, vocab, path, version, capturing):
+        def candidates():  # the fallbacks are evaluated only when the table has no fit
+            yield from self._table_configs(vocab, path, version)
+            yield from self._fallbacks(vocab, capturing)
+
+        tried = []
+        for cfg in candidates():
+            why = self.why_not(cfg, vocab, capturing=capturing)
+            if why is None:
+                return cfg
+            tried.append(f"{self.name_of(cfg)}: {why}")
+        known = {k: v for k, v in vocab.items() if v is not None}
+        more = f" (+{len(tried) - 6} more)" if len(tried) > 6 else ""
+        raise ValueError(f"{self.name}: no config can run {known}"
+                         f"{' (capturing)' if capturing else ''}: "
+                         + "; ".join(tried[:6]) + more)
+
 
 class Registry(Mapping):
     """The ops of a package, built one function at a time by ``register`` (used as the
     decorator ``@op_register``, see the module docstring). Read it as a mapping {op
     name: Op} in registration order, or by attribute: ``ops.moe is ops["moe"]``. An
     ``Op`` is the same object from its ref's registration on; later registrations add
-    to it."""
+    to it.
 
-    def __init__(self):
+    ``name``: for reports. ``table`` / ``bucket`` / ``relax``: the tuned table of the
+    ops, its bucketed vocabulary name and the key substitutions tried when a key has no
+    rows (dispatch, see the module docstring)."""
+
+    def __init__(self, name=None, *, table=None, bucket=None, relax=None):
+        if relax is not None and not isinstance(relax, dict):
+            raise TypeError(f"Registry: relax is a dict {{name: value}}, got {relax!r}")
         self._ops = {}
+        self._name, self._table, self._bucket = name, table, bucket
+        self._relax = dict(relax or {})
+
+    name = property(lambda self: self._name)
+    table = property(lambda self: self._table)
+    bucket = property(lambda self: self._bucket)
+    relax = property(lambda self: self._relax)
 
     def register(self, f):
         """Add ``f`` to its op, by its name (see the module docstring); return ``f``."""
@@ -633,7 +867,7 @@ class Registry(Mapping):
             if early:
                 raise TypeError(f"{op}_ref: {o.name}_{early[0]} was registered before it and "
                                 f"went to op {o.name!r}; register {op}_ref first")
-        self._ops[op] = Op(op, ref)
+        self._ops[op] = Op(op, ref, self)
 
     def _owner(self, name):
         """The registered op with the longest prefix of ``name``."""
@@ -671,4 +905,4 @@ class Registry(Mapping):
         return [*super().__dir__(), *self._ops]
 
     def __repr__(self):
-        return f"Registry({list(self._ops)})"
+        return f"Registry({'' if self._name is None else repr(self._name) + ', '}{list(self._ops)})"

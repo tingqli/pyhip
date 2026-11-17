@@ -1,6 +1,7 @@
 """CPU tests of pyhip.kit (no GPU): registration, grids, limits, config names, the checks
 a registration runs on the conventions, and the pytest tests ``kit.testing`` generates."""
 
+import os
 import textwrap
 
 import pytest
@@ -95,15 +96,15 @@ def toy():
     return _toy()
 
 
-def _ops(src):
-    """A fresh Registry holding the top-level functions of ``src``, each registered as
-    it is defined (``@op_register`` inserted above its decorators)."""
+def _ops(src, **registry):
+    """A fresh Registry(**registry) holding the top-level functions of ``src``, each
+    registered as it is defined (``@op_register`` inserted above its decorators)."""
     lines, out = textwrap.dedent(src).splitlines(), []
     for i, line in enumerate(lines):
         if line.startswith(("@", "def ")) and not (i and lines[i - 1].startswith("@")):
             out.append("@op_register")
         out.append(line)
-    reg = Registry()
+    reg = Registry(**registry)
     exec("\n".join(out), {"op_register": reg.register, "param": param, "requires": requires,
                           "meta": meta, "stack": stack}, {})
     return reg
@@ -181,6 +182,117 @@ def test_registration_rules():
         with pytest.raises(TypeError, match=match):
             reg.register(f)
         assert "kit_op" not in f.__dict__ and list(reg.g.impls) == ["k"]  # left no trace
+    _raises(ref + "def f_fallback(n): pass", r"outside the vocabulary \[\]")
+    _raises(ref + "def f_test(n=1): pass\n@meta(k=1)\ndef f_fallback(n): pass", "take kit marks")
+    _raises(ref + "def f_test(n=1): pass\ndef f_dyn_fallback(n): pass", "register f_dyn_ref first")
+    _raises("def f_ref(x, *, config=None): pass", r"\['config'\] are reserved")
+    with pytest.raises(TypeError, match="relax is a dict"):
+        Registry(relax=["act"])
+    assert repr(Registry("lib")) == "Registry('lib', [])"
+
+
+DISPATCH = '''
+def f_ref(x, *, dt="a"):
+    return ("ref",)
+
+@param("n", (4,))
+def f_test(n, dt="a", mode="s", seed=0):
+    return dict(x=[0.0] * n, dt=dt)
+
+def f_dims(x, *, dt="a"):
+    return dict(n=len(x), dt=dt)
+
+@param("b", (1, 2), id="b{}")
+@requires(lambda n, b: n % b == 0, "n={n} % {b}")
+def f_k1(x, *, dt="a", b=1):
+    return ("k1", b)
+
+@requires(lambda capturing: not capturing, "not graph-safe")
+def f_k2(x, *, dt="a"):
+    return ("k2",)
+
+def f_k3(x, *, dt="a"):
+    return ("k3",)
+'''
+
+TABLE = """dt,mode,n,config,us,err
+a,s,4,k2,2.0,0
+a,s,4,k1 b2,1.0,0
+a,s,4,k3,3.0,0
+a,s,4,zz,0.5,0
+a,s,16,k1 b1,2.0,0
+a,s,16,k3,1.0,0
+a,t,4,k3,1.0,0
+b,s,4,k2,1.0,0
+"""
+
+
+def test_dispatch(tmp_path):
+    path = tmp_path / "tuned.csv"
+    path.write_text(TABLE)
+    op = _ops(DISPATCH, table=str(path), bucket="n", relax={"mode": "s"}).f
+
+    def pick(capturing=False, table=str(path), **v):
+        return op.name_of(op.pick(dict(op._blank, **v), table=table, capturing=capturing))
+
+    assert pick(n=4, dt="a") == "k1 b2"  # the fastest; mode None matches the default "s"
+    assert pick(n=3, dt="a") == "k2"  # point 4; k1 b2 needs n % 2 == 0
+    assert pick(n=3, dt="a", capturing=True) == "k3"  # k2 is not graph-safe
+    assert pick(n=5, dt="a") == "k3" and pick(n=100, dt="a") == "k3"  # point 16, the largest
+    assert pick(n=4, dt="a", mode="t") == "k3"
+    assert pick(n=4, dt="a", mode="u") == "k1 b2"  # no rows: relax mode -> s
+    assert pick(n=4, dt="b") == "k2"
+    assert pick(n=4, dt="c") == "k1 b1"  # no rows: the first grid point that runs
+    assert pick(n=4, dt="a", table=None) == "k1 b1"
+    assert pick(n=4, dt="a", table=str(tmp_path / "none.csv")) == "k1 b1"
+    vocab = dict(op._blank, n=4, dt="a")
+    assert op.pick(vocab) is op.pick(dict(vocab))  # memoized
+    assert [(n, [op.name_of(c) for _, c in cs]) for n, cs in op.points(vocab)] == [
+        (4, ["k1 b2", "k2", "k3"]), (16, ["k3", "k1 b1"])]  # zz: not an implementation
+    with pytest.raises(ValueError, match="needs n"):
+        op.pick(dict(op._blank, dt="a"))
+    with pytest.raises(TypeError, match="lacks"):
+        op.pick(dict(n=4))
+    # a call: dims and hints -> pick -> run
+    x3, x4 = [0.0] * 3, [0.0] * 4
+    assert op(x4) == ("k1", 2) and op(x4, mode="t") == ("k3",) and op(x3) == ("k2",)
+    assert op(x3, config="k3") == ("k3",) and op(x3, config=dict(kind="k1", b=1)) == ("k1", 1)
+    assert op(x4, dt="b", table=None) == ("k1", 1)
+    with pytest.raises(TypeError, match=r"unknown argument\(s\) \['bogus'\]"):
+        op(x4, bogus=1)
+    # the table file changes: it is read again
+    path.write_text(TABLE.replace("k1 b2,1.0", "k1 b2,9.0"))
+    os.utime(path, (1, 1))
+    assert pick(n=4, dt="a") == "k2"
+    # a table without the mode column: mode is no key
+    old = tmp_path / "old.csv"
+    old.write_text("dt,n,config,us\na,4,k3,1.0\n")
+    assert pick(n=4, dt="a", mode="t", table=str(old)) == "k3"
+    bad = tmp_path / "bad.csv"
+    bad.write_text("dt,n,config,us\na,4,k1 bx,1.0\n")
+    with pytest.raises(ValueError, match=r"bad.csv:2: .*'k1 bx'"):
+        pick(n=4, dt="a", table=str(bad))
+    nocols = tmp_path / "nocols.csv"
+    nocols.write_text("dt,n\na,4\n")
+    with pytest.raises(ValueError, match="config and us"):
+        pick(n=4, dt="a", table=str(nocols))
+
+
+def test_dispatch_fallback():
+    src = DISPATCH + '''
+def f_fallback(n, capturing):
+    return ["k2", dict(kind="k1", b=2)] if n < 8 else ["k3"]
+'''
+    op = _ops(src, bucket="n").f
+    assert op.fallback is not None and op.fallback.kit_op == "f"
+    assert op.name_of(op.pick(dict(op._blank, n=4))) == "k2"
+    assert op.name_of(op.pick(dict(op._blank, n=4), capturing=True)) == "k1 b2"
+    assert op.name_of(op.pick(dict(op._blank, n=9))) == "k3"
+    with pytest.raises(ValueError, match=r"no config can run \{'n': 3\} \(capturing\): "
+                                         r"k2: not graph-safe; k1 b2: n=3 % 2"):
+        op.pick(dict(op._blank, n=3), capturing=True)
+    with pytest.raises(TypeError, match="needs g_dims"):
+        _ops("def g_ref(x): pass\ndef g_k(x): pass").g([1])
 
 
 def test_marks_return_the_function_in_written_order():
