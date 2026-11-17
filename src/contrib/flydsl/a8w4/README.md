@@ -46,8 +46,8 @@ out = a8w4_moe_dyn(x8, W, topk_weights, topk_ids, m_valid, x_scale=x8_scale,
 
 ```bash
 pytest -q a8w4/tests/test_a8w4_ops.py a8w4/tests/test_a8w4_moe.py   # 正确性（gfx942）
-python -m a8w4.tune show   --case mimo-v2.6-flash-tp8         # 查看调优表：每个 token 数选中的配置
-python -m a8w4.tune verify --case mimo-v2.6-flash-ep8         # 按表实际调用：耗时、正确性
+python -m a8w4.tune show   tp8-silu                    # 查看调优表：每个 token 数选中的配置
+python -m a8w4.tune verify ep8-silu                    # 按表实际调用：耗时、正确性
 pytest -q a8w4/tests/test_a8w4_mori_ep8.py                   # 8 卡 EP8 整层：MORI dispatch + a8w4_moe_dyn + MORI combine 对参考实现
 python a8w4/tests/test_a8w4_mori_ep8.py --act silu situv2     # 整层性能（总 token 64..4096），SiLU / SiTUv2 对比；更多用法见 8.1 节
 pytest -q a8w4/tests/test_a8w4_mori_tp8.py                   # 8 卡 TP8 整层：a8w4_moe + all-reduce（aiter custom / RCCL）对参考实现
@@ -154,7 +154,7 @@ a8w4/
   _ops.py                      本包的算子注册表 ops = pyhip.kit.Registry("a8w4", table=DEFAULT_CSV, bucket="num_tokens", relax={"act": "silu"}) 和装饰器 op_register；ref.py 注册问题定义，moe.py 注册实现
   moe.py                       a8w4_moe / a8w4_moe_dyn（只处理 M == 0，其余交给算子）；各族的实现函数 moe_<kind>（@op_register 注册；@param 网格、@meta，tp1kq 另有 @no_capture；限制由 kernel 的 assert 检查），算子 MOE = ops.moe、MOE_DYN = ops.moe_dyn（9.3 节）；shape_vocab（工具用：由 shape 元组构造词汇）
   weights.py                   prepare_weights（fd2 权重）、shuffle_mxfp4、weight_shape
-  tune.py                      调优 CLI：tune / merge / show / verify / candidates / tune-all / compare / readme / stats；表的读、写、合并、比较在 `pyhip.kit.table`（分派和 tune 共用）
+  tune.py                      调优 CLI：`python -m a8w4.tune <cmd>` 就是 `python -m pyhip.kit <cmd> a8w4:moe`（`pyhip.kit.tune`：cases / candidates / tune / merge / show / verify / tune-all），另有 a8w4 的报告 compare / readme / stats；表的读、写、合并、比较在 `pyhip.kit.table`（分派和 tune 共用）
   tables.py                    调优表报告：compare（`kit.table.compare`，按 shape / act / tokens 列出两张表逐点的 winner）、readme（重新生成 / 检查 README 7.2–7.4）、stats（situv2 与 silu）
   ref.py                       测试与调优用：算子的问题定义（moe_ref 参考实现、moe_test 测试输入、moe_check 判定、moe_dims 读词汇并检查输入；moe_dyn_* 同理）、随机权重和路由、模拟 fp8 量化的 fp32 参考、冷 cache 计时
   megamoe.py                   MegaMoeEpA8W4：EP8 整层（dispatch + 专家 + combine）的单 persistent kernel 封装，用于大 batch
@@ -445,9 +445,11 @@ ARB 是每个 K-tile 每行 A 的字节数，默认 256。`t16` 的 gemm2 用窄
 
 表按文件路径和 mtime 缓存，mtime 每张表最多一秒读一次：文件更新后一秒内重新读取。`ops.moe(...)` 的选择按（表、mtime、capture 状态、`moe_dims` 的值）缓存。
 
-### 6.3 tuner（`tune.py`）
+### 6.3 tuner（`pyhip.kit.tune`，`python -m a8w4.tune`）
 
-- **候选**（`candidates(shape)`，即 `MOE.configs`：各实现的完整网格。kernel 跑不了的配置运行时抛异常，记为 n/a，不进表）：
+调优是通用的（`pyhip.kit.tune`），a8w4 只在注册表里声明（`_ops.py`）：分桶维 `num_tokens` 的调优点 `TOKENS`、不进表的词汇 `expert_offset` / `seed`、计时时轮换的输入 `W`。调优的 case 是 `ref.moe_test` 的网格去掉 token 轴：`tp8-silu`、`tp8-situv2`、`tp4-silu`、`tp4-situv2`、`ep8-silu`、`ep8-situv2`（`ref.SHAPES` × act，EP8 用 rank 3 的 expert_offset 96）；`--set name=value` 改其中的词汇（新 shape、routing）。表的列由词汇推出：key 列（`moe_test` 的参数顺序，去掉不进表的）、`num_tokens`、`config`、`us`、`moe_check` 返回的 `cos`。
+
+- **候选**（`candidates <case>`，即 `MOE.configs`：各实现的完整网格。kernel 跑不了的配置运行时抛异常，记为 n/a，不进表）：
   - tp2k：bm × g1bcm × g2，共 8 个；
   - tp1k：bcm × ksplit，ksplit 取每个 CTA 256 / 384 / 512 列对应的值；
   - tp1kq；
@@ -463,33 +465,34 @@ ARB 是每个 K-tile 每行 A 的字节数，默认 256。`t16` 的 gemm2 用窄
   每个候选最终取各轮的中位数。每测完一个 token 数就写一次文件（同 key 的行覆盖）。
 - **计时**（`pyhip.kit.timing.time_cold`，`ref.time_cold` 是同一个函数）：
   - 每次迭代前读一遍 512 MB，用干净行挤掉 L2。用读而不是读改写，是为了不留下 dirty 行，否则写回会抢 HBM 带宽；
-  - 刷 cache 挤不掉 MALL 里每次调用都读的权重（读 2 GB 也一样），所以每次调用换一份权重：`ref.weight_copies` 复制 8 份（`--wcopies`，EP8 / TP8 约 3.3 GB），轮流使用，和模型里相邻各层读不同的权重一样。只用一份权重时，W 走 cache 的配置会显得快 5–13%（10 节第 15 条）；
+  - 刷 cache 挤不掉 MALL 里每次调用都读的权重（读 2 GB 也一样），所以每次调用换一份权重：`kit.timing.copies` 复制 8 份（`--copies`，EP8 / TP8 约 3.3 GB），轮流使用，和模型里相邻各层读不同的权重一样。只用一份权重时，W 走 cache 的配置会显得快 5–13%（10 节第 15 条）；
   - 再让 GPU 空转约 1 ms（`torch.cuda._sleep`），这段时间里 host 已经把本次调用的所有 launch 入队，因此 host 开销不计入，和 graph 回放的情况一致；
   - 用 event 包住调用，每次迭代都同步，最后取中位数。
 
 ```bash
 cd <包含 a8w4/ 的目录>
-python -m a8w4.tune candidates --case mimo-v2.6-flash-ep8
-# 整表：8 张空闲卡，每个 (act, case) 用 4 张卡、各跑 1/4 的 token 数；先查 GPU 空闲并加
-# /tmp/gpu-N.lock，结束时汇总 BAD / FAIL 并合并成 <out>/a8w4_moe_tuned.new.csv
+python -m a8w4.tune cases                          # 调优的 case
+python -m a8w4.tune candidates ep8-silu
+# 整表：8 张空闲卡，每个 case 用 4 张卡、各跑 1/4 的 token 数；先查 GPU 空闲并加
+# /tmp/gpu-N.lock，结束时汇总 BAD 并合并成 <out>/a8w4_moe_tuned.new.csv
 python -m a8w4.tune tune-all --gpus 0-7 --out /tmp/a8w4_tune
 python -m a8w4.tune compare configs/a8w4_moe_tuned.csv /tmp/a8w4_tune/a8w4_moe_tuned.new.csv
 # 单卡手动调几个点
-HIP_VISIBLE_DEVICES=0 python -m a8w4.tune tune --case mimo-v2.6-flash-ep8 -t 1024 4096 --out /tmp/ep8_0.csv
+HIP_VISIBLE_DEVICES=0 python -m a8w4.tune tune ep8-silu -t 1024 4096 --out /tmp/ep8_0.csv
 python -m a8w4.tune merge /tmp/ep8_*.csv          # 合并进 configs/a8w4_moe_tuned.csv
-python -m a8w4.tune show   --case mimo-v2.6-flash-ep8
-python -m a8w4.tune verify --case mimo-v2.6-flash-ep8 -t 1 100 3000 20000
+python -m a8w4.tune show   ep8-silu
+python -m a8w4.tune verify ep8-silu -t 1 100 3000 20000
 python -m a8w4.tune readme --check                # README 7.2–7.4 与表一致吗（--write 重新生成）
 python -m a8w4.tune stats                         # situv2 与 silu 行的对比（6.3 末尾的数字）
-# situv2：同样的命令加 --act situv2，结果写成 act=situv2 的行（完整命令见 configs/README.md）
+# situv2：case 换成 <shape>-situv2，结果写成 act=situv2 的行（完整命令见 configs/README.md）
 
-# 新 shape：H,I,E_local,E_global,topk（也可以把它加进 tune.py 的 CASES）
-python -m a8w4.tune tune --shape 6144,256,384,384,8 --out /tmp/new.csv
+# 新 shape：从一个 case 出发改词汇（也可以把它加进 ref.SHAPES）
+python -m a8w4.tune tune tp8-silu --set model_dim=6144 experts=384 experts_global=384 --out /tmp/new.csv
 ```
 
 - **调优时机器要空闲**：调优时 8 张卡各跑一个进程，事后在空闲卡上单独复测，大 batch 的结果与表中数值相差 ±5–8%，方向不固定。
-- **路由分布**：`--routing hot`（1/32 的专家分数 +2）会写成另一组行，调用时用 `a8w4_moe(..., routing="hot")` 选这组表。
-- **situv2**：`--act situv2` 按 situv2 计时，结果写成单独的一组行，调用时按 act 查（6.2 节）。
+- **路由分布**：`--set routing=hot`（1/32 的专家分数 +2）会写成另一组行，调用时用 `a8w4_moe(..., routing="hot")` 选这组表。
+- **situv2**：`<shape>-situv2` 这些 case 按 situv2 计时，结果写成单独的一组行，调用时按 act 查（6.2 节）。
   - 参数取 `ref.SITU`。β / clamp 是 launch 参数，不影响耗时，所以这组行对任意 SiTUv2 参数都适用。
   - TP8、EP8 已按 situv2 调优。同一配置、同一点上，situv2 / silu 的中位数都是 1.016，p5–p95 为 1.001–1.037（TP8）和 1.001–1.032（EP8）。
   - 35 个点里，TP8 有 11 个点（4、8、12、32、128、320、384、448、1024、1280、16384）、EP8 有 4 个点（8、128、256、2048）选中的配置与 silu 不同，都是候选之间本来就相差很小的点（tp2k 的 bm32 / bm64、g2base / nt4，t16 / s16 等）。按 situv2 实测，新的选择比沿用 silu 的选择只快 0.1–0.8%，在测量误差以内。

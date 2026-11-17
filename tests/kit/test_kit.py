@@ -325,6 +325,46 @@ def test_table(tmp_path):
     assert "(no old row)" in lines[1]
 
 
+def test_tune(tmp_path, monkeypatch):
+    import sys
+    import types
+
+    from pyhip.kit import table
+    from pyhip.kit import tune as kt
+
+    src = TOY.replace("ops = Registry()", "ops = Registry(table=TABLE, bucket='n', points=(4, 6), "
+                                          "unkeyed=('seed',))")
+    mod = types.ModuleType("kit_toy_tune")
+    mod.TABLE = str(tmp_path / "tuned.csv")
+    exec(compile(src, "toy.py", "exec"), mod.__dict__)
+    monkeypatch.setitem(sys.modules, "kit_toy_tune", mod)
+    op = kt.resolve("kit_toy_tune:axpy")
+    assert op is mod.ops.axpy
+    with pytest.raises(SystemExit, match="no op 'nope'"):
+        kt.resolve("kit_toy_tune:nope")
+    with pytest.raises(SystemExit, match="expected <module>:<op>"):
+        kt.resolve("axpy")
+    cases = kt.cases(op)  # the n axis (the bucket) is dropped
+    assert list(cases) == ["a1", "a2"] and cases["a2"] == dict(n=None, alpha=2.0, seed=0)
+    assert kt.case(op, "a1", ["alpha=3", "seed=5"]) == dict(n=None, alpha=3, seed=5)
+    with pytest.raises(SystemExit, match="no tune case"):
+        kt.case(op, "a3")
+    assert kt.fields(op, ["err"]) == ["alpha", "n", "config", "us", "err"]
+    assert kt.gpu_list("0-2,5") == [0, 1, 2, 5]
+    monkeypatch.setattr(kt, "time_cold", lambda fn, iters: (fn(), 1.5)[1])
+    logs = []
+    kt.tune(op, cases["a1"], [4, 6], mod.TABLE, rounds=2, iters=1, log=logs.append, cid="a1")
+    fields, rows = table.read(mod.TABLE)
+    assert fields == ("alpha", "n", "config", "us", "err")
+    got = [(r["n"], r["config"]) for r in rows]
+    assert got == [("4", c) for c in ("loop", "tiled b2", "tiled b4", "queue fast", "queue slow")] \
+        + [("6", c) for c in ("loop", "tiled b2", "queue fast", "queue slow")]  # b4 can't run 6
+    assert rows[0]["us"] == "1.5" and rows[0]["alpha"] == "1.0" and float(rows[0]["err"]) == 0
+    assert "(1 n/a: AssertionError)" in logs[-1]
+    assert [op.name_of(c) for c in op.tuned(dict(cases["a1"], n=5))] == [
+        "loop", "tiled b2", "queue fast", "queue slow"]  # the dispatch reads what tune wrote
+
+
 def test_marks_return_the_function_in_written_order():
     a, b, c = param("p", (1,)), no_capture("r"), meta(k=1)
 

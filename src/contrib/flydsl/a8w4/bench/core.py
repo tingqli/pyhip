@@ -32,7 +32,7 @@ from pyhip.kit.timing import (  # noqa: F401 - re-exported for the bench tools
 from .. import ref as R
 from ..kernels import ep_gemm as EG
 from ..moe import MOE, shape_vocab
-from ..tune import CASES, COS_TOL  # noqa: F401 - COS_TOL: re-exported for the tools
+from ..ref import COS_TOL, SHAPES  # noqa: F401 - COS_TOL: re-exported for the tools
 
 PKG_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DIFF_TOL = 1e-4  # cos diff vs the base above this: flagged (bf16 atomics alone: ~1e-5)
@@ -79,24 +79,23 @@ class Case:
 
 
 def get_case(name=None, shape=None, e0=0, act="silu", routing="uniform"):
-    """A ``tune.CASES`` entry (full name or its suffix: tp8 / tp4 / ep8) or ``shape``
-    "H,I,E_local,E_global,topk"."""
+    """A ``ref.SHAPES`` entry (tp8 / tp4 / ep8; the old names mimo-v2.6-flash-<name> work
+    too) or ``shape`` "H,I,E_local,E_global,topk"."""
     if shape:
         H, I, E, EGl, K = (int(v) for v in shape.split(","))
         return Case(f"H{H}-I{I}-E{E}of{EGl}-top{K}", (H, I, E, EGl, K), e0, act, routing)
-    full = name if name in CASES else next((c for c in sorted(CASES)
-                                            if c.endswith("-" + str(name))), None)
-    if full is None:
-        raise SystemExit(f"unknown case {name!r}: one of {sorted(CASES)} or the suffix "
-                         "after the last '-' (tp8, tp4, ep8), or --shape H,I,E,E_global,topk")
-    *shp, e0c = CASES[full]
+    full = str(name).rpartition("-")[2] if str(name) not in SHAPES else name
+    if full not in SHAPES:
+        raise SystemExit(f"unknown case {name!r}: one of {sorted(SHAPES)}, or --shape "
+                         "H,I,E,E_global,topk")
+    *shp, e0c = SHAPES[full]
     return Case(full, tuple(shp), e0 or e0c, act, routing)
 
 
 def add_case_args(ap, local=True):
     g = ap.add_argument_group("case")
     g.add_argument("--case", default=None,
-                   help=f"one of {sorted(CASES)} or its suffix (tp8, tp4, ep8)")
+                   help=f"one of {sorted(SHAPES)} (ref.SHAPES)")
     g.add_argument("--shape", default=None, help="H,I,E_local,E_global,topk (instead of --case)")
     g.add_argument("--expert-offset", type=int, default=0)
     g.add_argument("--act", default="silu", choices=R.ACTS)
@@ -109,7 +108,7 @@ def add_case_args(ap, local=True):
 
 def case_from_args(a):
     if not (a.case or a.shape):
-        raise SystemExit("--case (tp8 / tp4 / ep8 / a tune.CASES name) or --shape is required")
+        raise SystemExit("--case (tp8 / tp4 / ep8) or --shape is required")
     return get_case(a.case, a.shape, a.expert_offset, a.act, a.routing)
 
 

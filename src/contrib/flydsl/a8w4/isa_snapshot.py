@@ -53,8 +53,7 @@ from pathlib import Path
 
 PKG = __package__
 ACTS = ("silu", "situv2")
-CASE_KEYS = {"tp8": "mimo-v2.6-flash-tp8", "tp4": "mimo-v2.6-flash-tp4",
-             "ep8": "mimo-v2.6-flash-ep8"}
+CASE_KEYS = ("tp8", "tp4", "ep8")  # ref.SHAPES, expert_offset 0
 FAMILIES = ("tp2k", "tp1k", "tp1kq", "ep3k", "ep1k")
 DYN_X = ("bf16", "fp8g128", "fp8tok")
 DYN_CAPS = (256, 4096)  # ep_prep: single-WG (M * topk <= 2048) / multi-WG
@@ -72,17 +71,17 @@ def isa_tokens():
     """Tuned token counts + the counts where a token-dependent compile option flips:
     tp_prep's histogram unroll (every 128 tokens up to 2048 at topk 8) and route range
     (> 2048 / 4096 / 8192), ep_prep's multi-WG path (> 256)."""
-    from . import tune
+    from ._ops import TOKENS
 
     extra = [128 * h for h in range(1, 17)] + [257, 2049, 4097, 8193]
-    return sorted(set(tune.TOKENS) | set(extra))
+    return sorted(set(TOKENS) | set(extra))
 
 
 def _case(name):
-    from . import tune
+    from .ref import SHAPES
 
-    H, I, E, EGl, K, e0 = tune.CASES[CASE_KEYS[name]]
-    return (H, I, E, EGl, K), e0
+    H, I, E, EGl, K, _ = SHAPES[name]
+    return (H, I, E, EGl, K), 0
 
 
 def _tuned(shape, act, t, family):
@@ -346,7 +345,7 @@ def _git_head():
 
 
 def snapshot(argv):
-    from .tune import _gpu_list, busy_gpus
+    from pyhip.kit.tune import busy_gpus, gpu_list
 
     ap = argparse.ArgumentParser(prog="prof isa-snapshot")
     ap.add_argument("--out", required=False)
@@ -364,7 +363,7 @@ def snapshot(argv):
         return
     if not a.out:
         raise SystemExit("--out is required")
-    gpus = _gpu_list(a.gpus)
+    gpus = gpu_list(a.gpus)
     busy = busy_gpus(gpus)
     if busy:
         raise SystemExit(f"GPUs busy: {busy}")

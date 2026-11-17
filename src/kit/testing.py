@@ -45,7 +45,7 @@ def op_tests(ops):
             pre = f"{op.name}-{cid}" if cid else op.name
             if op.dims is not None:
                 items.append(pytest.param(op, cid, case, None, id=f"{pre}-dims"))
-            tuned = op._registry.table is not None
+            tuned = op.registry.table is not None
             for cfg in op.tuned(case) if tuned else op.configs(case):
                 items.append(pytest.param(op, cid, case, cfg, id=f"{pre}-{op.name_of(cfg)}"))
     current = {}

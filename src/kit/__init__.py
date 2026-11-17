@@ -528,6 +528,8 @@ class Op:
     def __setattr__(self, k, v):
         raise AttributeError(f"Op is read-only ({k})")
 
+    registry = property(lambda self: self._registry)
+
     def __repr__(self):
         return f"Op({self.name!r}, impls={list(self._fns)})"
 
@@ -801,19 +803,31 @@ class Registry(Mapping):
 
     ``name``: for reports. ``table`` / ``bucket`` / ``relax``: the tuned table of the
     ops, its bucketed vocabulary name and the key substitutions tried when a key has no
-    rows (dispatch, see the module docstring)."""
+    rows (dispatch, see the module docstring). For ``kit.tune``: ``points``, the bucket
+    values to tune; ``unkeyed``, vocabulary names the table does not store (they do
+    not change which config is fastest, e.g. a seed); ``rotate``, the interface
+    arguments the timed calls cycle through copies of (``kit.timing.copies``)."""
 
-    def __init__(self, name=None, *, table=None, bucket=None, relax=None):
+    def __init__(self, name=None, *, table=None, bucket=None, relax=None, points=None,
+                 unkeyed=(), rotate=()):
         if relax is not None and not isinstance(relax, dict):
             raise TypeError(f"Registry: relax is a dict {{name: value}}, got {relax!r}")
+        for k, v in (("unkeyed", unkeyed), ("rotate", rotate)):
+            if isinstance(v, str) or not all(isinstance(n, str) for n in v):
+                raise TypeError(f"Registry: {k} is a sequence of names, got {v!r}")
         self._ops = {}
         self._name, self._table, self._bucket = name, table, bucket
         self._relax = dict(relax or {})
+        self._points = tuple(points) if points is not None else None
+        self._unkeyed, self._rotate = tuple(unkeyed), tuple(rotate)
 
     name = property(lambda self: self._name)
     table = property(lambda self: self._table)
     bucket = property(lambda self: self._bucket)
     relax = property(lambda self: self._relax)
+    points = property(lambda self: self._points)
+    unkeyed = property(lambda self: self._unkeyed)
+    rotate = property(lambda self: self._rotate)
 
     def register(self, f):
         """Add ``f`` to its op, by its name (see the module docstring); return ``f``."""

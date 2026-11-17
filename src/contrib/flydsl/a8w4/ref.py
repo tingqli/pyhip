@@ -268,7 +268,7 @@ def _weights(experts, model_dim, inter_dim):
 @param("num_tokens", (1, 77, 600), id="t{}")
 @param("act", ACTS, id="{}")
 def moe_test(model_dim, inter_dim, experts, experts_global, topk, expert_offset, num_tokens,
-             act="silu", routing="uniform", seed=0):
+             routing="uniform", act="silu", seed=0):
     """Inputs of ``moe_ref`` / ``a8w4_moe``: random mxfp4 weights of ``experts`` local
     experts (``make_weights``, cached per shape), ``make_routing(seed=seed)`` over
     ``experts_global``; SiTUv2 with ``SITU``."""
