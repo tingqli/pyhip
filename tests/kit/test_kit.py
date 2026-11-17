@@ -6,6 +6,7 @@ import textwrap
 
 import pytest
 
+from pyhip import kit
 from pyhip.kit import Registry, meta, param, requires, stack
 from pyhip.kit.testing import assert_close
 
@@ -260,10 +261,15 @@ def test_dispatch(tmp_path):
     assert op(x4, dt="b", table=None) == ("k1", 1)
     with pytest.raises(TypeError, match=r"unknown argument\(s\) \['bogus'\]"):
         op(x4, bogus=1)
-    # the table file changes: it is read again
+    with pytest.raises(TypeError, match="len"):  # dims runs with config= too: it checks
+        op(None, config="k3")
+    # the table file changes: it is read again (its mtime is read at most once a second)
     path.write_text(TABLE.replace("k1 b2,1.0", "k1 b2,9.0"))
     os.utime(path, (1, 1))
+    assert pick(n=4, dt="a") == "k1 b2"
+    kit._seen[str(path)] = (0.0, kit._seen[str(path)][1])  # a second later
     assert pick(n=4, dt="a") == "k2"
+    assert op(x4) == ("k2",)  # the memo of calls too
     # a table without the mode column: mode is no key
     old = tmp_path / "old.csv"
     old.write_text("dt,n,config,us\na,4,k3,1.0\n")

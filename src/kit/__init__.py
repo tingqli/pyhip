@@ -66,6 +66,8 @@ Conventions:
   dict of error metrics. Default: ``torch.testing.assert_close``. The first two
   arguments come by position: name them apart from the interface's parameters.
 * ``<op>_dims(...)`` takes the ref's parameters and returns vocabulary values.
+  ``op(...)`` calls it on every call (``config=`` too): the place to check the
+  arguments.
 * ``<op>_fallback(...)`` (optional) takes vocabulary names (and ``capturing``) and
   returns configs (dicts or names) in order of preference, tried when the tuned table
   has none that can run. Default: the grid points in definition order.
@@ -92,7 +94,9 @@ capturing=)``:
   config, fastest first, that meets its limits (``capturing`` included); then the
   ``<op>_fallback`` configs; else ValueError with the reasons.
 * Memoized per (table, its mtime, vocabulary values, capturing): the returned dict is
-  shared, do not modify it.
+  shared, do not modify it; ``op(...)`` memoizes its pick per (table, its mtime,
+  capturing, the ``<op>_dims`` values and hints of the call). The mtime is read at
+  most once a second per table: an edited table is used within a second.
 
 The decorators only record themselves in ``f.kit_marks`` (in written order) and return
 ``f`` unchanged. ``pyhip.kit.testing`` turns the ops into pytest tests.
@@ -107,6 +111,7 @@ import os
 import re
 import string
 import sys
+import time
 import types
 from collections.abc import Mapping
 
@@ -199,12 +204,27 @@ def _cell(s, default):
         return _guess(s)
 
 
+_RECHECK_S = 1.0  # a table's mtime is read again after this long (os.stat: ~1 us)
+_seen = {}  # path -> (monotonic time read, mtime or None)
+
+
 def _version(path):
-    """Cache key of a table file: its mtime (None: no table)."""
-    try:
-        return os.stat(path).st_mtime if path else None
-    except OSError:
+    """Cache key of a table file: its mtime (None: no table), read at most every
+    ``_RECHECK_S`` seconds."""
+    if not path:
         return None
+    now = time.monotonic()
+    got = _seen.get(path)
+    if got is not None and now - got[0] < _RECHECK_S:
+        return got[1]
+    try:
+        version = os.stat(path).st_mtime
+    except OSError:
+        version = None
+    if len(_seen) >= 64:
+        _seen.clear()
+    _seen[path] = (now, version)
+    return version
 
 
 @functools.lru_cache(maxsize=16)
@@ -217,12 +237,19 @@ def _read_table(path, version):
     return tuple(reader.fieldnames or ()), rows
 
 
+_cuda = None  # torch.cuda once CUDA is initialized
+
+
 def _capturing():
     """Whether the current CUDA stream is capturing a graph (False without torch or
     before CUDA is initialized: nothing can capture then)."""
-    torch = sys.modules.get("torch")
-    return bool(torch is not None and torch.cuda.is_initialized()
-                and torch.cuda.is_current_stream_capturing())
+    global _cuda
+    if _cuda is None:
+        torch = sys.modules.get("torch")
+        if torch is None or not torch.cuda.is_initialized():
+            return False
+        _cuda = torch.cuda
+    return _cuda.is_current_stream_capturing()
 
 
 class param(_Mark):
@@ -428,7 +455,7 @@ class Op:
 
     __slots__ = ("name", "ref", "test", "check", "dims", "fallback", "impls", "vocab", "_imp",
                  "_fns", "_axes", "_test_defaults", "_ref_params", "_ref_names", "_registry",
-                 "_fallback", "_vget", "_blank", "_tables", "_memo")
+                 "_fallback", "_vget", "_blank", "_tables", "_memo", "_calls")
 
     def __init__(self, name, ref, registry=None):
         ref_params = list(inspect.signature(ref).parameters.values())
@@ -448,7 +475,7 @@ class Op:
                          _ref_names=frozenset(p.name for p in ref_params),
                          _registry=registry if registry is not None else Registry(),
                          _fallback=None, _vget=_getter(()), _blank={}, _tables={},
-                         _memo={}).items():
+                         _memo={}, _calls={}).items():
             object.__setattr__(self, k, v)
 
     def _add(self, suffix, f):
@@ -507,6 +534,7 @@ class Op:
         object.__setattr__(self, "_fallback", call)
         object.__setattr__(self, "fallback", f)
         self._memo.clear()
+        self._calls.clear()
 
     def _add_helper(self, role, f):
         """``<op>_check`` / ``<op>_dims``: no marks; they take the ref's arguments."""
@@ -533,6 +561,7 @@ class Op:
             raise
         self._tables.clear()  # the table rows of this kind count from now on
         self._memo.clear()
+        self._calls.clear()
 
     def __setattr__(self, k, v):
         raise AttributeError(f"Op is read-only ({k})")
@@ -690,22 +719,39 @@ class Op:
         """Run the op on the interface arguments: ``config`` (a dict or a name;
         unchecked) if given, else ``pick`` on the vocabulary of the call (``<op>_dims``
         and the keyword arguments that are vocabulary names, e.g. ``routing=``)."""
-        hints = {k: kwargs.pop(k) for k in [k for k in kwargs if k not in self._ref_names]}
-        bad = _unknown(hints, self.vocab)
-        if bad:
-            raise TypeError(f"{self.name}: unknown argument(s) {bad}: neither parameters of "
-                            f"{self.name}_ref nor vocabulary names {list(self.vocab)}")
-        if config is None:
-            if self.dims is None:
-                raise TypeError(f"{self.name}: picking a config needs {self.name}_dims; "
-                                "pass config=")
-            vocab = dict(self._blank)
-            vocab.update(self.dims(*args, **kwargs))
-            vocab.update(hints)
-            config = self.pick(vocab, table=table, capturing=_capturing())
-        elif isinstance(config, str):
-            config = self.parse(config)
-        return self.run(config, *args, **kwargs)
+        hints = None
+        if not kwargs.keys() <= self._ref_names:
+            hints = {k: kwargs.pop(k) for k in [k for k in kwargs if k not in self._ref_names]}
+            bad = _unknown(hints, self.vocab)
+            if bad:
+                raise TypeError(f"{self.name}: unknown argument(s) {bad}: neither parameters "
+                                f"of {self.name}_ref nor vocabulary names {list(self.vocab)}")
+        dims = self.dims
+        if config is not None:
+            if dims is not None:
+                dims(*args, **kwargs)  # it checks the arguments
+            if isinstance(config, str):
+                config = self.parse(config)
+            knobs = dict(config)
+            return self._fns[knobs.pop("kind")](*args, **kwargs, **knobs)
+        if dims is None:
+            raise TypeError(f"{self.name}: picking a config needs {self.name}_dims; "
+                            "pass config=")
+        got = dims(*args, **kwargs)
+        path = self._registry.table if table is _DEFAULT else table
+        capturing = _capturing()
+        # memo of the call: (implementation, knobs) per vocabulary of the call
+        key = (path, _version(path), capturing, tuple(got.items()),
+               tuple(hints.items()) if hints else None)
+        hit = self._calls.get(key)
+        if hit is None:
+            knobs = dict(self.pick({**self._blank, **got, **(hints or {})}, table=path,
+                                   capturing=capturing))
+            if len(self._calls) >= _MEMO_MAX:
+                self._calls.clear()
+            hit = self._calls[key] = (self._fns[knobs.pop("kind")], knobs)
+        fn, knobs = hit
+        return fn(*args, **kwargs, **knobs)
 
     def pick(self, vocab, *, table=_DEFAULT, capturing=False):
         """The config ``op(...)`` runs for ``vocab`` (see the module docstring): from the
