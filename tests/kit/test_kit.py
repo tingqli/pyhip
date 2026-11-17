@@ -1,24 +1,29 @@
-"""CPU tests of pyhip.kit (no GPU): discovery, grids, limits, config names, the checks
-``collect`` runs on the conventions, and the pytest tests ``kit.testing`` generates."""
+"""CPU tests of pyhip.kit (no GPU): registration, grids, limits, config names, the checks
+a registration runs on the conventions, and the pytest tests ``kit.testing`` generates."""
 
 import textwrap
 
 import pytest
 
-from pyhip.kit import collect, meta, param, requires, stack
+from pyhip.kit import Registry, meta, param, requires, stack
 from pyhip.kit.testing import assert_close
 
 pytest_plugins = ["pytester"]
 
 TOY = '''
 import random
-from pyhip.kit import collect, meta, param, requires, stack
+from pyhip.kit import Registry, meta, param, requires, stack
+
+ops = Registry()
+op_register = ops.register
 
 
+@op_register
 def axpy_ref(x, y, *, alpha=1.0):
     return [alpha * a + b for a, b in zip(x, y)]
 
 
+@op_register
 @param("n", (4, 6), id="n{}")
 @param("alpha", {"a1": 1.0, "a2": 2.0})
 def axpy_test(n, alpha, seed=0):
@@ -27,10 +32,12 @@ def axpy_test(n, alpha, seed=0):
                 alpha=alpha)
 
 
+@op_register
 def axpy_dims(x, y, *, alpha=1.0):
     return dict(n=len(x), alpha=alpha)
 
 
+@op_register
 def axpy_check(out, expected, **inputs):
     assert len(out) == len(expected), (len(out), len(expected))
     err = max((abs(a - b) for a, b in zip(out, expected)), default=0.0)
@@ -38,6 +45,7 @@ def axpy_check(out, expected, **inputs):
     return {"err": err}
 
 
+@op_register
 def axpy_loop(x, y, *, alpha=1.0):
     return [alpha * a + b for a, b in zip(x, y)]
 
@@ -46,6 +54,7 @@ tiles = stack(param("block", (2, 4), id="b{}"),
               requires(lambda n, block: n % block == 0, "n={n} % block {block}"))
 
 
+@op_register
 @tiles
 @meta(rows=lambda block: block * 8, graph_safe=True)
 def axpy_tiled(x, y, *, alpha=1.0, block=2, **over):
@@ -55,6 +64,7 @@ def axpy_tiled(x, y, *, alpha=1.0, block=2, **over):
     return out
 
 
+@op_register
 @param("mode", ("fast", "slow"), id="{}")
 @requires(lambda capturing: not capturing, "not graph-safe")
 @meta(rows=None, graph_safe=False)
@@ -62,30 +72,41 @@ def axpy_queue(x, y, *, alpha=1.0, mode="fast"):
     return [alpha * a + b for a, b in zip(x, y)]
 
 
+@op_register
 def axpy_dyn_ref(x, y, valid, *, alpha=1.0):
     return [alpha * a + b if i < valid else 0.0 for i, (a, b) in enumerate(zip(x, y))]
 
 
+@op_register
 def axpy_dyn_loop(x, y, valid, *, alpha=1.0):
     return axpy_dyn_ref(x, y, valid, alpha=alpha)
 
-
-OPS = collect(globals())
 '''
 
 
-@pytest.fixture(scope="module")
-def toy():
+def _toy():
     ns = {"__name__": "toy"}
     exec(compile(TOY, "toy.py", "exec"), ns)
     return ns
 
 
+@pytest.fixture(scope="module")
+def toy():
+    return _toy()
+
+
 def _ops(src):
-    ns = {}
-    exec(textwrap.dedent(src), {"collect": collect, "param": param, "requires": requires,
-                                "meta": meta, "stack": stack}, ns)
-    return collect(ns)
+    """A fresh Registry holding the top-level functions of ``src``, each registered as
+    it is defined (``@op_register`` inserted above its decorators)."""
+    lines, out = textwrap.dedent(src).splitlines(), []
+    for i, line in enumerate(lines):
+        if line.startswith(("@", "def ")) and not (i and lines[i - 1].startswith("@")):
+            out.append("@op_register")
+        out.append(line)
+    reg = Registry()
+    exec("\n".join(out), {"op_register": reg.register, "param": param, "requires": requires,
+                          "meta": meta, "stack": stack}, {})
+    return reg
 
 
 def _raises(src, match):
@@ -93,19 +114,73 @@ def _raises(src, match):
         _ops(src)
 
 
-def test_discovery(toy):
-    ops = toy["OPS"]
-    assert list(ops) == ["axpy", "axpy_dyn"]
+def test_registration(toy):
+    ops = toy["ops"]
+    assert list(ops) == ["axpy", "axpy_dyn"] and len(ops) == 2 and "axpy" in ops
     op = ops["axpy"]
+    assert ops.axpy is op
     assert (op.ref, op.test, op.check, op.dims) == (toy["axpy_ref"], toy["axpy_test"],
                                                      toy["axpy_check"], toy["axpy_dims"])
     assert list(op.impls) == ["loop", "tiled", "queue"]  # axpy_dyn_* go to the longer prefix
     assert op.vocab == ("n", "alpha", "seed")
     dyn = ops["axpy_dyn"]
     assert list(dyn.impls) == ["loop"] and dyn.test is None and dyn.vocab == ()
+    assert (toy["axpy_tiled"].kit_op, toy["axpy_dyn_loop"].kit_op) == ("axpy", "axpy_dyn")
     assert repr(op) == "Op('axpy', impls=['loop', 'tiled', 'queue'])"
+    assert repr(ops) == "Registry(['axpy', 'axpy_dyn'])"
     with pytest.raises(AttributeError):
         op.name = "x"
+    with pytest.raises(AttributeError, match="no op 'nope'; registered: "):
+        ops.nope  # noqa: B018
+    with pytest.raises(AttributeError):
+        ops._nope  # noqa: B018
+    other = _toy()["ops"]  # a package imported twice: two independent registries
+    assert other["axpy"] is not op and list(other["axpy"].impls) == list(op.impls)
+
+
+def test_registration_rules():
+    ref = "def f_ref(x, *, a=1): pass\n"
+    _raises("def f_k(x): pass\n" + ref, r"register its <op>_ref first")
+    _raises(ref + "def f_k(x, *, a=1): pass\ndef f_test(n=1): pass",
+            "register it before the implementations")
+    _raises(ref + "def f_dyn_test(n=1): pass", "register f_dyn_ref first")
+    _raises(ref + "def f_dyn_k(x, *, a=1): pass\ndef f_dyn_ref(y): pass",
+            "f_dyn_k was registered before it")
+    _raises(ref + ref, "op 'f' is already registered")
+    _raises(ref + "def f_dims(x, *, a=1): pass\n" * 2, "f_dims is already registered")
+    _raises(ref + "def f_k(x, *, a=1): pass\n" * 2, "f_k is already registered")
+    _raises("def items_ref(x): pass", r"taken by Registry.items")
+    _raises("def _f_ref(x): pass", "private")
+    reg = Registry()
+    for bad in (int, len, param("a", (1,)), lambda x: x):
+        with pytest.raises(TypeError):
+            reg.register(bad)
+
+    @reg.register
+    def g_ref(x):
+        pass
+
+    with pytest.raises(TypeError, match="g_ref is already registered"):
+        reg.register(g_ref)
+    with pytest.raises(TypeError, match="outermost decorator, above meta"):
+        @meta(k=1)
+        @reg.register
+        def g_k(x):
+            pass
+    with pytest.raises(TypeError, match="outermost"):
+        stack(param("b", (1,)))(g_ref)
+
+    def g_bad(x, *, b=1):  # a knob without its @param
+        pass
+
+    @param("b", ("x y", "z"), id="{}")
+    def g_odd(x, *, b="z"):  # a value that cannot appear in a config name
+        pass
+
+    for f, match in ((g_bad, "each knob needs exactly one @param"), (g_odd, "cannot parse")):
+        with pytest.raises(TypeError, match=match):
+            reg.register(f)
+        assert "kit_op" not in f.__dict__ and list(reg.g.impls) == ["k"]  # left no trace
 
 
 def test_marks_return_the_function_in_written_order():
@@ -129,10 +204,10 @@ def test_marks_return_the_function_in_written_order():
 
 
 def test_cases(toy):
-    cases = toy["OPS"]["axpy"].cases()
+    cases = toy["ops"]["axpy"].cases()
     assert [cid for cid, _ in cases] == ["n4-a1", "n4-a2", "n6-a1", "n6-a2"]
     assert cases[1][1] == dict(n=4, alpha=2.0, seed=0)
-    assert toy["OPS"]["axpy_dyn"].cases() == []
+    assert toy["ops"]["axpy_dyn"].cases() == []
 
 
 def test_param_forms():
@@ -149,7 +224,7 @@ def test_param_forms():
 
 
 def test_configs_and_limits(toy):
-    op = toy["OPS"]["axpy"]
+    op = toy["ops"]["axpy"]
     vocab = dict(n=6, alpha=1.0, seed=0)
     got = [(op.name_of(c), why) for c, why in op.configs(vocab)]
     assert got == [("loop", None), ("tiled b2", None), ("tiled b4", "n=6 % block 4"),
@@ -168,7 +243,7 @@ def test_configs_and_limits(toy):
 
 
 def test_names(toy):
-    op = toy["OPS"]["axpy"]
+    op = toy["ops"]["axpy"]
     for cfg, _ in op.configs(dict(n=4, alpha=1.0, seed=0)):
         assert op.parse(op.name_of(cfg)) == cfg
     cfg = dict(kind="tiled", block=4, arb=128, tag="x1", f=0.5)
@@ -180,7 +255,7 @@ def test_names(toy):
 
 
 def test_meta_and_run(toy):
-    op = toy["OPS"]["axpy"]
+    op = toy["ops"]["axpy"]
     assert op.meta(dict(kind="tiled", block=4), "rows") == 32
     assert op.meta(dict(kind="tiled"), "graph_safe") is True
     assert op.meta(dict(kind="queue", mode="slow"), "rows") is None
@@ -226,9 +301,8 @@ def test_convention_errors():
             "cannot parse")
     _raises(ref + "@param('b', ('1', '2'), id='{}')\ndef f_k(x, *, a=1, b=0): pass",
             "reads back")
-    ok = _ops(ref + "def f_check(out, expected, **inputs): pass\ndef f_dims(x, *, a=1): pass\n"
-              "_hidden = lambda x: x\nf_alias = int\n")
-    assert list(ok["f"].impls) == []
+    ok = _ops(ref + "def f_check(out, expected, **inputs): pass\ndef f_dims(x, *, a=1): pass\n")
+    assert list(ok["f"].impls) == [] and ok.f.check is not None and ok.f.dims is not None
 
 
 def test_default_check():
@@ -243,8 +317,8 @@ def test_default_check():
 def test_generated_tests(pytester):
     pytester.makepyfile(toy=TOY)
     pytester.makepyfile(test_toy="from pyhip.kit.testing import op_tests\n"
-                                 "from toy import OPS\n"
-                                 "test_ops = op_tests(OPS)\n")
+                                 "from toy import ops\n"
+                                 "test_ops = op_tests(ops)\n")
     res = pytester.runpytest("-q", "-rs", "-p", "no:cacheprovider")
     # 4 cases x (dims + loop + tiled b2/b4 + queue fast/slow); n6 cases skip tiled b4
     res.assert_outcomes(passed=4 * 6 - 2, skipped=2)
@@ -257,14 +331,14 @@ def test_generated_tests(pytester):
 def test_generated_tests_report_failures(pytester):
     pytester.makepyfile(toy=TOY.replace("out += [alpha * a + b", "out += [alpha * a - b"))
     pytester.makepyfile(test_toy="from pyhip.kit.testing import op_tests\n"
-                                 "from toy import OPS\n"
-                                 "test_ops = op_tests(OPS)\n")
+                                 "from toy import ops\n"
+                                 "test_ops = op_tests(ops)\n")
     res = pytester.runpytest("-q", "-p", "no:cacheprovider", "-k", "tiled")
     res.assert_outcomes(failed=6, skipped=2)
 
 
 def test_toy_runs_without_pytest_helpers(toy):
-    op = toy["OPS"]["axpy"]
+    op = toy["ops"]["axpy"]
     for _, case in op.cases():
         inputs = op.test(**case)
         assert op.dims(**inputs) == {k: case[k] for k in ("n", "alpha")}

@@ -1,7 +1,7 @@
 """pytest adapter of ``pyhip.kit``.
 
     from pyhip.kit.testing import op_tests
-    test_ops = op_tests(OPS)          # in a test module; OPS = kit.collect(...)
+    test_ops = op_tests(ops)          # in a test module; ops: a kit.Registry
 
 generates, for every op with an ``<op>_test`` and every case of its grid:
 
@@ -34,7 +34,8 @@ def assert_close(out, expected, /, **_):
 
 
 def op_tests(ops):
-    """A pytest test function over every (op, case, config) of ``ops`` ({name: Op})."""
+    """A pytest test function over every (op, case, config) of ``ops`` (a ``Registry``,
+    or any mapping {name: Op})."""
     items = []
     for op in ops.values():
         if op.test is None:

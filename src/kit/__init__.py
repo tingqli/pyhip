@@ -1,25 +1,57 @@
 """pyhip.kit: an op is a family of plain functions that share a name prefix.
 
+    ops = Registry()                                  # one per package (e.g. in _ops.py)
+    op_register = ops.register
+
+    @op_register
     def axpy_ref(x, y, *, alpha=1.0):                 # op "axpy": interface + reference
         return alpha * x + y
 
+    @op_register
     @param("n", (64, 1000))
     def axpy_test(n, seed=0):                         # test inputs; vocabulary: n, seed
         g = torch.Generator().manual_seed(seed)
         return dict(x=torch.randn(n, generator=g), y=torch.randn(n, generator=g))
 
+    @op_register
     def axpy_dims(x, y, *, alpha=1.0):                # vocabulary values of a real call
         return dict(n=x.numel())
 
+    @op_register                                      # outermost, above the kit marks
     @param("block", (16, 64), id="b{}")
     @requires(lambda n, block: n % block == 0, "n={n} is not a multiple of {block}")
     def axpy_tiled(x, y, *, alpha=1.0, block=16):     # implementation "tiled", knob block
         ...
 
-    OPS = collect(globals())                          # {"axpy": Op}
-    OPS["axpy"].candidates(dict(n=64, seed=0))        # [{"kind": "tiled", "block": 16}, ...]
+    ops.axpy.candidates(dict(n=64, seed=0))           # [{"kind": "tiled", "block": 16}, ...]
 
-Conventions, checked when ``collect`` builds the ops:
+The vocabulary names are defined by the op's ``<op>_test`` function and describe a
+concrete problem instance (for example ``n`` and ``seed`` in ``axpy_test``). Knobs are
+defined by an implementation function such as ``<op>_<kind>`` and are the tuning
+choices of that implementation (for example ``block`` in ``axpy_tiled``). In other
+words, vocabulary answers "what problem am I solving?" and knobs answer "how is this
+implementation configured?".
+
+The vocabulary is used by ``<op>_dims``, ``@requires``, and ``@meta`` logic when a
+real call or a test case is evaluated. The knobs are used by the implementation's
+``@param`` grid, config naming/parsing, and runtime dispatch to choose a valid
+configuration for a given vocabulary.
+
+Registration: ``Registry.register`` (``@op_register``) adds one function to its op and
+returns it unchanged, after checking it against the conventions below:
+
+* It is the outermost decorator: the kit marks below it are complete when it checks
+  them, and a mark applied above it raises.
+* The name gives the role. ``<op>_ref`` defines op ``<op>`` and is registered first.
+  Any other ``<op>_<suffix>`` joins the registered op with the longest such prefix
+  (``moe_dyn_ep3k`` belongs to ``moe_dyn`` once ``moe_dyn_ref`` is registered): suffix
+  ``test`` / ``check`` / ``dims`` is that role, any other suffix an implementation.
+  ``<op>_test`` comes before the implementations (their limits are checked against its
+  vocabulary).
+* One registry per package (a small module holding ``ops = Registry()``, imported by
+  the modules that register): a package imported under two names keeps two registries.
+
+Conventions:
 
 * ``<op>_ref`` defines op ``<op>``: its parameters are the interface (named parameters
   only), its result the expected answer.
@@ -34,8 +66,9 @@ Conventions, checked when ``collect`` builds the ops:
   dict of error metrics. Default: ``torch.testing.assert_close``. The first two
   arguments come by position: name them apart from the interface's parameters.
 * ``<op>_dims(...)`` takes the ref's parameters and returns vocabulary values.
-* Suffixes ``ref``, ``test``, ``check``, ``dims`` are reserved. Names starting with
-  ``_``, classes and kit marks are not collected.
+* Suffixes ``ref``, ``test``, ``check``, ``dims`` are reserved; an implementation name
+  does not end in ``_test`` / ``_check`` / ``_dims`` either. Names starting with ``_``
+  are not registered.
 
 A config is a dict ``{"kind": kind, knob: value, ...}``. Its name joins the kind and the
 ``@param`` ids with spaces (``"tiled b64"``), overrides appended as ``":k=v,k=v"``.
@@ -50,8 +83,9 @@ import operator
 import re
 import string
 import types
+from collections.abc import Mapping
 
-__all__ = ["param", "requires", "meta", "stack", "collect", "Op"]
+__all__ = ["param", "requires", "meta", "stack", "Registry", "Op"]
 
 ROLES = ("ref", "test", "check", "dims")
 _FIELD = re.compile(r"\{[^{}]*\}")
@@ -64,6 +98,9 @@ class _Mark:
     def __call__(self, f):
         if not callable(f) or isinstance(f, _Mark):
             raise TypeError(f"{type(self).__name__} decorates a function, got {f!r}")
+        if "kit_op" in getattr(f, "__dict__", ()):
+            raise TypeError(f"{f.__name__}: @op_register must be the outermost decorator, "
+                            f"above {type(self).__name__}")
         f.__dict__.setdefault("kit_marks", []).insert(0, self)  # applied bottom-up
         return f
 
@@ -319,7 +356,8 @@ class _Impl:
 
 
 class Op:
-    """One op: its functions and the queries tools need. Built by ``collect``; read-only.
+    """One op: its functions and the queries tools need. Built by ``Registry.register``
+    one function at a time; read-only otherwise.
 
     Attributes: ``name``, ``ref``, ``test``, ``check``, ``dims`` (None when absent),
     ``impls`` ({kind: function}), ``vocab`` (the ``<op>_test`` parameter names). A
@@ -328,54 +366,82 @@ class Op:
     """
 
     __slots__ = ("name", "ref", "test", "check", "dims", "impls", "vocab", "_imp", "_fns",
-                 "_axes", "_test_defaults")
+                 "_axes", "_test_defaults", "_ref_params")
 
-    def __init__(self, name, ref, impls=None, *, test=None, check=None, dims=None):
+    def __init__(self, name, ref):
         ref_params = list(inspect.signature(ref).parameters.values())
         if not all(p.kind in _NAMED for p in ref_params):
             raise TypeError(f"{_sig(name, 'ref', ref)}: the interface takes named parameters "
                             "only (no '/', *args, **kwargs)")
-        for role, f in dict(ref=ref, check=check, dims=dims).items():
-            if f is not None and _marks(f):
-                raise TypeError(f"{name}_{role}: only implementations and {name}_test take "
-                                "kit marks")
-        vocab, axes, defaults = (), (), {}
-        if test is not None:
-            tps = list(inspect.signature(test).parameters.values())
-            if not all(p.kind in _NAMED for p in tps):
-                raise TypeError(f"{_sig(name, 'test', test)}: named parameters only (their "
-                                "names are the vocabulary)")
-            if any(not isinstance(m, param) for m in _marks(test)):
-                raise TypeError(f"{name}_test: only @param marks")
-            vocab = tuple(p.name for p in tps)
-            axes = tuple(_marks(test, param))
-            grid = [n for p in axes for n in p.names]
-            if _unknown(grid, vocab) or len(set(grid)) < len(grid):
-                raise TypeError(f"{name}_test: the @param names {grid} must be distinct "
-                                f"parameters of {_sig(name, 'test', test)}")
-            if any(isinstance(p.values, _Call) for p in axes):
-                raise TypeError(f"{name}_test: @param values must be a sequence or a dict")
-            missing = [p.name for p in tps if p.default is p.empty and p.name not in grid]
-            if missing:
-                raise TypeError(f"{name}_test: parameter(s) {missing} need a default or a "
-                                "@param")
-            defaults = {p.name: p.default for p in tps if p.default is not p.empty}
-        inputs = {p.name: None for p in ref_params}
-        for role, f, args in (("check", check, (None, None)), ("dims", dims, ())):
-            try:
-                if f is not None:
-                    inspect.signature(f).bind(*args, **inputs)
-            except TypeError as e:
-                raise TypeError(f"{_sig(name, role, f)} does not take the arguments of "
-                                f"{_sig(name, 'ref', ref)}: {e}") from None
-        fns = dict(impls or {})
-        imp = {k: _Impl(name, k, f, ref_params, vocab) for k, f in fns.items()}
-        for k, v in dict(name=name, ref=ref, test=test, check=check, dims=dims,
-                         impls=types.MappingProxyType(fns), vocab=vocab, _imp=imp, _fns=fns,
-                         _axes=axes, _test_defaults=defaults).items():
+        if _marks(ref):
+            raise TypeError(f"{name}_ref: only implementations and {name}_test take kit marks")
+        fns = {}
+        for k, v in dict(name=name, ref=ref, test=None, check=None, dims=None,
+                         impls=types.MappingProxyType(fns), vocab=(), _imp={}, _fns=fns,
+                         _axes=(), _test_defaults={}, _ref_params=ref_params).items():
             object.__setattr__(self, k, v)
-        for i in imp.values():
-            self._check_names(i)
+
+    def _add(self, suffix, f):
+        """Add ``f`` as role ``suffix`` (test / check / dims) or as implementation
+        ``suffix``; the op is unchanged when ``f`` breaks a convention."""
+        if suffix in ROLES and getattr(self, suffix) is not None:
+            raise TypeError(f"{self.name}_{suffix} is already registered")
+        if suffix == "test":
+            self._add_test(f)
+        elif suffix in ROLES:
+            self._add_helper(suffix, f)
+        else:
+            self._add_impl(suffix, f)
+
+    def _add_test(self, test):
+        name = self.name
+        if self._imp:
+            raise TypeError(f"{name}_test: register it before the implementations "
+                            f"{list(self._imp)} (their limits use its vocabulary)")
+        tps = list(inspect.signature(test).parameters.values())
+        if not all(p.kind in _NAMED for p in tps):
+            raise TypeError(f"{_sig(name, 'test', test)}: named parameters only (their "
+                            "names are the vocabulary)")
+        if any(not isinstance(m, param) for m in _marks(test)):
+            raise TypeError(f"{name}_test: only @param marks")
+        vocab = tuple(p.name for p in tps)
+        axes = tuple(_marks(test, param))
+        grid = [n for p in axes for n in p.names]
+        if _unknown(grid, vocab) or len(set(grid)) < len(grid):
+            raise TypeError(f"{name}_test: the @param names {grid} must be distinct "
+                            f"parameters of {_sig(name, 'test', test)}")
+        if any(isinstance(p.values, _Call) for p in axes):
+            raise TypeError(f"{name}_test: @param values must be a sequence or a dict")
+        missing = [p.name for p in tps if p.default is p.empty and p.name not in grid]
+        if missing:
+            raise TypeError(f"{name}_test: parameter(s) {missing} need a default or a @param")
+        defaults = {p.name: p.default for p in tps if p.default is not p.empty}
+        for k, v in dict(test=test, vocab=vocab, _axes=axes, _test_defaults=defaults).items():
+            object.__setattr__(self, k, v)
+
+    def _add_helper(self, role, f):
+        """``<op>_check`` / ``<op>_dims``: no marks; they take the ref's arguments."""
+        if _marks(f):
+            raise TypeError(f"{self.name}_{role}: only implementations and {self.name}_test "
+                            "take kit marks")
+        inputs = {p.name: None for p in self._ref_params}
+        try:
+            inspect.signature(f).bind(*((None, None) if role == "check" else ()), **inputs)
+        except TypeError as e:
+            raise TypeError(f"{_sig(self.name, role, f)} does not take the arguments of "
+                            f"{_sig(self.name, 'ref', self.ref)}: {e}") from None
+        object.__setattr__(self, role, f)
+
+    def _add_impl(self, kind, f):
+        if kind in self._imp:
+            raise TypeError(f"{self.name}_{kind} is already registered")
+        imp = _Impl(self.name, kind, f, self._ref_params, self.vocab)
+        self._imp[kind], self._fns[kind] = imp, f
+        try:
+            self._check_names(imp)
+        except Exception:
+            del self._imp[kind], self._fns[kind]
+            raise
 
     def __setattr__(self, k, v):
         raise AttributeError(f"Op is read-only ({k})")
@@ -528,22 +594,97 @@ class Op:
         return v(vals, extras)
 
 
-def collect(namespace):
-    """{op name: Op} from the functions of ``namespace`` (a module's ``globals()``).
+class Registry(Mapping):
+    """The ops of a package, built one function at a time by ``register`` (used as the
+    decorator ``@op_register``, see the module docstring). Read it as a mapping {op
+    name: Op} in registration order, or by attribute: ``ops.moe is ops["moe"]``. An
+    ``Op`` is the same object from its ref's registration on; later registrations add
+    to it."""
 
-    ``<op>_ref`` defines op ``<op>``; every other function named ``<op>_<suffix>`` (the
-    longest such op) is its test / check / dims, or implementation ``suffix``. Raises
-    TypeError when a function breaks a convention (see the module docstring)."""
-    fns = {k: v for k, v in namespace.items()
-           if not k.startswith("_") and callable(v) and not isinstance(v, (_Mark, type))}
-    refs = {k[:-4]: f for k, f in fns.items() if k.endswith("_ref") and len(k) > 4}
-    by_len = sorted(refs, key=len, reverse=True)
-    roles = {op: {} for op in refs}
-    impls = {op: {} for op in refs}
-    for k, f in fns.items():
-        op = next((o for o in by_len if k.startswith(o + "_") and len(k) > len(o) + 1), None)
-        if op is not None:
-            suffix = k[len(op) + 1:]
-            (roles if suffix in ROLES else impls)[op][suffix] = f
-    return {op: Op(op, refs[op], impls[op], test=roles[op].get("test"),
-                   check=roles[op].get("check"), dims=roles[op].get("dims")) for op in refs}
+    def __init__(self):
+        self._ops = {}
+
+    def register(self, f):
+        """Add ``f`` to its op, by its name (see the module docstring); return ``f``."""
+        if not inspect.isfunction(f):
+            raise TypeError(f"op_register registers a function, got {f!r}")
+        name = f.__name__
+        if "kit_op" in f.__dict__:
+            raise TypeError(f"{name} is already registered (op {f.kit_op!r})")
+        if name.startswith("_") or not name.isidentifier():
+            raise TypeError(f"{name!r}: private or unnamed functions are not registered")
+        if name.endswith("_ref") and len(name) > 4:
+            op = name[:-4]
+            self._new_op(op, f)
+        else:
+            op = self._owner(name)
+            self._ops[op]._add(name[len(op) + 1:], f)
+        f.kit_op = op
+        return f
+
+    def _new_op(self, op, ref):
+        if op in self._ops:
+            raise TypeError(f"{op}_ref: op {op!r} is already registered")
+        if hasattr(Registry, op):
+            raise TypeError(f"{op}_ref: the op name {op!r} is taken by Registry.{op}")
+        for o in self._ops.values():
+            pre = op[len(o.name) + 1:] + "_" if op.startswith(o.name + "_") else None
+            early = [k for k in o.impls if pre and k.startswith(pre)]
+            if early:
+                raise TypeError(f"{op}_ref: {o.name}_{early[0]} was registered before it and "
+                                f"went to op {o.name!r}; register {op}_ref first")
+        self._ops[op] = Op(op, ref)
+
+    def _owner(self, name):
+        """The registered op with the longest prefix of ``name``."""
+        op = max((o for o in self._ops if name.startswith(o + "_") and len(name) > len(o) + 1),
+                 key=len, default=None)
+        if op is None:
+            raise TypeError(f"{name}: no registered op is a prefix of the name; register its "
+                            f"<op>_ref first (registered: {list(self._ops)})")
+        head, _, role = name[len(op) + 1:].rpartition("_")
+        if head and role in ROLES:
+            raise TypeError(f"{name}: no op {op}_{head} is registered; register "
+                            f"{op}_{head}_ref first (implementation names do not end in "
+                            f"_{role})")
+        return op
+
+    def __getitem__(self, name):
+        return self._ops[name]
+
+    def __iter__(self):
+        return iter(self._ops)
+
+    def __len__(self):
+        return len(self._ops)
+
+    def __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        try:
+            return self._ops[name]
+        except KeyError:
+            raise AttributeError(f"no op {name!r}; registered: {list(self._ops)} (import the "
+                                 f"module that registers {name}_ref)") from None
+
+    def __dir__(self):
+        return [*super().__dir__(), *self._ops]
+
+    def __repr__(self):
+        return f"Registry({list(self._ops)})"
+
+
+def collect(namespace):
+    """Transition only (removed when a8w4 registers its functions): a Registry of the
+    functions of ``namespace`` named ``<op>_...`` for some ``<op>_ref`` in it, the refs
+    registered first, then the tests, then the rest in namespace order."""
+    fns = {k: f for k, f in namespace.items() if not k.startswith("_") and inspect.isfunction(f)}
+    reg = Registry()
+    refs = [f for k, f in fns.items() if k.endswith("_ref") and len(k) > 4]
+    for f in refs:
+        reg.register(f)
+    rest = [f for k, f in fns.items() if f not in refs
+            and any(k.startswith(o + "_") and len(k) > len(o) + 1 for o in reg)]
+    for f in sorted(rest, key=lambda f: not f.__name__.endswith("_test")):
+        reg.register(f)
+    return reg
