@@ -1,12 +1,13 @@
 """Figures for docs/megamoe_ep8_942/mega_moe_ep8_impl.md and mega_moe_ep8_att.md.
 
-    python docs/megamoe_ep8_942/images/mega_moe_impl.py [FONT_DIR] [--from-trace TRACE.pt]
+    python docs/megamoe_ep8_942/images/mega_moe_impl.py [FONT_DIR] [--from-trace TRACE.pt ...]
 
-FONT_DIR holds NotoSansSC-*.otf (default /tmp/fonts). --from-trace refreshes data/trace_32k_balanced_bf16_rank0.json.gz
-from `trace_ep8_mega.py --routing balanced --save TRACE.pt` (rank 0's tasks).
+FONT_DIR holds NotoSansSC-*.otf (default /tmp/fonts). --from-trace refreshes data/trace_32k_{routing}_bf16_rank0.json.gz
+from `trace_ep8_mega.py --routing {balanced,random} --save TRACE.pt` (rank 0's tasks and block experts, the count matrix).
 Example everywhere: MiMo-V2.6-Flash MoE layer, EP8, H 4096, I 2048, 256 experts (32 per rank), top-8, 4096 tokens per
-rank (32k in total), balanced routing: every (source rank, expert) pair carries 128 routes, so every rank receives
-32 x 1024 routes = 128 full blocks of 256 rows.
+rank (32k in total). Balanced routing: every (source rank, expert) pair carries 128 routes, so every rank receives
+32 x 1024 routes = 128 full blocks of 256 rows. Random routing (seed 0, the *_random.png figures): rank 0 receives 33204
+routes in 148 blocks, the last block of an expert partly padding.
 """
 
 import argparse
@@ -25,7 +26,8 @@ from matplotlib import font_manager  # noqa: E402
 from matplotlib.patches import FancyArrowPatch, FancyBboxPatch, Rectangle  # noqa: E402
 
 HERE = Path(__file__).parent
-DATA = HERE / "data" / "trace_32k_balanced_bf16_rank0.json.gz"
+DATA = HERE / "data"
+ROUTING = dict(balanced="均匀路由", random="随机路由")
 
 NPES, E_LOCAL, NG, ND, QUEUES, QP, LAG, PAIR, CUS_PER_XCD = 8, 32, 16, 16, 8, 2, 2, 2, 38
 BLOCKS = 128
@@ -55,15 +57,43 @@ def decode(queue, ticket, blocks=BLOCKS):
         else:
             tail = mid - (gate + down) * (groups - lead)
             kind, group, sub = "D", groups - lead + tail // down, tail % down
-    return kind, first + group * PAIR + sub % PAIR, sub // PAIR
+    local = group * PAIR + sub % PAIR
+    # An odd last block leaves its pair partner's tasks empty (block None).
+    return kind, first + local if local < own else None, sub // PAIR
 
 
-def name(kind, block, tile):
-    """e{expert}_blk{block within the expert}_N{tile} (balanced: 4 blocks per expert)."""
-    return f"e{block // 4}_blk{block % 4}_N{tile}" if kind != "P" else "producer"
+def block_rows(counts, rank=0):
+    """(local expert, rows) of each block of a rank: an expert's routes from all sources in whole blocks of 256 rows."""
+    blocks = []
+    for e in range(E_LOCAL):
+        n = sum(row[E_LOCAL * rank + e] for row in counts)
+        blocks += [(e, min(256, n - 256 * j)) for j in range((n + 255) // 256)]
+    return blocks
+
+
+def block_names(experts):
+    """e{expert}_blk{block within the expert} of each block, from the rank's expert_ids."""
+    seen = defaultdict(int)
+    names = []
+    for e in experts:
+        names.append(f"e{e}_blk{seen[e]}")
+        seen[e] += 1
+    return names
+
+
+BALANCED_NAMES = block_names([b // 4 for b in range(BLOCKS)])
+
+
+def name(kind, block, tile, names=BALANCED_NAMES):
+    """e{expert}_blk{block within the expert}_N{tile}."""
+    return f"{names[block]}_N{tile}" if kind != "P" else "producer"
 
 
 # ----------------------------------------------------------------------------------------------- trace data
+
+
+def trace_file(routing):
+    return DATA / f"trace_32k_{routing}_bf16_rank0.json.gz"
 
 
 def extract(trace_pt):
@@ -73,14 +103,15 @@ def extract(trace_pt):
     raw = d["traces"][0].view(-1, 8).tolist()
     qcap = d["traces"][0].numel() // 8 // 8
     experts = d["expert_ids"][0].tolist()
-    assert len(experts) == BLOCKS and all(e == b // 4 for b, e in enumerate(experts)), "expects the balanced example"
+    counts = d["counts"].tolist()
+    assert [e for e, _ in block_rows(counts)] == experts, "rank 0's expert_ids do not match the count matrix"
     rows = [(i, r) for i, r in enumerate(raw) if r[3] & 0xFF in (1, 2, 3)]
     t0 = min(r[4] for _, r in rows)
     us = lambda t: round(((t - t0) & 0xFFFFFFFF) * 0.01, 2)
     tasks = []
     for i, r in rows:
         queue, ticket = divmod(i, qcap)
-        kind, block, tile = decode(queue, ticket)
+        kind, block, tile = decode(queue, ticket, len(experts))
         assert {"P": 1, "G": 2, "D": 3}[kind] == r[3] & 0xFF, (queue, ticket)
         entry, start, waited, end = us(r[4]), us(r[0]), us(r[1]), us(r[2])
         if kind == "P":
@@ -90,17 +121,22 @@ def extract(trace_pt):
             cyc, k0, k1 = (r[5] & 0xFFFFFFFF), (r[6] & 0xFFFFFFFF), (r[7] & 0xFFFFFFFF)
             marks = [round(waited + (end - waited) * k0 / cyc, 2), round(waited + (end - waited) * k1 / cyc, 2), cyc]
         tasks.append([kind, queue, ticket, block, tile, r[3] >> 24, (r[3] >> 8) & 0xFF, entry, start, waited, end, *marks])
-    DATA.parent.mkdir(exist_ok=True)
-    payload = dict(args=d["args"], stats=d["stats"], fields="kind queue ticket block tile xcc hw_id entry start waited end "
+    path = trace_file(d["args"]["routing"])
+    path.parent.mkdir(exist_ok=True)
+    payload = dict(args=d["args"], stats=d["stats"], experts=experts, counts=counts,
+                   fields="kind queue ticket block tile xcc hw_id entry start waited end "
                    "[P: first three chunk ends | G/D: K-loop start, K-loop end, shader clocks wait->end]", tasks=tasks)
-    with gzip.open(DATA, "wt") as f:
+    with gzip.open(path, "wt") as f:
         json.dump(payload, f)
-    print(f"wrote {DATA} ({len(tasks)} tasks)")
+    print(f"wrote {path} ({len(tasks)} tasks)")
 
 
-def load():
-    with gzip.open(DATA, "rt") as f:
+def load(routing):
+    """payload and rank 0's tasks; a GateUp / Down task also gets its block's rows and its name."""
+    with gzip.open(trace_file(routing), "rt") as f:
         payload = json.load(f)
+    names = block_names(payload["experts"])
+    rows = [n for _, n in block_rows(payload["counts"])]
     keys = "kind queue ticket block tile xcc hw entry start waited end".split()
     tasks = []
     for row in payload["tasks"]:
@@ -110,6 +146,8 @@ def load():
         else:
             t["k0"], t["k1"], t["cycles"] = row[11:14]
             t["mhz"] = t["cycles"] / max(t["end"] - t["waited"], 1e-3)
+            t["rows"] = rows[t["block"]]
+            t["name"] = name(t["kind"], t["block"], t["tile"], names) + (f"（{t['rows']}行）" if t["rows"] < 256 else "")
         t["cu"] = (t["xcc"], t["hw"])
         tasks.append(t)
     return payload, tasks
@@ -136,6 +174,7 @@ def budget(tasks):
                 acc["wait_" + t["kind"]] += t["waited"] - t["start"]
                 mfma = MFMA_CYCLES[t["kind"]] / t["mhz"]
                 acc["mfma"] += mfma
+                acc["mfma_pad"] += mfma * (256 - t["rows"]) / 256
                 acc["kloop_other"] += (t["k1"] - t["k0"]) - mfma
                 acc["pro_epi"] += (t["k0"] - t["waited"]) + (t["end"] - t["k1"])
             prev_end, prev_kind = t["end"], t["kind"]
@@ -427,6 +466,167 @@ def fig_expert_rows():
     save(fig, "impl_expert_rows.png")
 
 
+EXPERT_FILL = [("#FFF1D6", "#F8B84E"), ("#E3F0FF", "#7FB3EA")]  # (empty, rows) colors of even / odd experts' blocks
+
+
+def fig_partition_random(payload):
+    """Random routing on rank 0: blocks of every rank, rows of its experts, one expert's rows and its 8 queues."""
+    counts = payload["counts"]
+    blocks = block_rows(counts)
+    names = block_names([e for e, _ in blocks])
+    nb, rows = len(blocks), sum(n for _, n in blocks)
+    totals = [sum(counts[s][e] for s in range(NPES)) for e in range(E_LOCAL)]
+    dark, red = C["dark"], "#B03A2E"
+    # Canvas units 17..100 at 0.147 inch each for (c)-(e), 6.3 inches above them for the title, (a) and (b).
+    low, unit, above = 17, 0.147, 6.3
+    height = (100 - low) * unit + above
+    canvas_h = (100 - low) * unit / height
+    fig = plt.figure(figsize=(26, height), dpi=130)
+    fig.text(0.0, 1 - 0.2 / height, f"随机路由（每个token从256个expert里随机取top-8，seed 0）：rank 0 收到 {rows} 条路由 → {nb} 个block"
+             "（均匀路由：32768 条、128 个block）", fontsize=15, fontweight="bold", color=dark, va="top")
+    # (a) Blocks of every rank.
+    ax = fig.add_axes([0.03, canvas_h + 0.95 / height, 0.21, 4.3 / height])
+    for d in range(NPES):
+        per = block_rows(counts, d)
+        n = sum(r for _, r in per)
+        ax.bar(d, n / 256, width=0.7, color="#4C9BE8")
+        ax.bar(d, len(per) - n / 256, bottom=n / 256, width=0.7, color="#EEEEEE", hatch="///", edgecolor="#9E9E9E", lw=0)
+        ax.text(d, len(per) + 2, f"{len(per)}", ha="center", fontsize=10, fontweight="bold" if d == 0 else "normal")
+    ax.axhline(128, color="#2E7D32", ls="--", lw=1.2)
+    ax.set_ylim(0, 188)
+    ax.set_xticks(range(NPES), [f"rank{d}" for d in range(NPES)], fontsize=9)
+    ax.set_ylabel("block 数", fontsize=10)
+    ax.set_title("(a) 每个 rank 的 block 数", fontsize=12, fontweight="bold", loc="left", color=dark)
+    handles = [Rectangle((0, 0), 1, 1, fc="#4C9BE8"), Rectangle((0, 0), 1, 1, fc="#EEEEEE", hatch="///", ec="#9E9E9E"),
+               plt.Line2D([0], [0], color="#2E7D32", ls="--", lw=1.2)]
+    ax.legend(handles, ["有效行 / 256", "padding", "均匀路由：128"], loc="upper left", ncol=3, fontsize=8.5, frameon=False,
+              handlelength=1.6, columnspacing=1.0)
+    # (b) Rows of rank 0's experts by source.
+    ax = fig.add_axes([0.29, canvas_h + 0.95 / height, 0.70, 4.3 / height])
+    for e in range(E_LOCAL):
+        bottom = 0
+        for s in range(NPES):
+            ax.bar(e, counts[s][e], bottom=bottom, width=0.78, color=SRC_COLORS[s], lw=0)
+            bottom += counts[s][e]
+        top = (bottom + 255) // 256 * 256
+        ax.bar(e, top - bottom, bottom=bottom, width=0.78, color="#EEEEEE", hatch="///", edgecolor="#9E9E9E", lw=0)
+        ax.text(e, top + 12, f"{bottom}", ha="center", fontsize=7.8, color=dark)
+    for k in range(1, 6):
+        ax.axhline(256 * k, color="#777777", lw=0.6, ls=":", zorder=0)
+    ax.set_yticks([256 * k for k in range(6)])
+    ax.set_ylim(0, 1470)
+    ax.set_xlim(-0.6, E_LOCAL - 0.4)
+    ax.set_xticks(range(E_LOCAL), [f"e{e}" for e in range(E_LOCAL)], fontsize=8.5)
+    ax.set_ylabel("行（虚线 = block 边界）", fontsize=10)
+    big = sum(n > 1024 for n in totals)
+    ax.set_title(f"(b) rank 0 的 32 个本地expert：8 个源发来的行数（颜色 = 源 rank）+ 补齐到 256 的 padding（灰）。n_e = {min(totals)}–"
+                 f"{max(totals)}，{big} 个expert超过 1024 行，要 5 个block", fontsize=12, fontweight="bold", loc="left", color=dark)
+    handles = [Rectangle((0, 0), 1, 1, fc=c) for c in SRC_COLORS] + [Rectangle((0, 0), 1, 1, fc="#EEEEEE", hatch="///", ec="#9E9E9E")]
+    ax.legend(handles, [f"s{s}" for s in range(NPES)] + ["padding"], loc="upper left", ncol=9, fontsize=8.5, frameon=False,
+              bbox_to_anchor=(0, 1.0), handlelength=1.4, columnspacing=1.0)
+    for a in fig.axes:
+        for s in ("top", "right"):
+            a.spines[s].set_visible(False)
+    ax = fig.add_axes([0.0, 0.0, 1.0, canvas_h])
+    ax.set_xlim(0, 100)
+    ax.set_ylim(low, 100)
+    ax.axis("off")
+    # (c) One expert's rows: the sources interleave round by round until the fewest runs out.
+    c = [counts[s][0] for s in range(NPES)]
+    n, fewest = sum(c), min(c)
+    order = expert_rows(c)
+    nblk = (n + 255) // 256
+    ax.text(0, 99.6, f"(c) rank 0 的 e0：8 个源各发来 c = {c} 条，共 {n} 行 → {nblk} 个block。每个block一条，256 个格子 = 256 行，"
+            "颜色 = 源，灰 = padding", fontsize=12, fontweight="bold", color=dark, va="top")
+    x0, width, height = 13.0, 84.0, 1.45
+    cell = width / 256
+    for blk in range(nblk):
+        y = 95.0 - blk * 1.95
+        label = f"e0_blk{blk}  行 {256 * blk}–{256 * blk + 255}"
+        if 256 * (blk + 1) > n:
+            label = f"e0_blk{blk}：{n - 256 * blk} 行 + {256 * (blk + 1) - n} 行 padding"
+        ax.text(x0 - 0.5, y + height / 2, label, ha="right", va="center", fontsize=8.5, color=dark)
+        for k in range(256):
+            r = 256 * blk + k
+            ax.add_patch(Rectangle((x0 + k * cell, y), cell, height, fc=SRC_COLORS[order[r][0]] if r < n else "#DDDDDD", ec="none",
+                                   antialiased=False, zorder=2))
+        ax.add_patch(Rectangle((x0, y), width, height, fc="none", ec="#555555", lw=0.6, zorder=3))
+    blk, k = divmod(NPES * fewest, 256)
+    y = 95.0 - blk * 1.95
+    ax.plot([x0 + k * cell] * 2, [y - 0.25, y + height + 0.25], color=red, lw=2.0, zorder=4)
+    tail = sorted({s for s, _ in order[256 * (nblk - 1):]})
+    last = n - 256 * (nblk - 1)
+    ax.text(x0, 95.0 - nblk * 1.95 + 0.6, f"红线：第 {NPES * fewest} 行起（第 {fewest} 轮起）最少的源用完，"
+            f"之后每轮只排还有第 i 条的源、往前压紧（第 2.1 节图 (c)）。blk{nblk - 1} 的 {last} 行只来自 "
+            f"{'、'.join(f's{s}' for s in tail)}，GateUp(b, 0) 等 arrived[b] 到 expected[b] = {last}", fontsize=9, color=red,
+            va="center")
+    # (d) The blocks by queue: fill = rows, red box = a pair of two experts.
+    top = 84.0
+    ax.text(0, top, f"(d) {nb} 个block 按队列切成 8 段：队列 q = block [{nb}·q/8, {nb}·(q+1)/8)。格子里填充的高度 = 这个block的行数"
+            "（expected[b]），颜色按expert交替；红框 = 同一组的 2 个block属于不同expert", fontsize=12, fontweight="bold", color=dark,
+            va="top")
+    x0, cw, ch = 7.0, 4.25, 5.5
+    bounds = [nb * q // QUEUES for q in range(QUEUES + 1)]
+    most = max(bounds[q + 1] - bounds[q] for q in range(QUEUES))
+    for p in range(most):
+        ax.text(x0 + (p + 0.5) * cw, top - 4.4, f"p{p}", ha="center", fontsize=8.5, color="#555555")
+    for g in range((most + 1) // 2):
+        ax.text(x0 + (2 * g + 1) * cw, top - 3.1, f"组 g{g}", ha="center", fontsize=9, color=dark)
+    cross, split = 0, []
+    for q in range(QUEUES):
+        y = top - 5.0 - (q + 1) * ch
+        own = list(range(bounds[q], bounds[q + 1]))
+        ax.text(x0 - 0.4, y + ch / 2, f"队列{q}\nXCD {q}", ha="right", va="center", fontsize=9, color=dark)
+        for p, b in enumerate(own):
+            e, r = blocks[b]
+            empty, full = EXPERT_FILL[e % 2]
+            bx, by, bw, bh = x0 + p * cw + 0.1, y + 0.15, cw - 0.2, ch - 1.05
+            ax.add_patch(Rectangle((bx, by), bw, bh, fc=empty, ec="#BBBBBB", lw=0.5, zorder=2))
+            ax.add_patch(Rectangle((bx, by), bw, bh * r / 256, fc=full, ec="none", zorder=2))
+            ax.text(bx + bw / 2, by + bh / 2, f"{names[b]}\n{r} 行" if r < 256 else f"{names[b]}\nb{b}", ha="center", va="center",
+                    fontsize=7.2, color="black", zorder=3, fontweight="bold" if r < 128 else "normal")
+        for g in range(0, len(own), PAIR):
+            pair = own[g:g + PAIR]
+            gx0, gx1 = x0 + g * cw + 0.2, x0 + (g + len(pair)) * cw - 0.2
+            across = len(pair) == PAIR and blocks[pair[0]][0] != blocks[pair[1]][0]
+            cross += across
+            ax.plot([gx0, gx1], [y + ch - 0.55] * 2, color=red if across else "#999999", lw=1.6 if across else 1.0,
+                    ls="--" if len(pair) < PAIR else "-")
+            if across:
+                ax.add_patch(Rectangle((gx0 - 0.15, y + 0.05), gx1 - gx0 + 0.3, ch - 0.85, fc="none", ec=red, lw=1.8, zorder=4))
+            if len(pair) < PAIR:
+                ax.text(gx1 + 0.25, y + ch / 2, "单块组", fontsize=8, color=red, va="center")
+        if q and blocks[own[0]][0] == blocks[own[0] - 1][0]:
+            split.append(f"e{blocks[own[0]][0]}")
+        groups = (len(own) + PAIR - 1) // PAIR
+        tickets = (NG + ND) * PAIR * groups
+        note = f"{len(own)} 个block，{groups} 组\n{QP} + {tickets} = {QP + tickets} 张票"
+        if tickets > (NG + ND) * len(own):
+            note += f"\n（其中 {tickets - (NG + ND) * len(own)} 张空票）"
+        ax.text(x0 + (most + 0.75) * cw, y + ch / 2, note, va="center", fontsize=9, color=dark)
+    thin = [r for _, r in blocks if r < 128]
+    longer = [str(q) for q in range(QUEUES) if bounds[q + 1] - bounds[q] == most]
+    per_rank = [len(block_rows(counts, d)) for d in range(NPES)]
+    lines = [
+        f"• {nb} 个block（均匀路由 128）：有效 {rows} 行，padding {256 * nb - rows} 行（{(256 * nb - rows) / (256 * nb) * 100:.1f}%）。"
+        f"{big} 个expert超过 1024 行，多出来的那个block只有 {min(thin)}–{max(thin)} 行，"
+        "但 GateUp / Down 仍按 256 行算，MFMA 和满block一样多",
+        f"• 队列按 block 数平分，不看 expert：{'、'.join(split)} 的 block 分在两个队列里；队列 {'、'.join(longer)} 有 {most} 个block，"
+        f"比别的队列多 1 个（{NG + ND} 个任务）",
+        f"• 组 = 队列里相邻 2 个block，也不看 expert：{cross} 个组跨了两个expert（红框），"
+        "这两个block读不同expert的 W1 / W2，权重 tile 不能在 L2 里共享",
+        f"• 奇数个block的队列：最后一组只有 1 个block，组里另一个block的 {NG} + {ND} 个任务是空票（领到后直接领下一张）。"
+        f"每个队列 {QP} + {(NG + ND) * PAIR} × 组数 张票",
+        "• padding 行：gu_ids = down_ids = −1，GateUp 读 0、Down 不发原子加；"
+        "expected[b] < 256 的block，GateUp(b, 0) 只等 expected[b] 条路由",
+        f"• 8 个 rank 有 {min(per_rank)}–{max(per_rank)} 个block（图 (a)）。"
+        "一层要等最慢的 rank（ep_finish 互等），随机路由下由 block 多、时钟低的 rank 决定",
+    ]
+    for i, line in enumerate(lines):
+        ax.text(0.5, top - 5.0 - QUEUES * ch - 2.6 - i * 2.35, line, fontsize=10, color=dark, va="top")
+    save(fig, "impl_partition_random.png")
+
+
 # Model of one queue (XCD 0, 38 CUs) following the kernel's rules, with measured mean phase lengths (us, rank 0 trace)
 # and data-arrival times per queue position (tile-0 waits of positions 0-3 and 5 in the trace, the rest interpolated
 # up to the producers' end; later positions arrive before they are needed).
@@ -448,7 +648,8 @@ def simulate_queue(queue=0):
         request, cu, free = heapq.heappop(heap)
         kind, block, tile = decode(queue, ticket)
         start = free + MODEL["ticket"]
-        t = dict(kind=kind, block=block, tile=tile, cu=cu, ticket=ticket, entry=free, start=start)
+        t = dict(kind=kind, block=block, tile=tile, name=name(kind, block, tile), cu=cu, ticket=ticket, entry=free,
+                 start=start)
         if kind == "P":
             t.update(waited=start, k0=start, k1=start, end=start + MODEL["P"])
             heapq.heappush(heap, (t["end"], cu, t["end"]))
@@ -467,7 +668,7 @@ def simulate_queue(queue=0):
 
 
 def draw_lanes(ax, lanes, x_max, label_min=60.0, fs=6.0):
-    """lanes: [(label, [task dict with kind/block/tile/entry/start/waited/k0/k1/end])]; one row per CU."""
+    """lanes: [(label, [task dict with kind/name/entry/start/waited/k0/k1/end])]; one row per CU."""
     for row, (label, ts) in enumerate(lanes):
         y = len(lanes) - 1 - row
         ax.text(-12, y, label, ha="right", va="center", fontsize=7.2)
@@ -495,8 +696,10 @@ def draw_lanes(ax, lanes, x_max, label_min=60.0, fs=6.0):
             ax.barh(y, t["k1"] - t["k0"], left=t["k0"], height=h, color=loop, lw=0)
             ax.barh(y, t["end"] - t["k1"], left=t["k1"], height=h, color=epi, lw=0)
             ax.plot([t["end"]] * 2, [y - h / 2, y + h / 2], color="white", lw=0.6)
+            if t.get("rows", 256) < 128:
+                ax.add_patch(Rectangle((t["waited"], y - h / 2), t["end"] - t["waited"], h, fc="none", ec="#B03A2E", lw=1.2, zorder=3))
             if t["end"] - t["waited"] >= label_min:
-                ax.text((t["k0"] + t["k1"]) / 2, y, f"{t['kind']} {name(t['kind'], t['block'], t['tile'])}", ha="center",
+                ax.text((t["k0"] + t["k1"]) / 2, y, f"{t['kind']} {t['name']}", ha="center",
                         va="center", fontsize=fs, color="black" if t["kind"] == "G" else "white")
     ax.set_ylim(-0.8, len(lanes) - 0.2)
     ax.set_xlim(-2, x_max)
@@ -506,13 +709,16 @@ def draw_lanes(ax, lanes, x_max, label_min=60.0, fs=6.0):
     ax.set_xlabel("kernel 内时间 (µs)", fontsize=10)
 
 
-def lane_legend(ax, y=1.01):
+def lane_legend(ax, y=1.01, thin=False):
     items = [(C["ticket"], "领票/分派"), (C["wait"], "等待（G等数据 / D等GateUp）"), (C["pro"], "GateUp prologue"), (C["G"], "GateUp K循环"),
              (C["epi"], "GateUp epilogue"), (C["dpro"], "Down prologue"), (C["D"], "Down K循环"), (C["depi"], "Down epilogue（含combine原子加）"),
              (C["P"], "producer"), ("#A9CDF2", "等producer其余wave")]
     handles = [Rectangle((0, 0), 1, 1, fc=c, hatch="////" if c == C["wait"] else None, ec="#9A9A9A" if c == C["wait"] else "none")
                for c, _ in items]
-    ax.legend(handles, [t for _, t in items], loc="lower left", bbox_to_anchor=(0, y), ncol=10, fontsize=8.5, frameon=False,
+    if thin:
+        items.append((None, "红框：这个block不到128行（大部分是padding）"))
+        handles.append(Rectangle((0, 0), 1, 1, fc="none", ec="#B03A2E", lw=1.2))
+    ax.legend(handles, [t for _, t in items], loc="lower left", bbox_to_anchor=(0, y), ncol=len(items), fontsize=8.5, frameon=False,
               handlelength=1.6, columnspacing=1.2)
 
 
@@ -548,7 +754,8 @@ def fig_swimlane_model():
     save(fig, "impl_swimlane_model.png")
 
 
-def fig_swimlane_trace(tasks):
+def fig_swimlane_trace(tasks, payload):
+    routing = payload["args"]["routing"]
     xcd = [t for t in tasks if t["xcc"] == 0]
     by_cu = defaultdict(list)
     for t in xcd:
@@ -562,7 +769,7 @@ def fig_swimlane_trace(tasks):
     span = max(t["end"] for t in tasks)
     fig, ax = plt.subplots(figsize=(28, 15), dpi=120)
     draw_lanes(ax, lanes, span + 20)
-    lane_legend(ax)
+    lane_legend(ax, thin=routing != "balanced")
     stolen = sum(t["queue"] != 0 for t in xcd)
     row_of = {}
     for i, hw in enumerate(order):
@@ -580,10 +787,20 @@ def fig_swimlane_trace(tasks):
     first_ready = min(t["waited"] for t in xcd if t["kind"] == "G")
     ax.axvline(first_ready, color="#2E7D32", lw=1.2, ls="--")
     ax.text(first_ready + 3, -0.75, f"第一个GateUp的数据到齐（{first_ready:.0f} µs）", color="#2E7D32", fontsize=9, va="bottom")
-    ax.set_title(f"实测trace：rank 0 的 XCD 0（38个CU，{len(xcd)}个任务，其中{stolen}个来自别的队列）。8卡、每卡4096 token、均匀路由、BF16 combine；"
-                 "每条泳道一个CU，时间从rank 0第一个WG领票算起", fontsize=12, loc="left", pad=28)
+    layout = ""
+    if routing != "balanced":
+        blocks = block_rows(payload["counts"])
+        names = block_names(payload["experts"])
+        own = range(len(blocks) // QUEUES)
+        thin = "、".join(f"{names[b]}（{blocks[b][1]}行）" for b in own if blocks[b][1] < 128)
+        layout = (f"\nrank 0 收到 {sum(n for _, n in blocks)} 行 = {len(blocks)} 个block；队列0 = block 0–{own[-1]} = "
+                  f"e{blocks[0][0]}–e{blocks[own[-1]][0]}，其中 {thin} 大部分是padding"
+                  "（任务名后面的括号是这个block的行数，不到128行的画红框）")
+    ax.set_title(f"实测trace：rank 0 的 XCD 0（38个CU，{len(xcd)}个任务，其中{stolen}个来自别的队列）。8卡、每卡4096 token、"
+                 f"{ROUTING[routing]}、BF16 combine；每条泳道一个CU，时间从rank 0第一个WG领票算起{layout}", fontsize=12, loc="left",
+                 pad=46 if layout else 28)
     fig.tight_layout()
-    save(fig, "impl_swimlane_trace.png")
+    save(fig, "impl_swimlane_trace.png" if routing == "balanced" else f"impl_swimlane_trace_{routing}.png")
 
 
 BUDGET_LABELS = [("mfma", "MFMA（K循环里MFMA本身，按实测时钟）", "#2E7D32"), ("kloop_other", "K循环里的非MFMA时间", "#9CCC65"),
@@ -592,17 +809,24 @@ BUDGET_LABELS = [("mfma", "MFMA（K循环里MFMA本身，按实测时钟）", "#
                  ("tail", "收尾空闲", "#EEEEEE")]
 
 
+def stack(ax, y, b, span, labels, height=0.62, fs=8.6):
+    """One stacked bar of a budget (parts in `labels` order); returns its end."""
+    x = 0.0
+    for key, label, color in labels:
+        w = b.get(key, 0.0)
+        ax.barh(y, w, left=x, height=height, color=color, edgecolor="white", lw=1)
+        if w > 45:
+            ax.text(x + w / 2, y, f"{w:.0f}\n{w / span * 100:.0f}%", ha="center", va="center", fontsize=fs,
+                    color="white" if color in ("#2E7D32", "#5D5D5D", C["P"], "#8D8D8D") else "black")
+        x += w
+    return x
+
+
 def fig_budget(tasks):
     span, cus, b = budget(tasks)
     fig, ax = plt.subplots(figsize=(15, 4.8), dpi=150)
-    y, x = 3.0, 0.0
-    for key, label, color in BUDGET_LABELS:
-        w = b.get(key, 0.0)
-        ax.barh(y, w, left=x, height=0.62, color=color, edgecolor="white", lw=1)
-        if w > 45:
-            ax.text(x + w / 2, y, f"{w:.0f}\n{w / span * 100:.0f}%", ha="center", va="center", fontsize=8.6,
-                    color="white" if color in ("#2E7D32", "#5D5D5D", C["P"], "#8D8D8D") else "black")
-        x += w
+    y = 3.0
+    x = stack(ax, y, b, span, BUDGET_LABELS)
     ax.text(x + 20, y, f"{span:.0f} µs（实测 span）", va="center", fontsize=10.5, fontweight="bold")
     small = "、".join(f"{label} {b.get(key, 0.0):.0f} µs" for key, label, _ in BUDGET_LABELS if b.get(key, 0.0) <= 45)
     ax.text(0, y - 0.48, "窄条：" + small, fontsize=9, va="center", color="#444444")
@@ -630,6 +854,62 @@ def fig_budget(tasks):
     ax.tick_params(axis="y", length=0)
     fig.tight_layout()
     save(fig, "impl_budget.png")
+    return span, cus, b
+
+
+RANDOM_LABELS = [("mfma_rows", "MFMA：有效行", "#2E7D32"), ("mfma_pad", "MFMA：padding 行（block 里不满 256 的部分）", "#A5D6A7")]
+RANDOM_LABELS += BUDGET_LABELS[1:]
+# Exposed communication of the mega kernel with random routing (BF16 combine, 4096 tokens per rank): profile p2p minus
+# local, fp8_sweep_overlap_analysis.md section 4.3 (2026-11-13).
+RANDOM_EXPOSED = 102
+
+
+def fig_budget_random(data, ref):
+    """Random routing's per-CU budget (MFMA split into valid and padding rows) under the balanced one for reference."""
+    (payload, tasks), (ref_payload, ref_tasks) = data, ref
+    span, cus, b = budget(tasks)
+    b["mfma_rows"] = b["mfma"] - b["mfma_pad"]
+    ref_span, _, rb = budget(ref_tasks)
+    blocks = block_rows(payload["counts"])
+    rows = sum(n for _, n in blocks)
+    fig, ax = plt.subplots(figsize=(15, 5.4), dpi=150)
+    x = stack(ax, 3.2, b, span, RANDOM_LABELS)
+    ax.text(x + 20, 3.2, f"{span:.0f} µs（实测 span）", va="center", fontsize=10.5, fontweight="bold")
+    small = "、".join(f"{label} {b.get(key, 0.0):.0f} µs" for key, label, _ in RANDOM_LABELS if b.get(key, 0.0) <= 45)
+    ax.text(0, 3.2 - 0.48, "窄条：" + small, fontsize=9, va="center", color="#444444")
+    x = stack(ax, 2.2, rb, ref_span, BUDGET_LABELS, height=0.5, fs=7.6)
+    ax.text(x + 20, 2.2, f"{ref_span:.0f} µs：均匀路由，{len(ref_payload['experts'])} 个block（第8.2节的图）", va="center", fontsize=10)
+    count = {k: sum(t["kind"] == k for t in tasks) for k in "GD"}
+    ideal = (count["G"] * MFMA_CYCLES["G"] + count["D"] * MFMA_CYCLES["D"]) / 304 / 2100
+    pad = ideal * b["mfma_pad"] / b["mfma"]
+    ax.barh(1.3, ideal - pad, left=0, height=0.5, color="#81C784")
+    ax.barh(1.3, pad, left=ideal - pad, height=0.5, color="#C8E6C9")
+    ax.text(ideal + 20, 1.3, f"{ideal:.0f} µs：全部只做MFMA（2.1 GHz），其中padding行 {pad:.0f} µs；均匀路由是 631 µs", va="center",
+            fontsize=10)
+    # Rank 0 sends 32768 FP8 rows and its Down tasks send back one BF16 row per received route (measured P2P bandwidths).
+    dispatch, combine = 32768 * 4096 / 312e3, rows * 8192 / 339e3
+    ax.barh(0.4, dispatch, left=0, height=0.5, color=C["P"])
+    ax.barh(0.4, combine, left=dispatch, height=0.5, color="#1565C0")
+    ax.text(dispatch / 2, 0.4, f"dispatch ≈{dispatch:.0f}", ha="center", va="center", fontsize=8.6, color="white")
+    ax.text(dispatch + combine / 2, 0.4, f"combine（BF16远端原子加）≈{combine:.0f}", ha="center", va="center", fontsize=8.6,
+            color="white")
+    ax.text(dispatch + combine + 20, 0.4, f"通信单独跑约{round(dispatch + combine, -1):.0f} µs（回传{rows}行）；mega里露出来的约"
+            f"{RANDOM_EXPOSED} µs（profile：p2p − local）", va="center", fontsize=10)
+    ax.set_yticks([3.2, 2.2, 1.3, 0.4], ["实测：rank 0 每个CU的平均时间", "对照：均匀路由", "MFMA下限（2.1 GHz）", "通信量折算的时间"],
+                  fontsize=10)
+    ax.set_xlim(0, 3000)
+    ax.set_ylim(-0.1, 3.95)
+    mhz = lambda p: f"{p['stats'][0]['G_mhz']:.0f} / {p['stats'][0]['D_mhz']:.0f} MHz"
+    ax.set_xlabel(f"µs（8卡共32k token，随机路由，BF16 combine；rank 0 收到{rows}行 = {len(blocks)}个block，一次调用的trace，"
+                  f"时钟 GateUp / Down {mhz(payload)}；均匀路由那次 {mhz(ref_payload)}）")
+    handles = [Rectangle((0, 0), 1, 1, fc=c, ec="#BBBBBB") for _, _, c in RANDOM_LABELS]
+    ax.legend(handles, [l for _, l, _ in RANDOM_LABELS], loc="upper center", bbox_to_anchor=(0.5, 1.15), ncol=5, fontsize=9,
+              frameon=False)
+    for s in ("top", "right", "left"):
+        ax.spines[s].set_visible(False)
+    ax.tick_params(axis="y", length=0)
+    fig.tight_layout()
+    save(fig, "impl_budget_random.png")
     return span, cus, b
 
 
@@ -710,22 +990,26 @@ def fig_att():
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("font_dir", nargs="?", default="/tmp/fonts")
-    parser.add_argument("--from-trace")
+    parser.add_argument("--from-trace", action="append", default=[], help="trace_ep8_mega.py --save output (repeatable)")
     args = parser.parse_args()
     for f in Path(args.font_dir).glob("NotoSansSC-*.otf"):
         font_manager.fontManager.addfont(str(f))
     plt.rcParams["font.family"] = "Noto Sans SC"
     plt.rcParams["axes.unicode_minus"] = False
-    if args.from_trace:
-        extract(args.from_trace)
-    _, tasks = load()
+    for trace in args.from_trace:
+        extract(trace)
+    payload, tasks = load("balanced")
+    rpayload, rtasks = load("random")
     random.seed(0)
     fig_partition()
+    fig_partition_random(rpayload)
     fig_expert_rows()
     fig_swimlane_model()
-    fig_swimlane_trace(tasks)
-    span, cus, b = fig_budget(tasks)
-    print(f"budget: span {span:.0f} us over {cus} CUs: " + ", ".join(f"{k} {v:.1f}" for k, v in b.items()))
+    fig_swimlane_trace(tasks, payload)
+    fig_swimlane_trace(rtasks, rpayload)
+    for routing, (span, cus, b) in (("balanced", fig_budget(tasks)),
+                                    ("random", fig_budget_random((rpayload, rtasks), (payload, tasks)))):
+        print(f"budget {routing}: span {span:.0f} us over {cus} CUs: " + ", ".join(f"{k} {v:.1f}" for k, v in b.items()))
     fig_att()
 
 

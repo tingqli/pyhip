@@ -104,7 +104,9 @@ def main():
         dist.all_gather_object(traces, op.trace.cpu())
         dist.all_gather_object(experts, op.expert_ids[: stats["blocks"]].cpu())
         if rank == 0:
-            torch.save(dict(args=vars(args), traces=traces, expert_ids=experts, stats=gathered), args.save)
+            # C[s][g]: routes of source rank s to global expert g (the count matrix ep_prep exchanged).
+            counts = op.ws[: world * bench.EXPERTS].view(world, bench.EXPERTS).cpu()
+            torch.save(dict(args=vars(args), traces=traces, expert_ids=experts, counts=counts, stats=gathered), args.save)
     if rank == 0:
         print(f"producers={args.producers} lag={args.lag} queues={1 if args.one_queue else 8} "
               f"sync={'strict' if args.strict_sync else 'relaxed'} {'relaunch' if args.relaunch else 'persistent'} "

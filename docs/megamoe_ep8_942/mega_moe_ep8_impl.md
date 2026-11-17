@@ -1,7 +1,8 @@
-# gfx942 EP8 mega MoE：实现设计（MiMo，8卡共32k token，均匀路由，以 rank 0 为例）
+# gfx942 EP8 mega MoE：实现设计（MiMo，8卡共32k token，均匀 / 随机路由，以 rank 0 为例）
 
 这份文档写给要照着做一遍实现的开发者：数据放在哪里、任务怎么切、304 个 CU 怎么分工和互相等待、有哪些同步变量、
-代码按什么顺序执行，以及这个 kernel 离理论极限还有多远。设计的来龙去脉和历次实测见
+代码按什么顺序执行，以及这个 kernel 离理论极限还有多远。例子默认是均匀路由；随机路由下的数量、任务划分、实测 trace 和
+时间分解在第 1.1、3.6、7.3、8.5 节。设计的来龙去脉和历次实测见
 [mega_moe_ep8_design.md](mega_moe_ep8_design.md)（2026-11-12 这一轮被采纳的优化记录在它的第 8 节），FP8 combine 和 token 扫描见
 [fp8_sweep_overlap_analysis.md](fp8_sweep_overlap_analysis.md)，ATT 分析和后续优化方向见
 [mega_moe_ep8_att.md](mega_moe_ep8_att.md)，`ep_prep` / `ep_plan` 的步骤、泳道图和实测分段见
@@ -31,6 +32,9 @@
   kernel 里每个 CU 的时间（rank 0 的 trace，span 2119 µs）：MFMA 本身 65%，K 循环里的非 MFMA 时间 10%，任务的
   prologue/epilogue 12%，GateUp 等数据 6%，其余 7%。比最初的版本（2336 µs）快了约 200 µs：GateUp 的 A scale 每个 block
   转置一次（第 2.5 节）、dispatch 全局按 key 发送（第 3.4 节）。
+- 随机路由（`--routing random`）：rank 0 收到 33204 行，每个 expert 补齐到 256 行以后是 148 个 block（均匀路由 128 个），
+  其中 4684 行（12.4%）是 padding。rank 0 的 trace span 2315 µs（均匀路由 2119 µs），多出的约 200 µs 主要是 padding 行的
+  MFMA（每个 CU 192 µs）。一层由最慢的 rank 决定：2382 vs 2132 µs。见第 3.6、7.3、8.5 节。
 - 通信约 88% 被藏住（单独跑约 1220 µs，露出约 145 µs）。prologue/epilogue 完全没有被藏住（一个 CU 同时只跑一个任务）。
   理论极限和还能拿回多少见第 8 节。
 - combine 有两种：BF16（默认，远端原子加进源 rank 的 `out`）和 FP8（每条路由一行 FP8 store 到源 rank，`ep_finish` 之后
@@ -60,6 +64,19 @@ global expert 32d .. 32d+31（本地 expert e = 0..31）。每卡 4096 个 token
 | dispatch 发送量 | 约 139 MB | 每条路由 4096 B FP8 行 + 128 B scale + 8 B id/权重 |
 | combine 发送量 | 约 268 MB | 每条路由一行 BF16（4096 × 2 B），远端原子加；FP8 combine 约 138 MB（第 9 节） |
 | 计算量 | 1.65 TFLOP | GateUp 2048 × 2·256·256·4096 + Down 2048 × 2·256·256·2048 |
+
+**随机路由**（`--routing random`，bench 的默认）：每个 token 从 256 个 expert 里随机取 8 个（seed 0）。各 (源 rank, expert)
+的路由数不再相同，每个 expert 的行数补齐到 256 的整数倍，最后一个 block 不满。rank 0 的数量（图见第 3.6 节）：
+
+| 项 | 数量 | 说明 |
+|---|---|---|
+| 本卡发出的路由 | 32768 | 和均匀路由一样 |
+| 本卡收到的路由 | 33204 | 8 个 rank 在 32497–33204 之间，rank 0 最多 |
+| 每个本地 expert 的行数 | 979–1099 | 12 个 expert 不超过 1024 行，4 个 block；20 个超过 1024 行，5 个 block |
+| block（256 行） | 148 个 | 37888 行，其中 4684 行（12.4%）是 padding，20 个 block 只有 8–75 行。其他 rank 139–147 个 |
+| GateUp / Down 任务 | 各 148 × 16 = 2368 | 不满的 block 也按 256 行算 |
+| 每个队列的票 | 578 或 642 | 148 个 block 切成 18 或 19 个一段；19 个的队列最后一组只有 1 个 block，多 32 张空票 |
+| 计算量 | 1.91 TFLOP | 2368 + 2368 个任务，其中 12.4% 算的是 padding 行 |
 
 ### 1.2 buffer 一览
 
@@ -159,7 +176,8 @@ global expert 32d .. 32d+31（本地 expert e = 0..31）。每卡 4096 个 token
 ### 2.1 接收端的行布局
 
 - rank d 上，本地 expert e 占 `recv_a` 的一段连续行，起点 `base_e = Σ_{e'<e} ⌈n_{e'}/256⌉·256`（n 是 8 个源 rank
-  发给它的路由数之和）。均匀路由下 base_e = 1024e，expert e 占 block 4e .. 4e+3。
+  发给它的路由数之和）。均匀路由下 base_e = 1024e，expert e 占 block 4e .. 4e+3。随机路由下各 expert 的行数不同，
+  例如 rank 0 的 e0 有 1037 行，占 block 0–4，最后一个 block 只有 13 行（第 3.6 节）。
 - 一个 expert 的行里，源 rank s 的第 i 条路由放在第 8i + s 行（某个源的路由用完以后往前压紧，见下图）。所以每个 block 里
   8 个源 rank 各 32 行，所有源都要发到，block 才完整；但每个源只需要发自己那 32 条。
 - 行号由源 rank 自己算（`ep_plan` 里的 `mega_row`），它需要全部 8 个源的计数矩阵，这就是 `ep_prep` 先交换计数的原因。
@@ -259,7 +277,7 @@ K 循环、LDS 布局、两组 wave 错开一个 barrier 的流水线和单独�
 - WG 读 `HW_REG_XCC_ID` 得到自己所在的 XCD，先领这个 XCD 的队列（home 队列）。同一个 block 的 16 个 GateUp tile 都读
   同一份 A（1 MiB），在一个 XCD 的 L2 里共享。
 - home 队列空了，WG 才去别的队列领（先用普通 load 看 8 个票计数，只对还有票的队列做原子加）。均匀路由下这种“偷”
-  只发生在最后，rank 0 一次调用里 XCD 0 上有 19 个任务来自别的队列。
+  只发生在最后，rank 0 一次调用里 XCD 0 上有 6 个任务来自别的队列（第 7.2 节）。随机路由下队列有长有短，偷得更多（第 7.3 节）。
 
 ### 3.2 一个队列里的票顺序
 
@@ -322,6 +340,25 @@ K 循环、LDS 布局、两组 wave 错开一个 barrier 的流水线和单独�
 - 更小的票已经在某个正在运行的 WG 手里；持票的 WG 要么在跑这个任务，要么在 epilogue（不再等待），跑完就做它。
 - grid 不超过 CU 数，WG 都常驻。前提是同一时间没有别的进程占着这块 GPU。
 
+### 3.6 随机路由下的划分
+
+![随机路由下 rank 0 的 block 和队列](images/impl_partition_random.png)
+
+规则和均匀路由一样，变的是 block 数和每个 block 的行数：
+
+- **block**：每个 expert 的行数补齐到 256 的整数倍。rank 0 的 32 个 expert 有 979–1099 行，20 个超过 1024 行，多出来的
+  第 5 个 block 只有 8–75 行（图 (b)）。148 个 block 里 4684 行是 padding（12.4%）。padding 行 `gu_ids` = `down_ids` = −1：
+  GateUp 读 0，Down 不发原子加，但 MFMA 照样按 256 行算。
+- **一个 expert 的行**（图 (c)，e0）：前 8 × 118 = 944 行每轮 8 个源各一条（118 是 8 个源里最少的条数），之后用完的源
+  跳过、往前压紧（第 2.1 节）。最后一个 block 的 13 行只来自 s1、s3、s7，`expected` = 13，GateUp(b, 0) 等这 13 条到齐。
+- **队列**：`[blocks·q/8, blocks·(q+1)/8)` 按 block 数平分，不看 expert 边界。148 个 block 切成 18、19、18、19…个；
+  e8、e12、e16、e19、e23、e27 的 block 分在两个队列里。
+- **组**：仍然是队列里相邻 2 个 block，不看 expert。有 17 个组的两个 block 属于不同 expert（图里红框），它们读不同的
+  W1 / W2 tile，两个 block 共享 B 的好处没有了。
+- **票**：19 个 block 的队列最后一组只有 1 个 block，组里另一个 block 的 16 + 16 张票是空票（`run_task` 里
+  `local ≥ own`，什么也不做，领到后直接领下一张）。这些队列有 2 + 640 = 642 张票，18 个 block 的有 578 张。
+- **各 rank**：139–148 个 block（图 (a)，rank 0 最多）。`ep_finish` 要等 8 个 rank 都做完，一层由最慢的 rank 决定。
+
 ## 4. 术语表
 
 | 术语 | 含义（本文和代码里的用法） |
@@ -330,7 +367,7 @@ K 循环、LDS 布局、两组 wave 错开一个 barrier 的流水线和单独�
 | 路由（route）、slot | 一个 token 的 top-8 里的一项；slot = 它在 top-8 里的序号（0..7） |
 | 本地 expert e | 目标 rank 上的 expert 0..31（global expert = 32·rank + e） |
 | 行（sorted 行） | `recv_a` 的一行 = 一条路由。expert 的行按 256 对齐，源 s 的第 i 条在 expert 内第 8i+s 行 |
-| block | 256 个连续行，属于同一个 expert。均匀路由下每个 expert 4 个 block（blk 0..3），rank 上 128 个 |
+| block | 256 个连续行，属于同一个 expert。均匀路由下每个 expert 4 个 block（blk 0..3），rank 上 128 个；随机路由下 4 或 5 个，rank 0 上 148 个 |
 | N tile | 输出列方向的切分。GateUp：128 个输出列（256 个 W1 行），16 个；Down：256 个 hidden 列，16 个 |
 | tile / 任务 | 一个 WG 一次做的一块：GateUp 256 行 × 一个 N tile，Down 256 行 × 一个 N tile。任务名 `G/D e?_blk?_N?` |
 | 队列（queue） | 每个 XCD 一个，放一段连续的 block 和它们的全部任务（514 张票） |
@@ -507,6 +544,21 @@ ep_combine_fp8（FP8 combine）: out[t] = BF16(Σ_slot comb[t][slot] · scale)�
 - Down 任务几乎不等（平均 1.5 µs）；GateUp 任务稳定段等数据也只有约 2 µs。
 - 最后约 130 µs 里各 CU 陆续结束；XCD 0 有 6 个任务是从别的队列偷来的。
 
+### 7.3 实测 trace（随机路由）
+
+![实测 trace：随机路由，rank 0 的 XCD 0](images/impl_swimlane_trace_random.png)
+
+`trace_ep8_mega.py --routing random --save`，rank 0 的 XCD 0（队列 0 = block 0–17 = e0–e3）。和均匀路由（第 7.2 节）比：
+
+- 启动一样：第一个 GateUp 的数据在 56 µs 到齐（XCD 0 是 61 µs），第一轮的 288 个 GateUp 任务平均等 111 µs；
+  producer 在 706–803 µs 发完（均匀路由 655–767 µs）。
+- 红框是 e0_blk4（13 行）和 e1_blk4（39 行）的任务。这种不到 128 行的 block 在 rank 0 上有 20 个，共 640 个任务：
+  GateUp 和满的 block 一样长（平均 166 vs 167 µs），Down 短一点（84 vs 90 µs，epilogue 只对有效行做原子加）。
+- 收尾更长：19 个 block 的 4 个队列，最后一个任务在 2277–2315 µs 结束；18 个 block 的在 2158–2206 µs。
+  先做完的 CU 去别的队列偷 Down（rank 0 共 127 个，均匀路由 38 个；XCD 0 偷了 22 个），304 个 CU 在
+  2163–2315 µs 之间陆续结束（均匀路由 1986–2119 µs）。
+- Down 等 GateUp 平均 2.2 µs（均匀路由 1.5 µs）。
+
 ## 8. 理论极限和遮盖率
 
 ### 8.1 下限
@@ -571,6 +623,35 @@ rank 0 一次调用的 trace，304 个 CU 的平均（kernel span 2119 µs）：
 注意功耗墙：GPU 在 750 W 上限运行，K 循环里的 stall 本身耗电少，去掉 stall 时钟会降一些，省下的 cycle 不会全部变成
 时间（单独跑的 GateUp：K 循环少 14% 的 cycle，时间只少 3%）。启动和收尾的空闲段功耗低，去掉它们更接近一比一地省时间。
 逐项的 ATT 证据和优化方向见 [mega_moe_ep8_att.md](mega_moe_ep8_att.md)。
+
+### 8.5 随机路由的时间分解
+
+![随机路由下 rank 0 每个 CU 的时间分解](images/impl_budget_random.png)
+
+和第 8.2 节同样的统计（rank 0，304 个 CU 的平均）。MFMA 按每个任务所在 block 的行数拆成有效行和 padding 行：
+
+| 用途 | 随机路由 | 均匀路由 | 差 |
+|---|---|---|---|
+| MFMA：有效行 | 1353 µs | 1368 µs | −15 |
+| MFMA：padding 行 | 192 µs | 0 | +192 |
+| K 循环里的非 MFMA | 169 µs | 204 µs | −35 |
+| prologue + epilogue | 283 µs | 263 µs | +20 |
+| 等数据（GateUp） | 119 µs | 117 µs | +2 |
+| 收尾空闲 | 79 µs | 70 µs | +9 |
+| 领票 / 分派 | 62 µs | 49 µs | +13 |
+| producer | 41 µs | 38 µs | +3 |
+| 等 GateUp（Down） | 18 µs | 10 µs | +8 |
+| kernel span | 2315 µs | 2119 µs | +196 |
+
+- 多出来的时间主要是 padding 行的 MFMA：148 个 block 里有 18.3 个 block 的行是 padding。有效行的 MFMA 两边差不多
+  （33204 vs 32768 行；这次 trace 的时钟 GateUp / Down 983 / 1018 MHz，均匀路由那次 953 / 1028 MHz）。任务多了 16%，
+  领票和 prologue / epilogue 也跟着多一些。
+- K 循环里的非 MFMA 少 35 µs 和路由无关：这次 trace 的 GateUp K 循环平均 145k cycle，均匀路由那次（11-12）是 150k，
+  同一天的均匀路由 trace 也是 144k。
+- 一次 trace 的 span 受时钟影响很大：同一天连续 4 次随机路由的 trace，rank 0 的 span 2192–2444 µs，GateUp 时钟
+  971–1078 MHz；这里用的是时钟居中的一次。一层的时间看 profile：随机路由 2382 µs，均匀路由 2132 µs
+  （[fp8_sweep_overlap_analysis.md](fp8_sweep_overlap_analysis.md) 第 4.3 节，最慢的 rank）；通信露出 102 µs，比均匀路由的 141 µs 少。
+- 要省掉 padding 行的 MFMA，得让不满的 block 用更小的 M tile（例如 expert 的最后一个 block 用 64 或 128 行的 tile），还没有试过。
 
 ## 9. combine：BF16 还是 FP8，本 rank 上要不要先加
 
@@ -697,9 +778,10 @@ Down 任务：profile 每种模式跑 100 次 × 4 轮，取最快一轮之后�
 export PYTHONPATH=/tmp/pyhip_path:$PYTHONPATH            # /tmp/pyhip_path/pyhip -> src
 # 一层的时间（只跑 mega；--check-alt 和 step1 路径比对交替输入的结果）
 torchrun --nproc_per_node=8 tests/contrib/moe/ep8/bench_ep8_mori_flydsl.py --mode mega --routing balanced --iters 300 --warmup 20 --check-alt
-# 任务级 trace（第 7.2 节、第 8.2 节的数据）
+# 任务级 trace（第 7.2、8.2 节用均匀路由，第 3.6、7.3、8.5 节用随机路由）。--save 还存了 ep_prep 交换的计数矩阵
 torchrun --nproc_per_node=8 tests/contrib/moe/ep8/trace_ep8_mega.py --routing balanced --save /tmp/trace.pt
-python docs/megamoe_ep8_942/images/mega_moe_impl.py /tmp/fonts --from-trace /tmp/trace.pt
+torchrun --nproc_per_node=8 tests/contrib/moe/ep8/trace_ep8_mega.py --routing random --save /tmp/trace_random.pt
+python docs/megamoe_ep8_942/images/mega_moe_impl.py /tmp/fonts --from-trace /tmp/trace.pt --from-trace /tmp/trace_random.pt
 # 通信遮盖（第 8.3 节）
 torchrun --nproc_per_node=8 tests/contrib/moe/ep8/profile_ep8_mega_overlap.py --routing balanced
 # 两种 combine 的对比（第 9.2 节）：BF16、FP8、FP8、BF16 各跑一次，再分别 profile
@@ -720,5 +802,10 @@ torchrun --nproc_per_node=8 tests/contrib/moe/ep8/bench_ep8_mori_flydsl.py --mod
 - trace（rank 0）：span 2119 µs；GateUp 平均跑 180 µs、等 17 µs；Down 平均跑 93 µs、等 1.5 µs；时钟 953 / 1028 MHz。
 - 日志在 `/tmp/doc_refresh`（没有放进仓库）；路由统计（第 9.3 节）用 bench 的 `make_routes`（seed 0，8 个 rank）在 CPU 上算。
 - MORI 基线和 token 扫描见 [fp8_sweep_overlap_analysis.md](fp8_sweep_overlap_analysis.md) 第 4.1 节。
+
+随机路由的 trace（第 3.6、7.3、8.5 节）：2026-11-17，72e9e06（mega kernel 和 11-12 的版本只差 667b956：`send_info`
+的行号字段改成 19 位），每次运行前后 GPU 都空闲。连续 4 次，rank 0 的 span 2444 / 2192 / 2349 / 2315 µs（GateUp 时钟
+971 / 1078 / 980 / 983 MHz），图用最后一次。计数矩阵和 bench 的 `make_routes`（seed 0）在 CPU 上算的一致。同一天的均匀路由
+trace：rank 0 span 2134 µs（919 / 962 MHz），没有替换第 7.2、8.2 节的数据。
 
 第 2.5 节的 A/B（按 token 读 vs 转置）：2026-11-12，发送顺序改之前的版本，ABBA 日志和 trace 在 `/tmp/scale_t`。
