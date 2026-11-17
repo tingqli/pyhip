@@ -160,7 +160,7 @@ VARIANT_HELP = """\
 variant spec: [label=]<base>[:<override>,...]  or  [label=]py:<module | file.py>:<func>
   base      a config name (python -m a8w4.tune candidates --case ...), e.g. "tp1k bcm1 ks1",
             "ep3k l128"; a bare ep_gemm.CFGS name ("l128" = "ep3k l128"); "@table" (the
-            tuned table's pick at each token count) or "@auto" (the untuned default)
+            tuned table's pick at each token count)
   override  ep3k only: g1.<k>=v / g2.<k>=v (ep_gemm1 / ep_gemm2 kwargs: pf, bcm, acm, sch,
             st, prio, nw, ni / no, arb, tr, wpe), <k>=v (bm, rowv=32/64/128, sched, sst);
             v "-" drops the key (kernel default)
@@ -231,7 +231,7 @@ def parse_variant(text):
     base = base.strip()
     if base in EG.CFGS:
         base = f"ep3k {base}"
-    if base not in ("@table", "@auto"):
+    if base != "@table":
         try:
             cfg = MOE.parse(base)
         except (IndexError, KeyError, ValueError):
@@ -262,9 +262,10 @@ class Resolved:
 
 
 def resolve(v, case, tokens):
-    """-> Resolved, or a str: why ``v`` cannot run ``tokens`` on ``case``. The overrides
-    of an ep3k variant become config entries: ``moe_ep3k(**over)`` applies them, and its
-    ``@requires`` / ``@meta`` see them."""
+    """-> Resolved, or a str: why ``v`` has no config for ``tokens`` on ``case`` (an
+    untuned key for ``@table``). The overrides of an ep3k variant become config
+    entries: ``moe_ep3k(**over)`` applies them, and its ``@meta`` sees them. A config
+    the kernels cannot run raises at its first run."""
     kw = dict(expert_offset=case.e0, num_experts=case.shape[3], act=case.act, situ=case.situ)
     if v.func is not None:
         f = v.func
@@ -272,16 +273,11 @@ def resolve(v, case, tokens):
     try:
         if v.base == "@table":
             cfg = MOE.pick(shape_vocab(case.shape, tokens, case.act, case.routing))
-        elif v.base == "@auto":
-            cfg = MOE.pick(shape_vocab(case.shape, tokens, case.act), table=None)
         else:
             cfg = MOE.parse(v.base)
-    except ValueError as e:  # no config can run the case
+    except ValueError as e:  # no tuned config for the case
         return str(e)
     cfg = {**cfg, **v.overrides}
-    why = MOE.why_not(cfg, shape_vocab(case.shape, tokens, case.act))
-    if why:
-        return f"{MOE.name_of(cfg)}: {why}"
     return Resolved(v.label, v.spec, MOE.name_of(cfg),
                     lambda x, W, tw, ti: MOE.run(cfg, x, W, tw, ti, **kw), cfg=cfg,
                     bm=MOE.meta(cfg, "tile_m"), cached=MOE.meta(cfg, "cached_loads"))

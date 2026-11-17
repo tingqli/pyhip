@@ -65,8 +65,8 @@ SID_SINGLE = -(1 << 31)
 @flydsl_kernel
 def ep_prep_kernel(*, H, TOPK, EL, BM, EPT, QUANT, MULTI, MDYN=False):
     """Sort coverage: grid * 256 * EPT >= M * TOPK (MULTI) or 256 * EPT (single)."""
-    assert H % 512 == 0
-    assert EL <= 32, "padded-count scan runs over 32 lanes"
+    assert H % 512 == 0, f"ep_prep: model_dim={H} is not a multiple of 512"
+    assert EL <= 32, f"ep_prep: {EL} local experts > 32 (the padded-count scan runs over 32 lanes)"
     CH = H // 512  # 16 B (8 bf16) loads per lane per row
     # LDS (i32): cnt[EL+1] (slot EL = dummy for non-local entries), base[EL],
     # gcnt[EL], off[EL+1], per wave: quant row count + 64 compacted rows
@@ -156,7 +156,7 @@ def ep_prep_kernel(*, H, TOPK, EL, BM, EPT, QUANT, MULTI, MDYN=False):
             xs[t] = s
 
     # ---- sort helpers ------------------------------------------------------------
-    assert 64 % TOPK == 0
+    assert 64 % TOPK == 0, f"ep_prep: topk={TOPK} does not divide 64"
 
     @flyc.jit
     def _rc_store(rc, t, n, ok):
@@ -548,7 +548,8 @@ def ep_prep(topk_ids, topk_weights, x, *, e0, block_m, quant, num_local=32, m_va
     sids = torch.empty(cap, dtype=torch.int32, device=dev)
     sw = torch.empty(cap, dtype=torch.float32, device=dev)
     nblk = cap // block_m
-    assert nblk == (M * K) // block_m + num_local and M < 65536
+    assert M < 65536, f"ep_prep: M={M} rows >= 65536 per call"
+    assert nblk == (M * K) // block_m + num_local
     seids_sched = torch.empty(2 * nblk + SCHED_BORDER + M, dtype=torch.int32, device=dev)
     seids, sched = seids_sched[:nblk], seids_sched[nblk:2 * nblk + SCHED_BORDER]
     rc = seids_sched[2 * nblk + SCHED_BORDER:]

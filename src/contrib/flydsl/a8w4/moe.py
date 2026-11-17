@@ -21,8 +21,9 @@ Kernel families = the functions ``moe_<kind>`` below (all consume the same ``W``
 README.md). ``@op_register`` adds them, after the reference / test functions of
 ``ref.py``, to the package's ops (``_ops.py``): ``MOE`` = ``ops.moe``, ``MOE_DYN`` =
 ``ops.moe_dyn``. A config is ``{"kind": kind, knob: value, ...}``, its knobs' grid is
-the ``@param``s, its limits the ``@requires``. ``MOE(...)`` / ``MOE.pick(vocab)`` pick
-one from the tuned table (``pyhip.kit`` dispatch), else ``moe_fallback``.
+the ``@param``s; a config that cannot run a call raises (the kernels' asserts).
+``MOE(...)`` / ``MOE.pick(vocab)`` pick one from the tuned table (``pyhip.kit``
+dispatch): only tuned keys are guaranteed, an untuned one raises ValueError.
   tp2k   prep -> gemm1 (q8s epilogue) -> gemm2 (atomic scatter)
   tp1k   prep -> one fused gemm1 + gemm2 kernel (BM 64)
   tp1kq  same, persistent work-queue kernel (inter_dim 256 only; NOT graph-safe)
@@ -37,8 +38,9 @@ import copy
 
 import torch
 
-from pyhip.kit import meta, param, requires, stack
+from pyhip.kit import meta, no_capture, param, stack
 
+from . import ref as _ref  # noqa: F401 - registers the ops' ref / test / check / dims first
 from ._ops import DEFAULT_CSV, op_register, ops  # noqa: F401 - DEFAULT_CSV re-exported
 from .kernels import ep_gemm as EG
 from .kernels import ep_small as ES
@@ -48,33 +50,10 @@ from .kernels import tp_gemm1 as G1
 from .kernels import tp_gemm2 as G2
 from .kernels import tp_prep as TPP
 from .kernels.row_quant import quantize_rows
-from .ref import ACTS  # importing ref.py registers the ops' ref / test / check / dims first
 from .weights import weight_shape
 
-EP_MAX_LOCAL_EXPERTS = 32  # ep_prep / ep_small: one wave holds the per-expert scans
-EP_MAX_ROWS = 65536  # ep_prep: rows per call (num_tokens / the receive buffer's capacity)
 EP_SMALL_MAXM = 512  # ep1k compile-time token capacity
 EP_CFGS = ("t16", "s16", "s32", "m64", "l128", "l128c")  # the ep3k presets of the grid
-
-
-# =============================================================================
-# limits (shared by several kernel families)
-# =============================================================================
-
-kernel_acts = requires(lambda act: act in ACTS, "act={act!r}: the kernels implement silu, situv2")
-tp_limits = stack(
-    kernel_acts,
-    requires(lambda model_dim, inter_dim: inter_dim % 256 == 0 and model_dim % 512 == 0,
-             "TP kernels need inter_dim % 256 == 0 and model_dim % 512 == 0 "
-             "(inter_dim={inter_dim}, model_dim={model_dim})"))
-ep_limits = stack(
-    kernel_acts,
-    requires(lambda experts: experts <= EP_MAX_LOCAL_EXPERTS,
-             "experts={experts} > 32: the EP kernels scan the local experts in one wave"),
-    requires(lambda model_dim, topk: 64 % topk == 0 and model_dim % 512 == 0,
-             "EP kernels need 64 % topk == 0 and model_dim % 512 == 0 "
-             "(topk={topk}, model_dim={model_dim})"),
-    requires(lambda num_tokens: num_tokens < EP_MAX_ROWS, "num_tokens={num_tokens} >= 65536"))
 
 _DROP = "-"  # an ep3k override value that removes the key (the kernel default applies)
 
@@ -95,13 +74,6 @@ def ep_preset(cfg, over=None):
     return c
 
 
-def _arb_fits(inter_dim, preset):
-    # gemm2's K loop (K = inter_dim) needs >= 4 * PF K tiles: inter_dim >= 1024 (ARB 128)
-    # or 2048 (ARB 256)
-    arb = preset["g2"].get("arb", 256)
-    return inter_dim // arb >= 8 and (inter_dim // arb) % 4 == 0
-
-
 def _ep_cached(preset):
     return any(preset[g].get("bcm", 2) != 2 or preset[g].get("acm", 2) != 2
                for g in ("g1", "g2"))
@@ -109,10 +81,6 @@ def _ep_cached(preset):
 
 ep3k_space = stack(  # moe_ep3k and moe_dyn_ep3k
     param("cfg", EP_CFGS, id="{}"),
-    ep_limits,
-    requires(lambda cfg: cfg in EG.CFGS, "no ep3k preset {cfg!r} in ep_gemm.CFGS"),
-    requires(lambda inter_dim, cfg, **over: _arb_fits(inter_dim, ep_preset(cfg, over)),
-             "inter_dim={inter_dim} is too short for gemm2's K loop of {cfg}"),
     meta(tile_m=lambda cfg, **over: ep_preset(cfg, over)["bm"],
          cached_loads=lambda cfg, **over: _ep_cached(ep_preset(cfg, over))))
 
@@ -165,9 +133,6 @@ def _shape(W, topk_ids, num_experts):
 @param("block_m", (32, 64), id="bm{}")
 @param("g1_bcm", (1, 2), id="g1bcm{}")
 @param("g2", ("base", "nt4"), id="g2{}")
-@tp_limits
-@requires(lambda g2, inter_dim: g2 != "nt4" or inter_dim == 256,
-          "g2nt4 needs inter_dim == 256 (inter_dim={inter_dim})")
 @meta(tile_m=lambda block_m: block_m, cached_loads=lambda g1_bcm: g1_bcm != 2)
 def moe_tp2k(x, W, topk_weights, topk_ids, *, expert_offset=0, num_experts=None, act="silu",
              situ=None, block_m=32, g1_bcm=1, g2="base"):
@@ -198,10 +163,6 @@ def moe_tp2k(x, W, topk_weights, topk_ids, *, expert_offset=0, num_experts=None,
 @param("bcm", (1, 2))
 @param("ksplit", lambda inter_dim: sorted({inter_dim // c for c in (256, 384, 512)
                                            if inter_dim % c == 0}), id="ks{}")
-@tp_limits
-@requires(lambda inter_dim, ksplit: (inter_dim // 128) % ksplit == 0
-          and inter_dim // ksplit <= 512,
-          "inter_dim={inter_dim} does not split into ks{ksplit} chunks of 128..512 columns")
 @meta(tile_m=F.BM, cached_loads=lambda bcm: bcm != 2)
 def moe_tp1k(x, W, topk_weights, topk_ids, *, expert_offset=0, num_experts=None, act="silu",
              situ=None, bcm=1, ksplit=1):
@@ -216,10 +177,7 @@ def moe_tp1k(x, W, topk_weights, topk_ids, *, expert_offset=0, num_experts=None,
 
 @op_register
 @param("bcm", (1,))
-@tp_limits
-@requires(lambda inter_dim: inter_dim == 256,
-          "tp1kq needs inter_dim == 256 (inter_dim={inter_dim})")
-@requires(lambda capturing: not capturing, "tp1kq is not CUDA-graph safe (host launch epoch)")
+@no_capture("tp1kq passes its work-queue epoch as a host launch argument")
 @meta(tile_m=Q.BM, cached_loads=lambda bcm: bcm != 2)
 def moe_tp1kq(x, W, topk_weights, topk_ids, *, expert_offset=0, num_experts=None, act="silu",
               situ=None, bcm=1):
@@ -243,10 +201,6 @@ def moe_ep3k(x, W, topk_weights, topk_ids, *, expert_offset=0, num_experts=None,
 
 @op_register
 @param("maxm", (EP_SMALL_MAXM,), id="m{}")
-@ep_limits
-@requires(lambda topk, inter_dim: topk == 8 and inter_dim % 2048 == 0,
-          "ep1k needs topk == 8 and inter_dim % 2048 == 0 (topk={topk}, inter_dim={inter_dim})")
-@requires(lambda num_tokens, maxm: num_tokens <= maxm, "num_tokens={num_tokens} > maxm {maxm}")
 @meta(tile_m=None, cached_loads=False)
 def moe_ep1k(x, W, topk_weights, topk_ids, *, expert_offset=0, num_experts=None, act="silu",
              situ=None, maxm=EP_SMALL_MAXM):
@@ -261,8 +215,6 @@ def _est(M, est_tokens):
 
 @op_register
 @ep3k_space
-@requires(lambda capacity: capacity < EP_MAX_ROWS,
-          "capacity={capacity} >= 65536: ep_prep takes fewer rows per call")
 def moe_dyn_ep3k(x, W, topk_weights, topk_ids, m_valid, *, x_scale=None, expert_offset=0,
                  num_experts=None, act="silu", situ=None, est_tokens=None, out=None,
                  cfg="t16", **over):
@@ -272,33 +224,13 @@ def moe_dyn_ep3k(x, W, topk_weights, topk_ids, m_valid, *, x_scale=None, expert_
                          cfg=ep_preset(cfg, over), act=act, **(situ or {}))
 
 
-# =============================================================================
-# fallbacks: the configs the dispatch tries when no tuned point fits (no table rows
-# for the shape, or none of the point's configs can run)
-# =============================================================================
-
-
-@op_register
-def moe_fallback(num_tokens):
-    """The ep3k preset of the EP thresholds (``ep_gemm.AUTO``), then tp2k bm64."""
-    auto = next(n for lim, n in EG.AUTO if lim is None or num_tokens <= lim)
-    return [dict(kind="ep3k", cfg=auto), dict(kind="tp2k", block_m=64, g1_bcm=1, g2="base")]
-
-
-@op_register
-def moe_dyn_fallback(num_tokens):
-    """EP kernels only: the preset of the EP thresholds, the larger ones, then all."""
-    names = [n for lim, n in EG.AUTO if lim is None or num_tokens <= lim]
-    return [dict(kind="ep3k", cfg=n) for n in names + [n for _, n in EG.AUTO]]
-
-
 MOE, MOE_DYN = ops.moe, ops.moe_dyn
 
 
 def shape_vocab(shape, tokens=None, act=None, routing=None, op=MOE):
     """The vocabulary of ``op`` for ``shape`` = (H, I, E local, E global, topk), ``tokens``
-    rows (``num_tokens``), ``act`` and ``routing``; the other names None (unknown: the
-    limits that need them are skipped). For the tools that work on shape tuples."""
+    rows (``num_tokens``), ``act`` and ``routing``; the other names None (unknown). For
+    the tools that work on shape tuples."""
     H, I, E, EGl, topk = shape
     return dict(dict.fromkeys(op.vocab), model_dim=H, inter_dim=I, experts=E,
                 experts_global=EGl, topk=topk, num_tokens=tokens, act=act, routing=routing)
@@ -321,7 +253,9 @@ def a8w4_moe(x, W, topk_weights, topk_ids, *, expert_offset=0, num_experts=None,
 
     ``MOE(...)`` (``ops.moe``; ``moe_dims`` checks the inputs). ``dispatch`` goes to it:
     ``config=`` (a config dict or name to force, e.g. ``"tp1k bcm1 ks1"``), ``table=``
-    (another tuned table; None: the fallback only), vocabulary hints (``routing=``).
+    (another tuned table), vocabulary hints (``routing=``). Only tuned keys are
+    guaranteed: an untuned one raises ValueError, a forced config the kernels cannot
+    run raises their AssertionError.
     Under CUDA-graph capture only graph-safe configs are picked. M == 0 returns an
     empty output: the kernels need rows."""
     if x.shape[0] == 0:

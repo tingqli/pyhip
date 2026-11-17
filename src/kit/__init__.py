@@ -19,11 +19,11 @@
 
     @op_register                                      # outermost, above the kit marks
     @param("block", (16, 64), id="b{}")
-    @requires(lambda n, block: n % block == 0, "n={n} is not a multiple of {block}")
     def axpy_tiled(x, y, *, alpha=1.0, block=16):     # implementation "tiled", knob block
+        assert x.numel() % block == 0, f"n={x.numel()} % block {block}"  # a limit: raise
         ...
 
-    ops.axpy.candidates(dict(n=64, seed=0))           # [{"kind": "tiled", "block": 16}, ...]
+    ops.axpy.configs(dict(n=64, seed=0))              # [{"kind": "tiled", "block": 16}, ...]
 
 The vocabulary names are defined by the op's ``<op>_test`` function and describe a
 concrete problem instance (for example ``n`` and ``seed`` in ``axpy_test``). Knobs are
@@ -32,10 +32,15 @@ choices of that implementation (for example ``block`` in ``axpy_tiled``). In oth
 words, vocabulary answers "what problem am I solving?" and knobs answer "how is this
 implementation configured?".
 
-The vocabulary is used by ``<op>_dims``, ``@requires``, and ``@meta`` logic when a
-real call or a test case is evaluated. The knobs are used by the implementation's
-``@param`` grid, config naming/parsing, and runtime dispatch to choose a valid
-configuration for a given vocabulary.
+The vocabulary is used by ``<op>_dims`` and ``@meta`` logic when a real call or a test
+case is evaluated, and keys the tuned table. The knobs are used by the implementation's
+``@param`` grid, config naming/parsing, and runtime dispatch.
+
+Limits are not declared: an implementation raises (an ``assert`` is enough) when it
+cannot run a call. The tuner runs every grid point and keeps the configs that ran and
+passed ``<op>_check``; ``op(...)`` only picks those, so a call is guaranteed for a
+tuned key only. ``@no_capture(reason)`` marks an implementation that cannot run under
+CUDA-graph capture: the dispatch skips it while the current stream captures.
 
 Registration: ``Registry.register`` (``@op_register``) adds one function to its op and
 returns it unchanged, after checking it against the conventions below:
@@ -45,9 +50,9 @@ returns it unchanged, after checking it against the conventions below:
 * The name gives the role. ``<op>_ref`` defines op ``<op>`` and is registered first.
   Any other ``<op>_<suffix>`` joins the registered op with the longest such prefix
   (``moe_dyn_ep3k`` belongs to ``moe_dyn`` once ``moe_dyn_ref`` is registered): suffix
-  ``test`` / ``check`` / ``dims`` / ``fallback`` is that role, any other suffix an
-  implementation. ``<op>_test`` comes before the implementations and ``<op>_fallback``
-  (they are checked against its vocabulary).
+  ``test`` / ``check`` / ``dims`` is that role, any other suffix an implementation.
+  ``<op>_test`` comes before the implementations (they are checked against its
+  vocabulary).
 * One registry per package (a small module holding ``ops = Registry()``, imported by
   the modules that register): a package imported under two names keeps two registries.
 
@@ -60,20 +65,17 @@ Conventions:
   the ref's, then keyword-only knobs with defaults, each with a ``@param``, then
   optionally ``**over`` (free overrides, e.g. for experiments).
 * ``<op>_test(...)`` returns the interface arguments (a dict) of one problem. Its
-  parameter names are the op's vocabulary, the names ``requires`` / ``meta`` / ``dims``
-  speak; its ``@param`` grid gives the test cases.
+  parameter names are the op's vocabulary, the names ``meta`` / ``dims`` and the tuned
+  table speak; its ``@param`` grid gives the test cases.
 * ``<op>_check(out, expected, **inputs)`` raises when ``out`` is wrong; it may return a
   dict of error metrics. Default: ``torch.testing.assert_close``. The first two
   arguments come by position: name them apart from the interface's parameters.
 * ``<op>_dims(...)`` takes the ref's parameters and returns vocabulary values.
   ``op(...)`` calls it on every call (``config=`` too): the place to check the
   arguments.
-* ``<op>_fallback(...)`` (optional) takes vocabulary names (and ``capturing``) and
-  returns configs (dicts or names) in order of preference, tried when the tuned table
-  has none that can run. Default: the grid points in definition order.
-* Suffixes ``ref``, ``test``, ``check``, ``dims``, ``fallback`` are reserved; an
-  implementation name does not end in ``_test`` / ``_check`` / ``_dims`` / ``_fallback``
-  either. Names starting with ``_`` are not registered.
+* Suffixes ``ref``, ``test``, ``check``, ``dims`` are reserved; an implementation name
+  does not end in ``_test`` / ``_check`` / ``_dims`` either. Names starting with ``_``
+  are not registered.
 
 A config is a dict ``{"kind": kind, knob: value, ...}``. Its name joins the kind and the
 ``@param`` ids with spaces (``"tiled b64"``), overrides appended as ``":k=v,k=v"``.
@@ -81,18 +83,18 @@ A config is a dict ``{"kind": kind, knob: value, ...}``. Its name joins the kind
 Dispatch: ``Registry(name, table=path, bucket=name, relax={name: value})`` declares a
 tuned table for its ops. ``op(*args, **kwargs)`` reads the vocabulary of the call
 (``<op>_dims``, plus keyword arguments that are vocabulary names: hints such as
-``routing=``), picks a config (``op.pick``) and runs it; ``config=`` forces one
-(unchecked), ``table=`` another table (None: none). ``op.pick(vocab, table=,
-capturing=)``:
+``routing=``), picks a config (``op.pick``) and runs it; ``config=`` forces one,
+``table=`` another table (None: none). ``op.pick(vocab, table=, capturing=)``:
 
 * The table is a CSV. Columns that are vocabulary names are keys, except the bucket
   column; ``config`` holds a config name, ``us`` its time; other columns are ignored.
   Rows of kinds that are not implementations of the op are skipped. A key that is None
   in ``vocab`` matches the ``<op>_test`` default.
 * The rows of ``vocab``'s key (if none: the key with ``relax`` substituted), at the first
-  tuned point of the bucket >= ``vocab[bucket]`` (the largest point beyond): the first
-  config, fastest first, that meets its limits (``capturing`` included); then the
-  ``<op>_fallback`` configs; else ValueError with the reasons.
+  tuned point of the bucket >= ``vocab[bucket]`` (the largest point beyond): these are
+  ``op.tuned(vocab)``, fastest first. ``pick`` returns the first, skipping
+  ``@no_capture`` implementations when ``capturing``; no rows: ValueError (tune the key
+  or pass ``config=``).
 * Memoized per (table, its mtime, vocabulary values, capturing): the returned dict is
   shared, do not modify it; ``op(...)`` memoizes its pick per (table, its mtime,
   capturing, the ``<op>_dims`` values and hints of the call). The mtime is read at
@@ -109,15 +111,14 @@ import itertools
 import operator
 import os
 import re
-import string
 import sys
 import time
 import types
 from collections.abc import Mapping
 
-__all__ = ["param", "requires", "meta", "stack", "Registry", "Op"]
+__all__ = ["param", "no_capture", "meta", "stack", "Registry", "Op"]
 
-ROLES = ("ref", "test", "check", "dims", "fallback")
+ROLES = ("ref", "test", "check", "dims")
 _FIELD = re.compile(r"\{[^{}]*\}")
 _NAMED = (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
 _DEFAULT = object()  # table=: the registry's
@@ -142,7 +143,7 @@ def _marks(f, cls=_Mark):
 
 
 def _getter(names):
-    """ns -> tuple of ns[name] for ``names`` (C-level for 2+ names: limits are checked
+    """ns -> tuple of ns[name] for ``names`` (C-level for 2+ names: memo keys are built
     on every dispatch)."""
     if len(names) > 1:
         return operator.itemgetter(*names)
@@ -329,36 +330,21 @@ class param(_Mark):
         return {self.names[0]: _convert(text, defaults[self.names[0]])}
 
 
-def _fields(fmt):
-    """The names a format string refers to (``"{a.b} {c[0]}"`` -> {"a", "c"})."""
-    return {re.match(r"[^.\[]*", name)[0]
-            for _, name, _, _ in string.Formatter().parse(fmt) if name is not None}
+class no_capture(_Mark):
+    """The implementation cannot run under CUDA-graph capture (e.g. it passes a host
+    counter by launch argument): ``op(...)`` / ``pick`` skip it while the current
+    stream captures. ``@no_capture("host launch epoch")``."""
 
-
-class requires(_Mark):
-    """A limit of an implementation: a config cannot run unless ``pred`` is true.
-
-        @requires(lambda dim, block: dim % block == 0, "dim={dim} % block {block}")
-
-    ``pred`` and ``reason`` (a format string) use vocabulary names, knobs and
-    ``capturing`` (True when asked for CUDA-graph capture); a ``**kw`` in ``pred``
-    receives the config's overrides. The limit is skipped when a value it needs is
-    None (unknown). One ``requires`` object can decorate several functions.
-    """
-
-    def __init__(self, pred, reason):
-        self.pred, self.reason = _Call(pred), reason
-        self.fields = _fields(reason)
-        if not all(n.isidentifier() for n in self.fields):
-            raise TypeError(f"requires: reason {reason!r} may only use named fields")
+    def __init__(self, reason):
+        self.reason = reason
 
     def __repr__(self):
-        return f"requires({self.reason!r})"
+        return f"no_capture({self.reason!r})"
 
 
 class meta(_Mark):
-    """Metadata for tools, read with ``Op.meta``: constants, or functions of names (as in
-    ``requires``). ``@meta(tile_m=64, cached=lambda bcm: bcm != 2)``."""
+    """Metadata for tools, read with ``Op.meta``: constants, or functions of vocabulary
+    names and knobs. ``@meta(tile_m=64, cached=lambda bcm: bcm != 2)``."""
 
     def __init__(self, **items):
         self.items = {k: _Call(v) if callable(v) else v for k, v in items.items()}
@@ -387,8 +373,8 @@ def _sig(op, role, f):
 class _Impl:
     """An implementation as its op sees it."""
 
-    __slots__ = ("kind", "f", "params", "requires", "meta", "defaults", "knobs", "keys", "varkw",
-                 "regex")
+    __slots__ = ("kind", "f", "params", "no_capture", "meta", "defaults", "knobs", "keys",
+                 "varkw", "regex")
 
     def __init__(self, op, kind, f, ref_params, vocab):
         where = f"{op}_{kind}"
@@ -409,10 +395,10 @@ class _Impl:
                 raise TypeError(f"{where}: parameter '{p}' after the {op}_ref ones must be a "
                                 "keyword-only knob with a default, or **over")
         knobs = list(self.defaults)
-        clash = [k for k in knobs if k in vocab or k in ("kind", "capturing")]
+        clash = [k for k in knobs if k in vocab or k == "kind"]
         if clash:
             raise TypeError(f"{where}: knob(s) {clash} clash with the vocabulary of {op} "
-                            f"{list(vocab)} or with 'kind' / 'capturing'")
+                            f"{list(vocab)} or with 'kind'")
         self.params = tuple(_marks(f, param))
         names = [n for p in self.params for n in p.names]
         if len(set(names)) < len(names) or set(names) != set(knobs):
@@ -420,15 +406,12 @@ class _Impl:
                             f"@param names {names}")
         self.knobs = frozenset(knobs)
         self.keys = self.knobs | {"kind"}
-        self.requires = tuple(_marks(f, requires))
+        caps = _marks(f, no_capture)
+        self.no_capture = caps[0].reason if caps else None
         self.meta = {}
         for m in _marks(f, meta):
             self.meta.update(m.items)
-        known = (*vocab, *knobs, "capturing")
-        for r in self.requires:
-            bad = _unknown((*r.pred.names, *r.fields), known)
-            if bad:
-                raise TypeError(f"{where}: {r!r} uses unknown name(s) {bad}; known: {list(known)}")
+        known = (*vocab, *knobs)
         for k, v in self.meta.items():
             bad = _unknown(v.names, known) if isinstance(v, _Call) else ()
             if bad:
@@ -447,15 +430,15 @@ class Op:
     """One op: its functions and the queries tools need. Built by ``Registry.register``
     one function at a time; read-only otherwise.
 
-    Attributes: ``name``, ``ref``, ``test``, ``check``, ``dims``, ``fallback`` (None when
-    absent), ``impls`` ({kind: function}), ``vocab`` (the ``<op>_test`` parameter names). A
+    Attributes: ``name``, ``ref``, ``test``, ``check``, ``dims`` (None when absent),
+    ``impls`` ({kind: function}), ``vocab`` (the ``<op>_test`` parameter names). A
     ``vocab`` argument is a dict {name: value} holding every vocabulary name (None:
-    unknown; the limits that need it are skipped).
+    unknown).
     """
 
-    __slots__ = ("name", "ref", "test", "check", "dims", "fallback", "impls", "vocab", "_imp",
-                 "_fns", "_axes", "_test_defaults", "_ref_params", "_ref_names", "_registry",
-                 "_fallback", "_vget", "_blank", "_tables", "_memo", "_calls")
+    __slots__ = ("name", "ref", "test", "check", "dims", "impls", "vocab", "_imp", "_fns",
+                 "_axes", "_test_defaults", "_ref_params", "_ref_names", "_registry", "_vget",
+                 "_blank", "_tables", "_memo", "_calls")
 
     def __init__(self, name, ref, registry=None):
         ref_params = list(inspect.signature(ref).parameters.values())
@@ -469,24 +452,22 @@ class Op:
             raise TypeError(f"{_sig(name, 'ref', ref)}: {taken} are reserved (op(...) takes "
                             "config= and table=)")
         fns = {}
-        for k, v in dict(name=name, ref=ref, test=None, check=None, dims=None, fallback=None,
+        for k, v in dict(name=name, ref=ref, test=None, check=None, dims=None,
                          impls=types.MappingProxyType(fns), vocab=(), _imp={}, _fns=fns,
                          _axes=(), _test_defaults={}, _ref_params=ref_params,
                          _ref_names=frozenset(p.name for p in ref_params),
                          _registry=registry if registry is not None else Registry(),
-                         _fallback=None, _vget=_getter(()), _blank={}, _tables={},
-                         _memo={}, _calls={}).items():
+                         _vget=_getter(()), _blank={}, _tables={}, _memo={},
+                         _calls={}).items():
             object.__setattr__(self, k, v)
 
     def _add(self, suffix, f):
-        """Add ``f`` as role ``suffix`` (test / check / dims / fallback) or as
-        implementation ``suffix``; the op is unchanged when ``f`` breaks a convention."""
+        """Add ``f`` as role ``suffix`` (test / check / dims) or as implementation
+        ``suffix``; the op is unchanged when ``f`` breaks a convention."""
         if suffix in ROLES and getattr(self, suffix) is not None:
             raise TypeError(f"{self.name}_{suffix} is already registered")
         if suffix == "test":
             self._add_test(f)
-        elif suffix == "fallback":
-            self._add_fallback(f)
         elif suffix in ROLES:
             self._add_helper(suffix, f)
         else:
@@ -494,9 +475,9 @@ class Op:
 
     def _add_test(self, test):
         name = self.name
-        if self._imp or self.fallback is not None:
+        if self._imp:
             raise TypeError(f"{name}_test: register it before the implementations "
-                            f"{list(self._imp)} and {name}_fallback (they use its vocabulary)")
+                            f"{list(self._imp)} (they use its vocabulary)")
         tps = list(inspect.signature(test).parameters.values())
         if not all(p.kind in _NAMED for p in tps):
             raise TypeError(f"{_sig(name, 'test', test)}: named parameters only (their "
@@ -518,23 +499,6 @@ class Op:
         for k, v in dict(test=test, vocab=vocab, _axes=axes, _test_defaults=defaults,
                          _vget=_getter(vocab), _blank=dict.fromkeys(vocab)).items():
             object.__setattr__(self, k, v)
-
-    def _add_fallback(self, f):
-        """``<op>_fallback``: no marks; its parameters are vocabulary names (or
-        ``capturing``)."""
-        name = self.name
-        if _marks(f):
-            raise TypeError(f"{name}_fallback: only implementations and {name}_test take kit "
-                            "marks")
-        call = _Call(f)
-        bad = _unknown(call.names, (*self.vocab, "capturing"))
-        if bad:
-            raise TypeError(f"{_sig(name, 'fallback', f)} uses name(s) {bad} outside the "
-                            f"vocabulary {list(self.vocab)} (register {name}_test first)")
-        object.__setattr__(self, "_fallback", call)
-        object.__setattr__(self, "fallback", f)
-        self._memo.clear()
-        self._calls.clear()
 
     def _add_helper(self, role, f):
         """``<op>_check`` / ``<op>_dims``: no marks; they take the ref's arguments."""
@@ -611,38 +575,15 @@ class Op:
             raise TypeError(f"{self.name}_{kind}: unknown knob(s) {sorted(extras)}")
         return imp, {**imp.defaults, **{k: v for k, v in knobs.items() if k in imp.knobs}}, extras
 
-    def _why(self, imp, knobs, extras, vocab, capturing):
-        if not imp.requires:
-            return None
-        ns = {**vocab, **knobs, "capturing": capturing}
-        for r in imp.requires:
-            p = r.pred
-            try:
-                vals = p.get(ns)
-            except KeyError:
-                raise TypeError(f"{self.name}_{imp.kind}: {r!r} needs "
-                                f"{_unknown(p.names, ns)}, missing from the vocabulary "
-                                f"passed {sorted(vocab)}") from None
-            if None in vals:
-                continue
-            if not (p.f(*vals) if p.plain else p(vals, extras)):
-                return r.reason.format_map({**ns, **extras})
-        return None
+    def capturable(self, cfg):
+        """Whether ``cfg``'s implementation may run under CUDA-graph capture (no
+        ``@no_capture``)."""
+        return self._split(cfg)[0].no_capture is None
 
-    def why_not(self, cfg, vocab, *, capturing=False):
-        """None when ``cfg`` meets every ``requires`` of its implementation, else the
-        reason of the first one it fails."""
-        imp = self._imp.get(cfg.get("kind"))
-        if imp is not None and cfg.keys() == imp.keys:  # fast path: all knobs, no overrides
-            knobs = dict(cfg)
-            del knobs["kind"]
-            return self._why(imp, knobs, {}, vocab, capturing)
-        imp, knobs, extras = self._split(cfg)
-        return self._why(imp, knobs, extras, vocab, capturing)
-
-    def configs(self, vocab, *, capturing=False):
-        """(cfg, None or the reason it cannot run) for every grid point of every
-        implementation, in definition order."""
+    def configs(self, vocab):
+        """Every grid point of every implementation, in definition order (``vocab`` feeds
+        the ``@param`` values functions). Whether one runs on ``vocab``: run it."""
+        out = []
         for imp in self._imp.values():
             try:
                 axes = [p.points(vocab) for p in imp.params]
@@ -650,15 +591,11 @@ class Op:
                 raise TypeError(f"{self.name}_{imp.kind}: the vocabulary passed lacks "
                                 f"{e}") from None
             for combo in itertools.product(*axes):
-                knobs = {}
+                cfg = dict(kind=imp.kind)
                 for _, vals in combo:
-                    knobs.update(vals)
-                yield (dict(kind=imp.kind, **knobs),
-                       self._why(imp, {**imp.defaults, **knobs}, {}, vocab, capturing))
-
-    def candidates(self, vocab, *, capturing=False):
-        """The configs that can run on ``vocab``."""
-        return [c for c, why in self.configs(vocab, capturing=capturing) if why is None]
+                    cfg.update(vals)
+                out.append(cfg)
+        return out
 
     def name_of(self, cfg):
         imp, knobs, extras = self._split(cfg)
@@ -705,7 +642,7 @@ class Op:
                            f"{sorted(imp.meta)}") from None
         if not isinstance(v, _Call):
             return v
-        ns = {**(vocab or {}), **knobs, "capturing": False}
+        ns = {**(vocab or {}), **knobs}
         try:
             vals = [ns[n] for n in v.names]
         except KeyError:
@@ -716,9 +653,9 @@ class Op:
     # ---- dispatch -----------------------------------------------------------------
 
     def __call__(self, *args, config=None, table=_DEFAULT, **kwargs):
-        """Run the op on the interface arguments: ``config`` (a dict or a name;
-        unchecked) if given, else ``pick`` on the vocabulary of the call (``<op>_dims``
-        and the keyword arguments that are vocabulary names, e.g. ``routing=``)."""
+        """Run the op on the interface arguments: ``config`` (a dict or a name) if given,
+        else ``pick`` on the vocabulary of the call (``<op>_dims`` and the keyword
+        arguments that are vocabulary names, e.g. ``routing=``)."""
         hints = None
         if not kwargs.keys() <= self._ref_names:
             hints = {k: kwargs.pop(k) for k in [k for k in kwargs if k not in self._ref_names]}
@@ -754,9 +691,9 @@ class Op:
         return fn(*args, **kwargs, **knobs)
 
     def pick(self, vocab, *, table=_DEFAULT, capturing=False):
-        """The config ``op(...)`` runs for ``vocab`` (see the module docstring): from the
-        tuned table (``table``: a path, None for none; default the registry's), else
-        ``<op>_fallback``; ValueError when none can run."""
+        """The config ``op(...)`` runs for ``vocab`` (see the module docstring): the
+        fastest of ``tuned(vocab, table=)`` (``table``: a path, None for none; default the
+        registry's) that may run in the capture state; ValueError when there is none."""
         path = self._registry.table if table is _DEFAULT else table
         version = _version(path)
         try:
@@ -836,29 +773,25 @@ class Op:
             pts = [next((p for p in pts if p[0] >= n), pts[-1])]
         return [cfg for _, cfg in pts[0][1]]
 
-    def _fallbacks(self, vocab, capturing):
-        if self._fallback is None:
-            return [cfg for cfg, _ in self.configs(vocab, capturing=capturing)]
-        f = self._fallback
-        out = f(f.get({**vocab, "capturing": capturing}), {})
-        return [self.parse(c) if isinstance(c, str) else c for c in out]
+    def tuned(self, vocab, *, table=_DEFAULT):
+        """The configs of the tuned point for ``vocab`` (``pick``'s candidates), fastest
+        first; [] when the table has no rows for its key."""
+        path = self._registry.table if table is _DEFAULT else table
+        return list(self._table_configs(vocab, path, _version(path)))
 
     def _pick(self, vocab, path, version, capturing):
-        def candidates():  # the fallbacks are evaluated only when the table has no fit
-            yield from self._table_configs(vocab, path, version)
-            yield from self._fallbacks(vocab, capturing)
-
-        tried = []
-        for cfg in candidates():
-            why = self.why_not(cfg, vocab, capturing=capturing)
-            if why is None:
+        cfgs = self._table_configs(vocab, path, version)
+        for cfg in cfgs:
+            if not capturing or self._imp[cfg["kind"]].no_capture is None:
                 return cfg
-            tried.append(f"{self.name_of(cfg)}: {why}")
         known = {k: v for k, v in vocab.items() if v is not None}
-        more = f" (+{len(tried) - 6} more)" if len(tried) > 6 else ""
-        raise ValueError(f"{self.name}: no config can run {known}"
-                         f"{' (capturing)' if capturing else ''}: "
-                         + "; ".join(tried[:6]) + more)
+        if not cfgs:
+            raise ValueError(f"{self.name}: no tuned config for {known} "
+                             + (f"in {path}" if path else "(no table)")
+                             + ": tune it, or pass config=")
+        why = "; ".join(f"{self.name_of(c)}: {self._imp[c['kind']].no_capture}" for c in cfgs)
+        raise ValueError(f"{self.name}: no tuned config for {known} can run under CUDA-graph "
+                         f"capture: {why}")
 
 
 class Registry(Mapping):

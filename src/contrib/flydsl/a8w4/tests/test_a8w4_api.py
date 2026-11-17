@@ -6,9 +6,9 @@
 
 * names and signatures of the entry points and of the references;
 * the ops registry (``ops.moe`` / ``ops.moe_dyn``, their implementations, the table);
-* dispatch: ``pick`` returns a known kind for the MiMo-V2.6-Flash TP8 / EP8 shapes,
-  never tp1kq under capture; ``moe_dyn`` needs the EP kernels; no runnable config
-  raises ValueError;
+* dispatch: ``pick`` returns the fastest tuned config, a known kind, for the
+  MiMo-V2.6-Flash TP8 / EP8 shapes, never tp1kq (``@no_capture``) under capture;
+  ``moe_dyn`` has EP kernels only; an untuned key raises ValueError;
 * every config string of the shipped tuned table parses and prints back unchanged.
 """
 
@@ -60,6 +60,7 @@ def test_registry():
     assert list(MOE_DYN.impls) == ["ep3k"]
     assert A.ops.table == A.DEFAULT_CSV and os.path.isfile(A.DEFAULT_CSV)
     assert A.ops.bucket == "num_tokens"
+    assert [MOE.capturable(dict(kind=k)) for k in KINDS] == [True, True, False, True, True]
 
 
 @pytest.mark.parametrize("shape", [TP8, EP8])
@@ -68,23 +69,23 @@ def test_registry():
 def test_pick_kind(shape, tokens, act):
     vocab = shape_vocab(shape, tokens, act)
     cfg = MOE.pick(vocab)
-    assert cfg["kind"] in KINDS and MOE.why_not(cfg, vocab) is None
-    assert MOE.pick(vocab, capturing=True)["kind"] != "tp1kq"  # tp1kq syncs the host
-    cfg = MOE.pick(vocab, table=None)  # no table: the fallback
-    assert MOE.why_not(cfg, vocab) is None
+    assert cfg["kind"] in KINDS and cfg == MOE.tuned(vocab)[0]
+    assert MOE.pick(vocab, capturing=True)["kind"] != "tp1kq"  # tp1kq is @no_capture
 
 
 def test_dyn_pick():
     assert MOE_DYN.pick(shape_vocab(EP8, 1, "silu", op=MOE_DYN))["kind"] == "ep3k"
-    with pytest.raises(ValueError):  # the MORI path needs the EP kernels
+    with pytest.raises(ValueError):  # the MORI path needs the EP kernels: none tuned
         MOE_DYN.pick(shape_vocab(TP8, 1, "silu", op=MOE_DYN))
-    with pytest.raises(ValueError):  # ep_prep takes < 65536 rows
-        MOE_DYN.pick(dict(shape_vocab(EP8, 1, "silu", op=MOE_DYN), capacity=65536))
 
 
-def test_no_config():
-    with pytest.raises(ValueError):  # H = 4000: no kernel family takes it
-        MOE.pick(shape_vocab((4000, 256, 256, 256, 8), 16, "silu"))
+def test_untuned():
+    for vocab in (shape_vocab((4000, 256, 256, 256, 8), 16, "silu"),  # an untuned shape
+                  shape_vocab(TP8, 16, "silu", "hot")):  # no rows of this routing
+        with pytest.raises(ValueError, match="no tuned config"):
+            MOE.pick(vocab)
+    with pytest.raises(ValueError, match=r"\(no table\)"):
+        MOE.pick(shape_vocab(TP8, 16, "silu"), table=None)
 
 
 def test_table_config_roundtrip():

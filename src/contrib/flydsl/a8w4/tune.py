@@ -71,8 +71,8 @@ TABLE_JOBS = ("situv2:mimo-v2.6-flash-tp8", "situv2:mimo-v2.6-flash-ep8",
 
 def candidates(shape):
     """Every config worth measuring on ``shape``: the grids of the kernel families
-    (``moe.MOE``) minus the structurally unsupported points."""
-    return MOE.candidates(shape_vocab(shape))
+    (``moe.MOE``). The ones the kernels cannot run raise when tried (n/a)."""
+    return MOE.configs(shape_vocab(shape))
 
 
 def _key(r):
@@ -118,33 +118,33 @@ def tune(shape, e0, tokens, out_path, routing="uniform", iters=20, rounds=3, log
          act="silu", wcopies=R.WCOPIES):
     """Per token count, ``rounds`` rounds, each with a fresh routing draw (at small
     batches the per-rank work depends on the draw): run every candidate (``MOE.run``)
-    on the ``ref.moe_test`` inputs, check it against ``moe_ref`` (``moe_check``: a
-    failure is BAD), time it (candidates interleaved, so clock / power drift hits all
-    of them; each timed call reads the next of ``wcopies`` weight copies); store the
-    median per candidate. ``act``: the experts' activation (its rows are stored under
-    that act)."""
+    on the ``ref.moe_test`` inputs (one that raises cannot run them: n/a), check it
+    against ``moe_ref`` (``moe_check``: a failure is BAD), time it (candidates
+    interleaved, so clock / power drift hits all of them; each timed call reads the next
+    of ``wcopies`` weight copies); store the median per candidate that ran and passed.
+    ``act``: the experts' activation (its rows are stored under that act)."""
     H, I, E, EGl, K = shape
     log(f"shape H{H} I{I} E{E}/{EGl} top{K} e0 {e0} act {act}: {len(candidates(shape))} "
         f"candidates, {wcopies} weight copies")
     copies = None
     for tok in tokens:
-        cfgs = MOE.candidates(shape_vocab(shape, tok, act))  # the ones that run tok rows of act
+        cfgs = MOE.configs(shape_vocab(shape, tok, act))
         times = {MOE.name_of(c): [] for c in cfgs}
         cos = dict.fromkeys(times, 0.0)
-        bad = {}
+        bad, na = {}, {}
         for rnd in range(rounds):
             inputs = R.moe_test(*shape, e0, tok, act=act, routing=routing, seed=101 * tok + rnd)
             if copies is None:  # moe_test's (cached) weights first, then wcopies - 1 clones
                 copies = itertools.cycle(R.weight_copies(inputs["W"], wcopies)).__next__
             expected = R.moe_ref(**inputs)
             for cfg, name in zip(cfgs, times):
-                if name in bad:
+                if name in bad or name in na:
                     continue
                 run = lambda W, cfg=cfg: MOE.run(cfg, **dict(inputs, W=W))  # noqa: E731
                 try:
                     out = run(inputs["W"])
-                except Exception as ex:  # noqa: BLE001
-                    bad[name] = f"FAIL {type(ex).__name__}: {str(ex)[:120]}"
+                except Exception as ex:  # noqa: BLE001 - the kernels cannot run it
+                    na[name] = type(ex).__name__
                     continue
                 try:
                     cos[name] = max(cos[name], R.moe_check(out, expected, **inputs)["cos"])
@@ -154,7 +154,7 @@ def tune(shape, e0, tokens, out_path, routing="uniform", iters=20, rounds=3, log
                 times[name].append(R.time_cold(lambda run=run: run(copies()), iters=iters))
         rows = []
         for name in times:
-            if name in bad:
+            if name in bad or name in na:
                 continue
             us = sorted(times[name])[len(times[name]) // 2]
             rows.append(dict(model_dim=H, inter_dim=I, experts=E, experts_global=EGl, topk=K,
@@ -165,7 +165,9 @@ def tune(shape, e0, tokens, out_path, routing="uniform", iters=20, rounds=3, log
         if rows:
             write_rows(out_path, rows)
         top = " | ".join(f"{r['config']} {r['us']}" for r in rows[:3])
-        log(f"tok {tok:6d}: {top}" + (f"  [{'; '.join(msgs)}]" if msgs else ""))
+        kinds = sorted(set(na.values()))
+        log(f"tok {tok:6d}: {top}" + (f"  [{'; '.join(msgs)}]" if msgs else "")
+            + (f"  ({len(na)} n/a: {', '.join(kinds)})" if na else ""))
         torch.cuda.empty_cache()
 
 
@@ -195,7 +197,7 @@ def show(shape, csv_path, routing="uniform", act="silu"):
 def verify(shape, e0, tokens, csv_path, routing="uniform", iters=20, log=print, act="silu",
            wcopies=R.WCOPIES):
     """``a8w4_moe`` (table lookup) at each token count, also between tuned points:
-    cos vs the reference, time vs the table entry and vs the untuned default."""
+    cos vs the reference, time vs the table entry."""
     pts = dict(_points(csv_path, shape, routing, act))
     copies = None
     for tok in tokens:
@@ -208,13 +210,10 @@ def verify(shape, e0, tokens, csv_path, routing="uniform", iters=20, log=print, 
                                             table=csv_path)
         c = R.cos_diff(expected, fn().float())
         us = R.time_cold(lambda: fn(copies()), iters=iters)
-        dflt = MOE.pick(shape_vocab(shape, tok, act), table=None)
-        dus = R.time_cold(lambda: MOE.run(dflt, **dict(inputs, W=copies())), iters=iters)
         n = next((p for p in sorted(pts) if p >= tok), max(pts))
         tus = next(u for u, cc in pts[n] if cc == cfg)
         log(f"tok {tok:6d} -> point {n:6d}: {MOE.name_of(cfg):24s} {us:8.1f} us (table {tus:8.1f})"
-            f" | default {MOE.name_of(dflt):24s} {dus:8.1f} us | x{dus / us:.2f} | cos {c:.1e}"
-            + ("" if c < COS_TOL else " BAD"))
+            f" | cos {c:.1e}" + ("" if c < COS_TOL else " BAD"))
 
 
 def merge(parts, csv_path):
@@ -316,8 +315,8 @@ def tune_all(jobs, gpus, per_job, tokens, out_dir, args, force=False, log=print)
     log(f"all jobs done in {(time.time() - t0) / 60:.1f} min")
     logs = sorted(glob.glob(os.path.join(out_dir, "*_[0-9]*.log")))
     bad = [f"{os.path.basename(f)}: {ln.strip()}" for f in logs for ln in open(f)
-           if re.search(r"\b(BAD|FAIL)\b", ln)]
-    print("\n".join(["BAD / FAIL candidates:"] + bad) if bad else "no BAD / FAIL candidates")
+           if re.search(r"\bBAD\b", ln)]
+    print("\n".join(["BAD candidates:"] + bad) if bad else "no BAD candidates")
     if failed:
         print(f"FAILED processes (see their logs): {failed}")
     parts = sorted(glob.glob(os.path.join(out_dir, "*_[0-9]*.csv")))

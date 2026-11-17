@@ -125,7 +125,7 @@ def _capacity(maxm, topk, el, bm):
 def ep_small_kernel(*, H, I, EL, TOPK, BM, NW, C1, C2, PF, ROWV, MAXM, SCH=3,
                      ACT="silu"):
     assert ACT in ("silu", "situv2"), ACT
-    assert EL <= 32 and TOPK == 8
+    assert EL <= 32 and TOPK == 8, f"ep1k: needs <= 32 local experts, topk 8 (E={EL}, topk={TOPK})"
     NT = 64 * NW
     NI1 = 16 * C1 * NW  # gemm1 inter cols per item (wave: C1 gate + C1 up 16-col blocks)
     NB1 = I // NI1
@@ -563,7 +563,7 @@ def ep_moe_small(x, W, topk_weights, topk_ids, *, e0, maxm=512, cfg=None,
     E = W["w2"].shape[0]
     I = W["w2"].shape[2] * 2
     K = topk_ids.shape[1]
-    assert M <= maxm
+    assert M <= maxm, f"ep1k: M={M} rows > its capacity maxm={maxm}"
     cap = _capacity(maxm, K, E, cfg["bm"])
     s = _scratch(x.device, maxm, H, I, cap, cap // cfg["bm"])
     out = torch.empty((M, H), dtype=torch.bfloat16, device=x.device)

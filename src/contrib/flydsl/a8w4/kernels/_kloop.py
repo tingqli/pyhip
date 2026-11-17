@@ -80,7 +80,9 @@ def _make_core(*, K, W_ROWS, BM, PF, bcm, cols, lds_ptr, LDS_BYTES, lane, tx, NT
     assert KG >= 1, "a K tile holds whole 128-K W chunks"
     KT = K // TK
     STEPS = TK // 32  # MFMA K steps per tile
-    assert PF >= 1 and KT % (2 * PF) == 0 and KT // (2 * PF) >= 2, (KT, PF)
+    assert PF >= 1 and KT % (2 * PF) == 0 and KT // (2 * PF) >= 2, (
+        f"K loop: K={K} gives {KT} K tiles of {TK}, prefetch {PF} needs a multiple of "
+        f"{2 * PF} and at least {4 * PF}: K is too short for this config")
     W_STEP = 0
     ST_STEP = STEPS // 2 if ST_STEP is None else ST_STEP
     assert 0 <= ST_STEP < STEPS

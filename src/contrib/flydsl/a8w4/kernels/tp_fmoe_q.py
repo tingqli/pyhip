@@ -82,7 +82,8 @@ def tp_fmoe_q_kernel(*, D_HIDDEN, D_INTER, NE, TOPK=8, b_cache_mod=1, n_ctas=608
     N1 = 2 * INTER
     K1_TILES = H // TILE_K1
     NT2 = H // TILE_N2
-    assert INTER == 256 and H % TILE_K1 == 0 and NT2 % 2 == 0 and n_ctas % NUM_XCD == 0
+    assert INTER == 256, f"tp1kq: inter_dim must be 256 (inter_dim={INTER})"
+    assert H % TILE_K1 == 0 and NT2 % 2 == 0 and n_ctas % NUM_XCD == 0
     CPX = n_ctas // NUM_XCD  # CTAs per XCD = queue lag D
     W1_K0 = H // 128
     SC1_STRIDE = (H // 256) * 64

@@ -1,5 +1,6 @@
-"""CPU tests of pyhip.kit (no GPU): registration, grids, limits, config names, the checks
-a registration runs on the conventions, and the pytest tests ``kit.testing`` generates."""
+"""CPU tests of pyhip.kit (no GPU): registration, grids, config names, dispatch, the
+checks a registration runs on the conventions, and the pytest tests ``kit.testing``
+generates."""
 
 import os
 import textwrap
@@ -7,14 +8,14 @@ import textwrap
 import pytest
 
 from pyhip import kit
-from pyhip.kit import Registry, meta, param, requires, stack
+from pyhip.kit import Registry, meta, no_capture, param, stack
 from pyhip.kit.testing import assert_close
 
 pytest_plugins = ["pytester"]
 
 TOY = '''
 import random
-from pyhip.kit import Registry, meta, param, requires, stack
+from pyhip.kit import Registry, meta, no_capture, param, stack
 
 ops = Registry()
 op_register = ops.register
@@ -52,14 +53,14 @@ def axpy_loop(x, y, *, alpha=1.0):
     return [alpha * a + b for a, b in zip(x, y)]
 
 
-tiles = stack(param("block", (2, 4), id="b{}"),
-              requires(lambda n, block: n % block == 0, "n={n} % block {block}"))
+tiles = stack(param("block", (2, 4), id="b{}"))
 
 
 @op_register
 @tiles
 @meta(rows=lambda block: block * 8, graph_safe=True)
 def axpy_tiled(x, y, *, alpha=1.0, block=2, **over):
+    assert len(x) % block == 0, f"n={len(x)} % block {block}"  # a limit: the impl raises
     out = []
     for i in range(0, len(x), block):
         out += [alpha * a + b for a, b in zip(x[i:i + block], y[i:i + block])]
@@ -68,7 +69,7 @@ def axpy_tiled(x, y, *, alpha=1.0, block=2, **over):
 
 @op_register
 @param("mode", ("fast", "slow"), id="{}")
-@requires(lambda capturing: not capturing, "not graph-safe")
+@no_capture("not graph-safe")
 @meta(rows=None, graph_safe=False)
 def axpy_queue(x, y, *, alpha=1.0, mode="fast"):
     return [alpha * a + b for a, b in zip(x, y)]
@@ -106,8 +107,8 @@ def _ops(src, **registry):
             out.append("@op_register")
         out.append(line)
     reg = Registry(**registry)
-    exec("\n".join(out), {"op_register": reg.register, "param": param, "requires": requires,
-                          "meta": meta, "stack": stack}, {})
+    exec("\n".join(out), {"op_register": reg.register, "param": param,
+                          "no_capture": no_capture, "meta": meta, "stack": stack}, {})
     return reg
 
 
@@ -183,9 +184,6 @@ def test_registration_rules():
         with pytest.raises(TypeError, match=match):
             reg.register(f)
         assert "kit_op" not in f.__dict__ and list(reg.g.impls) == ["k"]  # left no trace
-    _raises(ref + "def f_fallback(n): pass", r"outside the vocabulary \[\]")
-    _raises(ref + "def f_test(n=1): pass\n@meta(k=1)\ndef f_fallback(n): pass", "take kit marks")
-    _raises(ref + "def f_test(n=1): pass\ndef f_dyn_fallback(n): pass", "register f_dyn_ref first")
     _raises("def f_ref(x, *, config=None): pass", r"\['config'\] are reserved")
     with pytest.raises(TypeError, match="relax is a dict"):
         Registry(relax=["act"])
@@ -204,11 +202,10 @@ def f_dims(x, *, dt="a"):
     return dict(n=len(x), dt=dt)
 
 @param("b", (1, 2), id="b{}")
-@requires(lambda n, b: n % b == 0, "n={n} % {b}")
 def f_k1(x, *, dt="a", b=1):
     return ("k1", b)
 
-@requires(lambda capturing: not capturing, "not graph-safe")
+@no_capture("not graph-safe")
 def f_k2(x, *, dt="a"):
     return ("k2",)
 
@@ -225,6 +222,8 @@ a,s,16,k1 b1,2.0,0
 a,s,16,k3,1.0,0
 a,t,4,k3,1.0,0
 b,s,4,k2,1.0,0
+c,s,4,k2,1.0,0
+c,s,4,k3,2.0,0
 """
 
 
@@ -237,17 +236,25 @@ def test_dispatch(tmp_path):
         return op.name_of(op.pick(dict(op._blank, **v), table=table, capturing=capturing))
 
     assert pick(n=4, dt="a") == "k1 b2"  # the fastest; mode None matches the default "s"
-    assert pick(n=3, dt="a") == "k2"  # point 4; k1 b2 needs n % 2 == 0
-    assert pick(n=3, dt="a", capturing=True) == "k3"  # k2 is not graph-safe
+    assert pick(n=3, dt="a") == "k1 b2"  # point 4
+    assert pick(n=4, dt="c") == "k2" and pick(n=4, dt="c", capturing=True) == "k3"
+    with pytest.raises(ValueError, match=r"can run under CUDA-graph capture: k2: not graph"):
+        pick(n=4, dt="b", capturing=True)  # only k2 is tuned there
     assert pick(n=5, dt="a") == "k3" and pick(n=100, dt="a") == "k3"  # point 16, the largest
     assert pick(n=4, dt="a", mode="t") == "k3"
     assert pick(n=4, dt="a", mode="u") == "k1 b2"  # no rows: relax mode -> s
     assert pick(n=4, dt="b") == "k2"
-    assert pick(n=4, dt="c") == "k1 b1"  # no rows: the first grid point that runs
-    assert pick(n=4, dt="a", table=None) == "k1 b1"
-    assert pick(n=4, dt="a", table=str(tmp_path / "none.csv")) == "k1 b1"
+    with pytest.raises(ValueError, match=r"no tuned config for \{'n': 4, 'dt': 'd'\} in .*"
+                                         r"tuned.csv: tune it, or pass config="):
+        pick(n=4, dt="d")  # no rows, none after relax
+    with pytest.raises(ValueError, match=r"\(no table\)"):
+        pick(n=4, dt="a", table=None)
+    with pytest.raises(ValueError, match="no tuned config"):
+        pick(n=4, dt="a", table=str(tmp_path / "none.csv"))
     vocab = dict(op._blank, n=4, dt="a")
     assert op.pick(vocab) is op.pick(dict(vocab))  # memoized
+    assert [op.name_of(c) for c in op.tuned(dict(vocab, n=3))] == ["k1 b2", "k2", "k3"]
+    assert op.tuned(dict(vocab, dt="d")) == [] and op.tuned(vocab, table=None) == []
     assert [(n, [op.name_of(c) for _, c in cs]) for n, cs in op.points(vocab)] == [
         (4, ["k1 b2", "k2", "k3"]), (16, ["k3", "k1 b1"])]  # zz: not an implementation
     with pytest.raises(ValueError, match="needs n"):
@@ -256,13 +263,16 @@ def test_dispatch(tmp_path):
         op.pick(dict(n=4))
     # a call: dims and hints -> pick -> run
     x3, x4 = [0.0] * 3, [0.0] * 4
-    assert op(x4) == ("k1", 2) and op(x4, mode="t") == ("k3",) and op(x3) == ("k2",)
+    assert op(x4) == ("k1", 2) and op(x4, mode="t") == ("k3",) and op(x3) == ("k1", 2)
     assert op(x3, config="k3") == ("k3",) and op(x3, config=dict(kind="k1", b=1)) == ("k1", 1)
-    assert op(x4, dt="b", table=None) == ("k1", 1)
+    with pytest.raises(ValueError, match=r"\(no table\)"):
+        op(x4, table=None)
     with pytest.raises(TypeError, match=r"unknown argument\(s\) \['bogus'\]"):
         op(x4, bogus=1)
     with pytest.raises(TypeError, match="len"):  # dims runs with config= too: it checks
         op(None, config="k3")
+    with pytest.raises(TypeError, match="needs g_dims"):
+        _ops("def g_ref(x): pass\ndef g_k(x): pass").g([1])
     # the table file changes: it is read again (its mtime is read at most once a second)
     path.write_text(TABLE.replace("k1 b2,1.0", "k1 b2,9.0"))
     os.utime(path, (1, 1))
@@ -284,25 +294,8 @@ def test_dispatch(tmp_path):
         pick(n=4, dt="a", table=str(nocols))
 
 
-def test_dispatch_fallback():
-    src = DISPATCH + '''
-def f_fallback(n, capturing):
-    return ["k2", dict(kind="k1", b=2)] if n < 8 else ["k3"]
-'''
-    op = _ops(src, bucket="n").f
-    assert op.fallback is not None and op.fallback.kit_op == "f"
-    assert op.name_of(op.pick(dict(op._blank, n=4))) == "k2"
-    assert op.name_of(op.pick(dict(op._blank, n=4), capturing=True)) == "k1 b2"
-    assert op.name_of(op.pick(dict(op._blank, n=9))) == "k3"
-    with pytest.raises(ValueError, match=r"no config can run \{'n': 3\} \(capturing\): "
-                                         r"k2: not graph-safe; k1 b2: n=3 % 2"):
-        op.pick(dict(op._blank, n=3), capturing=True)
-    with pytest.raises(TypeError, match="needs g_dims"):
-        _ops("def g_ref(x): pass\ndef g_k(x): pass").g([1])
-
-
 def test_marks_return_the_function_in_written_order():
-    a, b, c = param("p", (1,)), requires(lambda p: True, "r"), meta(k=1)
+    a, b, c = param("p", (1,)), no_capture("r"), meta(k=1)
 
     def f():
         pass
@@ -341,28 +334,24 @@ def test_param_forms():
             bad()
 
 
-def test_configs_and_limits(toy):
+def test_configs_and_capture(toy):
     op = toy["ops"]["axpy"]
-    vocab = dict(n=6, alpha=1.0, seed=0)
-    got = [(op.name_of(c), why) for c, why in op.configs(vocab)]
-    assert got == [("loop", None), ("tiled b2", None), ("tiled b4", "n=6 % block 4"),
-                   ("queue fast", None), ("queue slow", None)]
-    assert [op.name_of(c) for c in op.candidates(vocab, capturing=True)] == ["loop", "tiled b2"]
-    assert op.why_not(dict(kind="queue", mode="fast"), vocab, capturing=True) == "not graph-safe"
-    assert op.why_not(dict(kind="tiled", block=4), dict(vocab, n=None)) is None  # unknown: skip
-    assert op.why_not(dict(kind="tiled"), vocab) is None  # knob default (block=2)
-    assert op.why_not(dict(kind="tiled", block=4, extra=1), vocab) == "n=6 % block 4"
-    with pytest.raises(TypeError, match="missing from the vocabulary"):
-        op.why_not(dict(kind="tiled", block=4), dict(alpha=1.0))
+    cfgs = op.configs(dict(n=6, alpha=1.0, seed=0))
+    assert [op.name_of(c) for c in cfgs] == ["loop", "tiled b2", "tiled b4", "queue fast",
+                                             "queue slow"]
+    assert [op.capturable(c) for c in cfgs] == [True, True, True, False, False]
+    assert op.capturable(dict(kind="tiled", block=4, extra=1))
+    with pytest.raises(AssertionError, match="n=6 % block 4"):  # limits: the impl raises
+        op.run(dict(kind="tiled", block=4), [0.0] * 6, [0.0] * 6)
     with pytest.raises(KeyError, match="no implementation 'nope'"):
-        op.why_not(dict(kind="nope"), vocab)
+        op.capturable(dict(kind="nope"))
     with pytest.raises(TypeError, match="unknown knob"):
-        op.why_not(dict(kind="queue", mode="fast", extra=1), vocab)
+        op.capturable(dict(kind="queue", mode="fast", extra=1))
 
 
 def test_names(toy):
     op = toy["ops"]["axpy"]
-    for cfg, _ in op.configs(dict(n=4, alpha=1.0, seed=0)):
+    for cfg in op.configs(dict(n=4, alpha=1.0, seed=0)):
         assert op.parse(op.name_of(cfg)) == cfg
     cfg = dict(kind="tiled", block=4, arb=128, tag="x1", f=0.5)
     assert op.name_of(cfg) == "tiled b4:arb=128,tag=x1,f=0.5"
@@ -394,12 +383,6 @@ def test_convention_errors():
     _raises(ref + "@param('b', (1,))\ndef f_k(x, *, a=1, b): pass", "keyword-only knob")
     _raises(ref + "def f_test(n=1): pass\n@param('n', (1,))\ndef f_k(x, *, a=1, n=1): pass",
             r"clash with the vocabulary")
-    _raises(ref + "@param('n', (1,))\ndef f_test(n): pass\n"
-            "@param('b', (1,))\n@requires(lambda m: m, 'r')\ndef f_k(x, *, a=1, b=1): pass",
-            r"unknown name\(s\) \['m'\]")
-    _raises(ref + "@param('n', (1,))\ndef f_test(n): pass\n"
-            "@param('b', (1,))\n@requires(lambda n: n, '{q}')\ndef f_k(x, *, a=1, b=1): pass",
-            r"unknown name\(s\) \['q'\]")
     _raises(ref + "@param('b', (1,))\n@meta(m=lambda q: q)\ndef f_k(x, *, a=1, b=1): pass",
             r"meta 'm' uses unknown")
     _raises(ref + "@param('b', lambda q: (1,))\ndef f_k(x, *, a=1, b=1): pass",
@@ -407,7 +390,7 @@ def test_convention_errors():
     _raises(ref + "def f_test(n, m=1): pass", r"\['n'\] need a default or a @param")
     _raises(ref + "@param('q', (1,))\ndef f_test(n=1): pass", "must be distinct parameters")
     _raises(ref + "@param('n', lambda: (1,))\ndef f_test(n): pass", "a sequence or a dict")
-    _raises(ref + "@requires(lambda n: n, 'r')\ndef f_test(n=1): pass", "only @param marks")
+    _raises(ref + "@no_capture('r')\ndef f_test(n=1): pass", "only @param marks")
     _raises(ref + "def f_test(*a): pass", "named parameters only")
     _raises(ref + "def f_check(out): pass", "does not take the arguments")
     _raises("def f_ref(x, *, out=None): pass\ndef f_check(out, expected, **_): pass",
@@ -432,27 +415,49 @@ def test_default_check():
     assert_close(torch.ones(3), torch.ones(3), out=None, expected=None)
 
 
+TUNED_TOY = ("n,config,us\n" + "".join(f"4,{c},1.0\n" for c in ("loop", "tiled b2", "tiled b4",
+                                                                "queue fast", "queue slow"))
+             + "".join(f"6,{c},1.0\n" for c in ("loop", "tiled b2", "queue fast")))
+
+
+def _toy_project(pytester, src=TOY):
+    """The toy with a tuned table (tiled b4 does not run n=6: not tuned there)."""
+    pytester.makepyfile(toy=src.replace(
+        "ops = Registry()",
+        "import os\nops = Registry(table=os.path.join(os.path.dirname(__file__), 'tuned.csv'), "
+        "bucket='n')"))
+    pytester.makefile(".csv", tuned=TUNED_TOY)
+    pytester.makepyfile(test_toy="from pyhip.kit.testing import op_tests\n"
+                                 "from toy import ops\n"
+                                 "test_ops = op_tests(ops)\n")
+
+
 def test_generated_tests(pytester):
+    _toy_project(pytester)
+    res = pytester.runpytest("-q", "-p", "no:cacheprovider")
+    # n4 cases: dims + 5 tuned configs; n6 cases: dims + 3
+    res.assert_outcomes(passed=2 * 6 + 2 * 4)
+    ids = pytester.runpytest("--collect-only", "-q").stdout.lines
+    assert "test_toy.py::test_ops[axpy-n4-a1-tiled b4]" in ids
+    assert "test_toy.py::test_ops[axpy-n6-a2-dims]" in ids
+    assert "test_toy.py::test_ops[axpy-n6-a2-tiled b4]" not in ids
+
+
+def test_generated_tests_without_table(pytester):
     pytester.makepyfile(toy=TOY)
     pytester.makepyfile(test_toy="from pyhip.kit.testing import op_tests\n"
                                  "from toy import ops\n"
                                  "test_ops = op_tests(ops)\n")
-    res = pytester.runpytest("-q", "-rs", "-p", "no:cacheprovider")
-    # 4 cases x (dims + loop + tiled b2/b4 + queue fast/slow); n6 cases skip tiled b4
-    res.assert_outcomes(passed=4 * 6 - 2, skipped=2)
+    res = pytester.runpytest("-q", "-p", "no:cacheprovider")
+    # every grid point must run: tiled b4 fails on the n6 cases
+    res.assert_outcomes(passed=4 * 6 - 2, failed=2)
     res.stdout.fnmatch_lines(["*n=6 % block 4*"])
-    ids = pytester.runpytest("--collect-only", "-q").stdout.lines
-    assert "test_toy.py::test_ops[axpy-n4-a1-tiled b4]" in ids
-    assert "test_toy.py::test_ops[axpy-n6-a2-dims]" in ids
 
 
 def test_generated_tests_report_failures(pytester):
-    pytester.makepyfile(toy=TOY.replace("out += [alpha * a + b", "out += [alpha * a - b"))
-    pytester.makepyfile(test_toy="from pyhip.kit.testing import op_tests\n"
-                                 "from toy import ops\n"
-                                 "test_ops = op_tests(ops)\n")
+    _toy_project(pytester, TOY.replace("out += [alpha * a + b", "out += [alpha * a - b"))
     res = pytester.runpytest("-q", "-p", "no:cacheprovider", "-k", "tiled")
-    res.assert_outcomes(failed=6, skipped=2)
+    res.assert_outcomes(failed=6)
 
 
 def test_toy_runs_without_pytest_helpers(toy):
@@ -461,5 +466,9 @@ def test_toy_runs_without_pytest_helpers(toy):
         inputs = op.test(**case)
         assert op.dims(**inputs) == {k: case[k] for k in ("n", "alpha")}
         expected = op.ref(**inputs)
-        for cfg in op.candidates(case):
+        for cfg in op.configs(case):
+            if cfg.get("block", 1) > 2 and case["n"] == 6:
+                with pytest.raises(AssertionError):
+                    op.run(cfg, **inputs)
+                continue
             assert op.check(op.run(cfg, **inputs), expected, **inputs)["err"] < 1e-12

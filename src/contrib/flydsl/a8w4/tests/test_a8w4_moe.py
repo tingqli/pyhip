@@ -10,8 +10,8 @@
 * ``a8w4_moe`` with the tuned table, including token counts between tuned points, on
   the MiMo-V2.6-Flash TP8 and EP8 per-rank shapes (EP: rank 3, global expert ids);
 * ``tp_prep`` (the TP kinds' fused prep) vs aiter moe_sorting + quantize_rows;
-* the table's act key (SiTUv2 rows, SiLU fallback, tables without the act column),
-  SiTUv2 dispatch (the clamp is exercised, betas are checked);
+* the table's act key (SiTUv2 rows, SiLU rows for an act without its own, tables
+  without the act column), SiTUv2 dispatch (the clamp is exercised, betas are checked);
 * CUDA-graph capture: only graph-safe configs are picked, replay matches eager;
   ``a8w4_moe_dyn``: one graph replayed with different device-side valid counts;
 * ``MOE_DYN.pick``: EP kernels only.
@@ -253,8 +253,8 @@ def test_dyn_pick():
     for tokens in (1, 300, 3000, 40000):
         vocab = shape_vocab((H, I, E, EGl, K), tokens, "silu", op=MOE_DYN)
         cfg = MOE_DYN.pick(vocab)
-        assert cfg["kind"] == "ep3k" and MOE_DYN.why_not(cfg, vocab) is None
-    with pytest.raises(ValueError):  # TP8 shape: 256 local experts, no EP kernels
+        assert cfg["kind"] == "ep3k" and cfg == MOE_DYN.tuned(vocab)[0]
+    with pytest.raises(ValueError):  # TP8 shape: 256 local experts, no EP kernels tuned
         MOE_DYN.pick(shape_vocab(SHAPES["tp8"][:5], 16, "silu", op=MOE_DYN))
 
 

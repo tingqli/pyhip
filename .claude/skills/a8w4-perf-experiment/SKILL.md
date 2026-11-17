@@ -61,10 +61,10 @@ python -m a8w4.bench ab --case tp8 -t 16 64 -v "tp2k bm32 g1bcm2 g2nt4" "tp2k bm
     --protocol coldrot cold      # shows whether a gain survives the deployment-like protocol
 python -m a8w4.bench ab --case ep8 -t 4096 --samples 3 -v l128 l128c     # EP8: work depends on the routing draw
 ```
-- Variant spec: `[label=]<config name | bare CFGS name | @table | @auto>[:override,...]`;
+- Variant spec: `[label=]<config name | bare CFGS name | @table>[:override,...]`;
   ep3k overrides `g1.<k>=v`, `g2.<k>=v` (pf, bcm, acm, sch, st, prio, nw, ni/no, arb, tr, wpe),
-  `bm=`, `rowv=32/64/128`, `sched=`, `sst=`, `-` drops a key; `moe.py`'s `@requires` check the
-  overridden config (a variant that cannot run is listed with the reason). Custom
+  `bm=`, `rowv=32/64/128`, `sched=`, `sst=`, `-` drops a key; a variant the kernels cannot run
+  raises at its first call (listed as FAIL with the exception). Custom
   pipelines: `label=py:<file.py | module>:<func>` with
   `func(x, W, tw, ti, *, expert_offset, num_experts, act, situ) -> out` — put an experiment's
   kernel variant behind such a function instead of writing a new timing script.
@@ -108,11 +108,11 @@ Needs all 8 GPUs idle (`rocm-smi --showuse`). Full-layer comparisons vs MORI: th
 ## 7. Landing checklist
 
 1. Kernel, `ep_gemm.CFGS` / `AUTO`, `moe.EP_CFGS`, and the `moe_<kind>` function in `moe.py`
-   (`@op_register` outermost, then the `@param` grid, `@requires` limits, `@meta`) as needed
-   (README §9.3).
+   (`@op_register` outermost, then the `@param` grid, `@no_capture` if not graph-safe,
+   `@meta`; limits are asserts in the kernel with a message) as needed (README §9.3).
 2. `python -m pytest -q a8w4/tests/test_a8w4_ops.py a8w4/tests/test_a8w4_moe.py` (the ops file
-   runs every config of every implementation); for megamoe / MORI / TP-layer changes
-   also the three 8-GPU tests.
+   runs the tuned configs of every case: tune a new config first); for megamoe / MORI /
+   TP-layer changes also the three 8-GPU tests.
 3. Selection changed: `python -m a8w4.tune tune-all --gpus 0-7 --out /tmp/a8w4_tune`
    (idle check, locks, BAD/FAIL report, merged table), `tune compare`, copy the table,
    `tune verify --case ... -t ...`.
