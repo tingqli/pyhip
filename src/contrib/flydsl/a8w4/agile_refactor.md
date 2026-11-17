@@ -13,7 +13,7 @@
 
 ### 0.1 当前状态（每次停下来前更新）
 
-- **迭代**：I1、I1b、I2、I3、I4 已完成。I3 的范围是用户看过 I2 后改的（见 3.4 节）：`_vendor` 只留真正用到的代码，迁到 `kernels/` 下的共享模块，删掉 `_vendor/`。用户看过 I4 后决定先跳过 I4b（NaN 传播，1.1 节），先做 I5（3.2 节）。I5 已完成。之后讨论出函数级 kit 的设计（`refactor6.md`），用户 2026-11-17 让开始实现：迭代 K（3.1 节）已完成。用户看过 K 后讨论了 `refactor7.md`：A 部分（op 注册表 `@op_register`）的迭代 R（3.0a 节）已完成。之后用户委托按推荐定下 B、C 部分的问题，并说明 sglang 现有代码不再考虑（冻结 API 取消）：迭代 D（3.0 节，查表分派进 kit）已完成，等用户 review；之后是 T1–T4（通用 tune / bench）。I4b、I6 排在这些之后；另有一个待定问题：`ref_moe(raw)` 的调用方（`bench/core.py`、`bench/dist.py` 的 megamoe 参考、两个 MORI 测试）要不要改用 `moe_ref(W)`。
+- **迭代**：I1、I1b、I2、I3、I4 已完成。I3 的范围是用户看过 I2 后改的（见 3.4 节）：`_vendor` 只留真正用到的代码，迁到 `kernels/` 下的共享模块，删掉 `_vendor/`。用户看过 I4 后决定先跳过 I4b（NaN 传播，1.1 节），先做 I5（3.2 节）。I5 已完成。之后讨论出函数级 kit 的设计（`refactor6.md`），用户 2026-11-17 让开始实现：迭代 K（3.1 节）已完成。用户看过 K 后讨论了 `refactor7.md`：A 部分（op 注册表 `@op_register`）的迭代 R（3.0a 节）已完成。之后用户委托按推荐定下 B、C 部分的问题，并说明 sglang 现有代码不再考虑（冻结 API 取消）：迭代 D（3.0 节，查表分派进 kit）已完成。用户看过 D 后决定：只保证调优表里的 key，限制交给 kernel 的 assert，迭代 E（3.0e 节，去掉 `@requires`）已完成；用户让 E 之后直接做完 T1–T4（通用 tune / bench），每完成一个就提交并 push 到 tq2。I4b、I6 排在这些之后；另有一个待定问题：`ref_moe(raw)` 的调用方（`bench/core.py`、`bench/dist.py` 的 megamoe 参考、两个 MORI 测试）要不要改用 `moe_ref(W)`。
 - **分支**：`/sgl-workspace/pyhip` 的 `refactor/a8w4`。
 - **已有提交**：
   - 迭代 0，安全网：`64ce77c`、`d17f502`（ISA 基线在这个提交上生成）、`4e256d9`。
@@ -27,6 +27,7 @@
   - K：`77aa77d`（计划）、`3361672`（K0）、`a6862e8`（K1）、`6acef65`（K2）、`b92ecc4`（K3）、`2a8e774`（修 `test_cuda_graph`）、`9859360`（K4）、`2ee2a19`（K5）、`4cb1ded`（文档、skill）。
   - R：`716cc46`（计划）、`8101410`（R0）、`689e112`（R1）、`8735b35`（文档、skill）。
   - D：`056028b`（计划）、`5d0b861`（D0）、`4f51e94`（D1 的 kit 部分：host 开销）、`23a3e8f`（D1）、`e60470a`（D2 文档）。
+  - E：`e522ebe`。
 - **用户的文件**：未跟踪的 `refactory2.md` 属于用户，不要改，也不要提交。`refactor3.md`–`refactor7.md`（设计稿）同样不提交。
 
 ### 0.2 工作方式
@@ -65,6 +66,7 @@
 | K | 函数级 kit：op 写成一族函数（`moe_ref`、`moe_test`、`moe_tp1k` …），配置空间和限制写在函数的装饰器上，测试和 tune 由 `pyhip.kit` 生成或驱动。已完成，见 3.1 节 | `refactor6.md`（Q66–Q76）；用户 2026-11-17 | 见 3.1 节 |
 | R | op 注册表：`@op_register` 逐个注册，取代 `collect(globals())`；每个包一个 `Registry`（`a8w4.ops.moe`）。已完成，见 3.0a 节 | `refactor7.md` A 部分；用户 2026-11-17 | 见 3.0a 节 |
 | D | 查表分派进 kit（`Op.pick`、`Op.__call__`、`<op>_fallback`、`Registry(table=, bucket=, relax=)`）；取消冻结 API；moe_dyn 词汇表改名。见 3.0 节 | `refactor7.md` B 部分和“决定”；用户 2026-11-17 | 见 3.0 节 |
+| E | 去掉 `@requires` 和兜底：限制只在 kernel 的 assert 里，只保证调优表里的 key；保留 `@no_capture`。已完成，见 3.0e 节 | 用户 2026-11-17 | 见 3.0e 节 |
 | T1–T4 | 通用 tune / bench：`kit.table`（T1）、`kit.timing`（T2）、`kit.tune` + CLI（T3）、`kit.bench`（T4） | `refactor7.md` C 部分 | 每步输出与改前相同（tune 的候选、CSV、show / verify；bench 的 resolve），计时同卡 ABAB 在噪声内 |
 | I6 | 新建 `workspace.py`，统一管理每张卡一份的缓冲区 | Q19 | ISA IDENTICAL；pytest |
 
@@ -94,6 +96,22 @@
 - 删完后，剩下的 kernel 的 ISA 必须完全不变。不在快照矩阵里的配置，本来就走不到。
 
 ## 3. 当前迭代
+
+### 3.0e E：去掉 `@requires`（已完成）
+
+**背景**：用户问为什么要在实现函数上重复 kernel 里已有的检查，并定下假定：只有命中调优表的配置保证调用成功；没调过的 key、或者强制一个 kernel 跑不了的配置，直接抛异常；tune 用异常表示“跑不了”。实测（session 的 `files/req/probe.py`，8 卡，崩溃 / 卡死单独记录）：`@requires` 拒绝的 164 种组合全部由 kernel 代码抛 `AssertionError`，没有 fault、hang 或错误结果；另有 7 种其实能跑（TP 在 H = 3840，`model_dim % 512` 写严了）。另一个方向的漂移：l128_v1 配 fp8 分组 scale 的 LDS 限制 `@requires` 没写。
+
+**改动**（一个提交 `e522ebe`）：
+
+- kit：删 `requires`、`why_not`、`candidates`、`<op>_fallback` 角色；加 `@no_capture(reason)`、`Op.capturable`、`Op.tuned`（调优点的全部配置）；`pick` = `tuned` 里最快的（capture 时跳过 `@no_capture`），没有行抛 `ValueError`；`configs` 是完整网格。`kit.testing`：有表时每个用例测 `tuned` 的配置，没表时测完整网格。
+- a8w4：`moe.py` 删全部限制和兜底，tp1kq 加 `@no_capture`；变成用户可见报错的几处 kernel assert 补上消息；tune 候选 = 完整网格，抛异常的记 n/a；verify 去掉“未调优默认值”；bench 去掉 `@auto`；isa_snapshot 编译每个 token 数所在调优点的配置（加网格外的 ep3k 预设）。
+
+**验证**：
+
+- 生成测试的 ID = 原来没有 skip 的那 360 项，逐项相同；
+- lookup / dyn 对 D 的 golden：调过的 shape、uniform 路由、≤ 32768 tokens 全部相同；没调过的 shape 和 routing "hot" 改为抛 `ValueError`；EP8 ≥ 65536 tokens 选到 ep3k l128c（运行时在 ep_prep 抛异常）；
+- TP4 一个点的 tune 记下的 8 个配置与表里相同（12 个 n/a）；
+- ISA IDENTICAL；kit 15、API 22 passed；单卡 413 passed（不再有 skip）；8 卡 3 passed。
 
 ### 3.0 D：查表分派进 kit，取消冻结 API（已完成，设计见 `refactor7.md` B 部分和“决定”）
 
@@ -500,6 +518,7 @@ host 端（`moe._run_tp2k`，G1/G2 唯一的调用方）只用到 gemm1 的 `epi
 | 2026-11-17 | K 函数级 kit | 新增 `pyhip.kit`（op = 一族同前缀的函数，`@param` / `@requires` / `@meta` / `stack`、`collect`、`op_tests`）；`ref.py` 定义问题（`moe_ref` 读 prepare 后的权重、`moe_test`、`moe_check`、`moe_dims`、`moe_dyn_*`），`moe.py` 的 runner 表改成 6 个实现函数；测试由 op 生成（506 项），tune / verify / bench 都改走 op。冻结 API 的 golden JSON 全部相等；ISA IDENTICAL；查表路径 host 时间少 1–3 µs；tune 候选逐字相同、计时不变；bench 只有 skip 原因变具体、覆盖项受 `@requires` 检查。API 测试 23 passed；单卡 pytest 391 passed、146 skipped；kit 12 passed | `3361672` `a6862e8` `6acef65` `b92ecc4` `2a8e774` `9859360` `2ee2a19` `4cb1ded` |
 | 2026-11-17 | R op 注册表 | `pyhip.kit.Registry` + `@op_register` 逐个注册（名字定角色，注册时校验，失败回滚），取代 `collect`；a8w4 一包一个注册表 `_ops.ops`，ref.py 8 个、moe.py 6 个函数注册，`MOE = ops.moe`。冻结函数 golden 和 op 级 golden 全部相等；生成测试 ID 集合不变（顺序 moe 在前）；包被导入两次时两份注册表互不影响；ISA IDENTICAL；API 23 passed；kit 13 passed；单卡 pytest 391 passed、146 skipped | `716cc46` `8101410` `689e112` `8735b35` |
 | 2026-11-17 | D 查表分派进 kit，取消冻结 API | kit：`Registry(table=, bucket=, relax=)`、`Op.pick` / `points` / `__call__`、`<op>_fallback`；`op(...)` 按调用记住实现，mtime 每秒最多读一次。a8w4：`_ops.py` 声明表；两个兜底函数；`moe_dyn` 词汇改名（capacity / num_tokens）；删 7 个元组形式的函数；薄包装只留 M == 0，入参检查进 dims；工具和测试改用 op 的方法。K2 golden 只有三类有意差异；op golden 中 moe 相同、moe_dyn 只差改名；测试 ID 不变；ISA IDENTICAL；API 22、kit 15 passed；单卡 413 passed、146 skipped；8 卡 3 passed；查表路径的 host 时间在噪声内 | `056028b` `5d0b861` `4f51e94` `23a3e8f` `e60470a` |
+| 2026-11-17 | E 去掉 `@requires` | 限制只在 kernel 的 assert 里（164 种被拒绝的组合实测都是干净的 `AssertionError`）；只保证调优表里的 key，没调过的抛 `ValueError`；删兜底；`@no_capture`、`Op.tuned`、`Op.capturable`；生成的测试测调优过的配置（与原来没 skip 的 360 项相同）；ISA IDENTICAL；单卡 413、8 卡 3 passed | `e522ebe` |
 
 **I4 的经验**：
 
