@@ -28,6 +28,7 @@
   - R：`716cc46`（计划）、`8101410`（R0）、`689e112`（R1）、`8735b35`（文档、skill）。
   - D：`056028b`（计划）、`5d0b861`（D0）、`4f51e94`（D1 的 kit 部分：host 开销）、`23a3e8f`（D1）、`e60470a`（D2 文档）。
   - E：`e522ebe`。
+  - T1：`bebaff3`。
 - **用户的文件**：未跟踪的 `refactory2.md` 属于用户，不要改，也不要提交。`refactor3.md`–`refactor7.md`（设计稿）同样不提交。
 
 ### 0.2 工作方式
@@ -96,6 +97,15 @@
 - 删完后，剩下的 kernel 的 ISA 必须完全不变。不在快照矩阵里的配置，本来就走不到。
 
 ## 3. 当前迭代
+
+### 3.0t T1–T4：通用 tune / bench（进行中，设计见 `refactor7.md` C 部分）
+
+用户 2026-11-17：E 之后直接做完 T1–T4，每完成一个就提交并 push 到 tq2。
+
+- [x] T1 `bebaff3`：`pyhip.kit.table`（标准库）——`read`、`identity`（`config` 及之前的列：同 identity 的行互相替换）、`write`（按 identity 去掉 config 后排序，数字按数值，再按 us；原子替换）、`merge`、`compare`。分派的读表、a8w4 tune 的 merge、`tables.compare` 都改用它。对照被替换的代码（原样拷贝）：把表打乱拆成 4 份再合并、把 300 行改时间后合并进表，得到的文件逐字节相同；compare 输出的 177 行相同；分派结果不变；`readme --check` 通过；kit 16、API 22 passed。去掉了旧部分文件“没有 act 列就当 silu”的补列（没有这样的文件了）。
+- [ ] T2 `kit.timing`
+- [ ] T3 `kit.tune` + CLI
+- [ ] T4 `kit.bench`
 
 ### 3.0e E：去掉 `@requires`（已完成）
 
