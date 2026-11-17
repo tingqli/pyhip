@@ -13,7 +13,7 @@
 
 ### 0.1 当前状态（每次停下来前更新）
 
-- **迭代**：I1、I1b、I2、I3、I4 已完成。I3 的范围是用户看过 I2 后改的（见 3.4 节）：`_vendor` 只留真正用到的代码，迁到 `kernels/` 下的共享模块，删掉 `_vendor/`。用户看过 I4 后决定先跳过 I4b（NaN 传播，1.1 节），先做 I5（3.2 节）。I5 已完成。之后讨论出函数级 kit 的设计（`refactor6.md`），用户 2026-11-17 让开始实现：迭代 K（3.1 节）已完成。用户看过 K 后讨论了 `refactor7.md`：A 部分（op 注册表 `@op_register`）已定，迭代 R（3.0 节）已完成，等用户 review；B 部分（查表分派进 kit）还有 Q77–Q85 待定。I4b、I6 排在这些之后；另有一个待定问题：`ref_moe(raw)` 的调用方（`bench/core.py`、`bench/dist.py` 的 megamoe 参考、两个 MORI 测试）要不要改用 `moe_ref(W)`。
+- **迭代**：I1、I1b、I2、I3、I4 已完成。I3 的范围是用户看过 I2 后改的（见 3.4 节）：`_vendor` 只留真正用到的代码，迁到 `kernels/` 下的共享模块，删掉 `_vendor/`。用户看过 I4 后决定先跳过 I4b（NaN 传播，1.1 节），先做 I5（3.2 节）。I5 已完成。之后讨论出函数级 kit 的设计（`refactor6.md`），用户 2026-11-17 让开始实现：迭代 K（3.1 节）已完成。用户看过 K 后讨论了 `refactor7.md`：A 部分（op 注册表 `@op_register`）的迭代 R（3.0a 节）已完成。之后用户委托按推荐定下 B、C 部分的问题，并说明 sglang 现有代码不再考虑（冻结 API 取消）：正在做迭代 D（3.0 节，查表分派进 kit），之后是 T1–T4（通用 tune / bench）。I4b、I6 排在这些之后；另有一个待定问题：`ref_moe(raw)` 的调用方（`bench/core.py`、`bench/dist.py` 的 megamoe 参考、两个 MORI 测试）要不要改用 `moe_ref(W)`。
 - **分支**：`/sgl-workspace/pyhip` 的 `refactor/a8w4`。
 - **已有提交**：
   - 迭代 0，安全网：`64ce77c`、`d17f502`（ISA 基线在这个提交上生成）、`4e256d9`。
@@ -45,7 +45,7 @@
 - **纯结构性的改动**（删除走不到的分支、搬文件、改名、换 host 封装）：`prof isa-diff` 对基线必须输出 `ISA IDENTICAL`。kernel 名字可以变。
 - **ISA 基线**：`/sgl-workspace/a8w4_refactor_state/isa_base` 从 I5 第 6 步起是 `ff82c3d` 的快照。更早的留在同目录：`isa_base_e565657`（I4 第 4 步到 I5 第 5 步）、`isa_base_d17f502`（I4 第 4 步之前）。基线丢了就按 `refactory.md` §0.4 重新生成，但 worktree 开在 `ff82c3d`；以后有意改变 ISA 的提交，也要这样换基线并在这里记下。
 - **中途不重新调优**：哪个改动需要重新调优，就说明它不是纯结构性的（Q6）。
-- **冻结的公开 API**：7 个函数和 `ref`（Q8、Q17），由 `tests/test_a8w4_api.py` 守护，不用 GPU，约 3 秒跑完。
+- **公开 API**：冻结（Q8、Q17）已由用户 2026-11-17 取消（sglang 将重新集成）。`tests/test_a8w4_api.py` 从 D 起守护新的公开接口（`ops`、`a8w4_moe`、`a8w4_moe_dyn`、`prepare_weights`、`ref`），不用 GPU，约 3 秒跑完。
 - **用 GPU 前**：先看 `rocm-smi --showuse`，再拿 `flock /tmp/gpu-N.lock`。卡被占用时停下来问用户（Q29）。
 
 ## 1. Backlog（按确定程度分三档）
@@ -62,7 +62,9 @@
 | I4b | 量化的 amax 改成传播 NaN（PyTorch 要求算子尽量传播 NaN）。I4 第 4 步实测：输入 x 的一个元素是 NaN 时，ep3k 的 3 个 tr 配置（`m64`、`l128`、`l128c`）、`ep1k`，以及对应的 dyn 配置输出有限的错误值；ref 和其他配置是整行 NaN。原因是 gemm1→gemm2 的重量化用 `maxnumf` 求 amax，忽略了 NaN：`ep_gemm` 的 tr epilogue（约 376–396 行）、`_kloop.quant_chunk`（ep1k 的 gemm2 输入）。同样写法的还有 megamoe 的 `ep_mega` epilogue 和 `ep_mega_comm.mega_quant_kernel`（量化原始 x），多卡，测试脚本还没覆盖。改成 `fx.max`，pack 函数不用动 | 用户 2026-11-16 | 每个配置注入 NaN / ±Inf 后输出和 ref 一样整行 NaN、其他行不受影响（加进 pytest）；ISA 只在这几处变；性能 A/B；单卡 pytest |
 | I5 | host 封装改用 `@flydsl_kernel`，替代 `_run_compiled` 和 `functools.cache`；每个 kernel 文件一个公开入口；同时删掉 I1 留下的无用 kernel 参数（标了 `# unused` 的那些）。已完成，见 3.2 节 | Q13，Phase 3 | ISA IDENTICAL（kernarg 偏移变化要逐个解释）；pytest |
 | K | 函数级 kit：op 写成一族函数（`moe_ref`、`moe_test`、`moe_tp1k` …），配置空间和限制写在函数的装饰器上，测试和 tune 由 `pyhip.kit` 生成或驱动。已完成，见 3.1 节 | `refactor6.md`（Q66–Q76）；用户 2026-11-17 | 见 3.1 节 |
-| R | op 注册表：`@op_register` 逐个注册，取代 `collect(globals())`；每个包一个 `Registry`（`a8w4.ops.moe`）。见 3.0 节 | `refactor7.md` A 部分；用户 2026-11-17 | 见 3.0 节 |
+| R | op 注册表：`@op_register` 逐个注册，取代 `collect(globals())`；每个包一个 `Registry`（`a8w4.ops.moe`）。已完成，见 3.0a 节 | `refactor7.md` A 部分；用户 2026-11-17 | 见 3.0a 节 |
+| D | 查表分派进 kit（`Op.pick`、`Op.__call__`、`<op>_fallback`、`Registry(table=, bucket=, relax=)`）；取消冻结 API；moe_dyn 词汇表改名。见 3.0 节 | `refactor7.md` B 部分和“决定”；用户 2026-11-17 | 见 3.0 节 |
+| T1–T4 | 通用 tune / bench：`kit.table`（T1）、`kit.timing`（T2）、`kit.tune` + CLI（T3）、`kit.bench`（T4） | `refactor7.md` C 部分 | 每步输出与改前相同（tune 的候选、CSV、show / verify；bench 的 resolve），计时同卡 ABAB 在噪声内 |
 | I6 | 新建 `workspace.py`，统一管理每张卡一份的缓冲区 | Q19 | ISA IDENTICAL；pytest |
 
 ### 1.2 中期：方向清楚，细节做到时再定
@@ -92,7 +94,23 @@
 
 ## 3. 当前迭代
 
-### 3.0 R：op 注册表（进行中，设计见 `refactor7.md` A 部分）
+### 3.0 D：查表分派进 kit，取消冻结 API（进行中，设计见 `refactor7.md` B 部分和“决定”）
+
+**目标**：
+
+- kit 做分派：`Registry(name, table=, bucket=, relax=)` 声明调优表；`op.pick(vocab, table=, capturing=)` 选配置；`op(*args, config=, table=, **hints)` 读词汇表、选配置、运行；新角色 `<op>_fallback`。
+- a8w4 只留声明和策略：`act → silu`、两个兜底函数、`moe_dyn` 的词汇表改名和容量限制。
+- 取消冻结 API：元组形式的 7 个函数删掉，工具和测试改用 op 的方法；`a8w4_moe` / `a8w4_moe_dyn` 只剩入参检查、`M == 0` 和 `MOE(...)`。
+
+**步骤**：
+
+| 步 | 内容 | 验收 |
+|---|---|---|
+| D0 | kit：读表（按路径 + mtime 缓存）、`pick`、`points`、`__call__`、`<op>_fallback`、`Registry` 的声明 | `tests/kit` 用玩具 op 和 tmp CSV：精确 key、第一个 ≥ 的点和超过最大点、relax、旧表缺列、None 的 key 取默认值、不认识的 kind 跳过、capturing 过滤、兜底、都不能跑时的 `ValueError`、mtime 重读、hints、`config=`；不碰 a8w4 |
+| D1 | a8w4：声明、兜底、moe_dyn 改名、薄包装；删元组形式的函数和分派段；tune / tables / bench / isa_snapshot / 测试改用 op 的方法；`test_a8w4_api.py` 改写；用到旧接口的实验脚本加说明 | K2 golden 的同样内容改用新接口计算，和改前逐项相同，只有有意差异（B1、≥ 65536 token 的 dyn、未知 ep3k 预设的解析），逐类列出；op 级 golden：`moe` 相同，`moe_dyn` 只有改名；生成测试的 ID 不变；ISA IDENTICAL；API + kit 测试；单卡 pytest；8 卡 MORI / megamoe；`a8w4_moe` 的 host 时间同卡 ABAB 不变差 |
+| D2 | 文档：README（2 节接口、6.2 查表规则、8 节、9.3 节）、skill | — |
+
+### 3.0a R：op 注册表（已完成，设计见 `refactor7.md` A 部分）
 
 **目标**：用装饰器 `@op_register` 逐个注册 op 的函数，取代一次性的 `collect(globals())`。
 
