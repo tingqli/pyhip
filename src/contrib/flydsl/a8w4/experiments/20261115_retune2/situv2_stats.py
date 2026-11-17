@@ -1,4 +1,7 @@
-"""SiTUv2 vs SiLU statistics of configs/a8w4_moe_tuned.csv for README 6.3 (20261115 table).
+"""NOTE: uses lookup_config / config_name, removed in refactor D (now
+``ops.moe.pick / name_of``); run this at commit 5d0b861 or earlier.
+
+SiTUv2 vs SiLU statistics of configs/a8w4_moe_tuned.csv for README 6.3 (20261115 table).
 
     cd src/contrib/flydsl && python a8w4/experiments/20261115_retune2/situv2_stats.py
 """

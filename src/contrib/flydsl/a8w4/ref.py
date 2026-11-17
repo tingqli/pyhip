@@ -286,40 +286,47 @@ def moe_check(out, expected, **_):
 @op_register
 def moe_dims(x, W, topk_weights, topk_ids, *, expert_offset=0, num_experts=None, act="silu",
              situ=None):
+    """Also checks the arguments (``ops.moe(...)`` calls it on every call)."""
     E, H, I = weight_shape(W)
-    return dict(num_tokens=x.shape[0], model_dim=H, inter_dim=I, experts=E,
-                experts_global=num_experts or E, topk=topk_ids.shape[1],
-                expert_offset=expert_offset, act=act)
+    M, topk = topk_ids.shape
+    assert x.dtype == torch.bfloat16 and x.shape == (M, H) and x.is_contiguous(), x.shape
+    assert topk_ids.dtype == torch.int32 and topk_weights.dtype == torch.float32
+    assert topk_weights.shape == (M, topk)
+    return dict(num_tokens=M, model_dim=H, inter_dim=I, experts=E,
+                experts_global=num_experts or E, topk=topk, expert_offset=expert_offset,
+                act=act)
 
 
 @op_register
 @param(_SHAPE, {"ep8": SHAPES["ep8"]})
-@param("num_tokens, valid", {"v0": (512, 0), "v1": (512, 1), "v37": (512, 37),
-                             "v300": (512, 300), "v1500": (2048, 1500)})
+@param("capacity, num_tokens", {"v0": (512, 0), "v1": (512, 1), "v37": (512, 37),
+                                "v300": (512, 300), "v1500": (2048, 1500)})
 @param("fp8", {"bf16": False, "fp8": True})
 @param("act", ACTS, id="{}")
 def moe_dyn_test(model_dim, inter_dim, experts, experts_global, topk, expert_offset,
-                 num_tokens, valid, fp8=False, act="silu", seed=0):
+                 capacity, num_tokens, fp8=False, act="silu", routing="uniform", seed=0):
     """Inputs of ``moe_dyn_ref`` / ``a8w4_moe_dyn``: an EP all-to-all receive buffer of
-    ``num_tokens`` rows (the capacity). Rows [0, valid) are tokens with >= 1 local
-    route (global ids); the rows past them are stale (NaN x, random ids) and must not
-    be read. fp8: x in fp8 with per-(row, 128) scales (``quant_fp8_groups``)."""
-    x, tw, ti = make_routing(num_tokens, model_dim, experts_global, topk, seed=seed)
+    ``capacity`` rows. Rows [0, num_tokens) are tokens with >= 1 local route (global
+    ids); the rows past them are stale (NaN x, random ids) and must not be read. fp8: x
+    in fp8 with per-(row, 128) scales (``quant_fp8_groups``). The host's estimate of the
+    valid rows (``est_tokens``) is exact."""
+    x, tw, ti = make_routing(capacity, model_dim, experts_global, topk, seed=seed,
+                             routing=routing)
     g = torch.Generator(device="cuda").manual_seed(seed)
     lo, hi = expert_offset, expert_offset + experts
-    forced = torch.randint(lo, hi, (num_tokens,), device="cuda", generator=g)
+    forced = torch.randint(lo, hi, (capacity,), device="cuda", generator=g)
     has_local = ((ti >= lo) & (ti < hi)).any(-1)
     ti[:, 0] = torch.where(has_local, ti[:, 0], forced.to(torch.int32))
-    ti[valid:] = torch.randint(0, experts_global, ti[valid:].shape, device="cuda", generator=g,
-                               dtype=torch.int32)
-    x[valid:] = float("nan")
+    ti[num_tokens:] = torch.randint(0, experts_global, ti[num_tokens:].shape, device="cuda",
+                                    generator=g, dtype=torch.int32)
+    x[num_tokens:] = float("nan")
     xs = None
     if fp8:
         x, xs = quant_fp8_groups(x)
     return dict(x=x, W=_weights(experts, model_dim, inter_dim), topk_weights=tw, topk_ids=ti,
-                m_valid=torch.tensor([valid], dtype=torch.int32, device="cuda"), x_scale=xs,
-                expert_offset=expert_offset, num_experts=experts_global, act=act,
-                situ=SITU if act == "situv2" else None, est_tokens=max(valid, 1))
+                m_valid=torch.tensor([num_tokens], dtype=torch.int32, device="cuda"),
+                x_scale=xs, expert_offset=expert_offset, num_experts=experts_global, act=act,
+                situ=SITU if act == "situv2" else None, est_tokens=num_tokens)
 
 
 @op_register
@@ -334,10 +341,21 @@ def moe_dyn_check(result, expected, *, m_valid, **_):
 @op_register
 def moe_dyn_dims(x, W, topk_weights, topk_ids, m_valid, *, x_scale=None, expert_offset=0,
                  num_experts=None, act="silu", situ=None, est_tokens=None, out=None):
-    """``num_tokens`` is the capacity; ``valid`` stays unknown (m_valid is on the
-    device: reading it would sync)."""
-    return dict(moe_dims(x, W, topk_weights, topk_ids, expert_offset=expert_offset,
-                         num_experts=num_experts, act=act), fp8=x_scale is not None)
+    """``capacity``: the buffer's rows; ``num_tokens``: the valid rows as the host
+    estimates them (``est_tokens`` clamped to the capacity; default the capacity).
+    m_valid is not read: it is on the device, reading it would sync. Also checks the
+    arguments (``ops.moe_dyn(...)`` calls it on every call)."""
+    E, H, I = weight_shape(W)
+    M, topk = topk_ids.shape
+    assert x.shape == (M, H) and x.is_contiguous(), x.shape
+    assert x.dtype in (torch.bfloat16, torch.float8_e4m3fnuz), x.dtype
+    assert (x.dtype == torch.bfloat16) == (x_scale is None), "fp8 x needs x_scale"
+    assert topk_ids.dtype == torch.int32 and topk_weights.dtype == torch.float32
+    assert m_valid.dtype == torch.int32 and m_valid.is_cuda, m_valid
+    est = M if est_tokens is None else max(0, min(M, int(est_tokens)))
+    return dict(model_dim=H, inter_dim=I, experts=E, experts_global=num_experts or E,
+                topk=topk, expert_offset=expert_offset, act=act, capacity=M, num_tokens=est,
+                fp8=x_scale is not None)
 
 
 # =============================================================================

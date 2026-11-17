@@ -1,4 +1,8 @@
-"""TP8 MiMo shape (I = 256, 256 experts): the fused TP prep (tp_prep.py: sort + x quant
+"""NOTE: uses config_name / lookup_config / parse_config / run_config, removed in
+refactor D (now ``ops.moe.name_of / pick / parse / run``); run this at commit 5d0b861
+or earlier.
+
+TP8 MiMo shape (I = 256, 256 experts): the fused TP prep (tp_prep.py: sort + x quant
 + out zeroing in one launch) in place of aiter moe_sorting + quantize_rows, feeding the
 tuned config's own GEMM kernels (tp2k / tp1k / tp1kq), or, at small T, the split-K EP
 gemm1 (20261114_splitk_gemm1) + tp_gemm2.

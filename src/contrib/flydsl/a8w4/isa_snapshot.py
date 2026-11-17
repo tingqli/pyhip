@@ -11,7 +11,7 @@ isa-snapshot runs a fixed matrix of jobs (``--list`` prints them), several worke
 processes per GPU, each with an empty FlyDSL cache (a cached kernel is not compiled, so
 not seen) and the compile hooks below. Matrix:
 
-  moe:<case>:<act>:<family>  ``run_config`` of every tuner candidate of the family (and
+  moe:<case>:<act>:<family>  ``MOE.run`` of every tuner candidate of the family (and
                              every ep3k preset) at every tuned token count plus the
                              token counts where a compile-time choice flips (tp_prep
                              unroll / route range, ep_prep multi-WG)
@@ -89,10 +89,11 @@ def _family_configs(shape, family):
 
     cands = [c for c in tune.candidates(shape) if c["kind"] == family]
     if family == "ep3k":  # presets the tuner skips (e.g. l128_v1)
-        names = {moe.config_name(c) for c in cands}
+        names = {moe.MOE.name_of(c) for c in cands}
         for p in EG.CFGS:
             c = dict(kind="ep3k", cfg=p)
-            if moe.config_name(c) not in names and moe.supported(c, shape):
+            if (moe.MOE.name_of(c) not in names
+                    and moe.MOE.why_not(c, moe.shape_vocab(shape)) is None):
                 cands.append(c)
     return cands
 
@@ -132,9 +133,9 @@ def _moe_items(case, act, fam, tokens):
     for t in tokens:
         x, tw, ti = R.make_routing(t, H, EGl, K)
         for c in cfgs:
-            if moe.supported(c, shape, act=act, tokens=t):
-                yield (f"t={t} {moe.config_name(c)}",
-                       lambda c=c, x=x, tw=tw, ti=ti: moe.run_config(
+            if moe.MOE.why_not(c, moe.shape_vocab(shape, t, act)) is None:
+                yield (f"t={t} {moe.MOE.name_of(c)}",
+                       lambda c=c, x=x, tw=tw, ti=ti: moe.MOE.run(
                            c, x, st["W"], tw, ti, expert_offset=e0, num_experts=EGl,
                            act=act, situ=_situ(act)))
 
@@ -162,8 +163,8 @@ def _dyn_items(act, xf):
             x = (x.float() / xs[:, None]).to(torch.float8_e4m3fnuz)
         for p in EG.CFGS:
             c = dict(kind="ep3k", cfg=p)
-            if moe.supported(c, shape, act=act, tokens=cap):
-                yield (f"cap={cap} {moe.config_name(c)}",
+            if moe.MOE.why_not(c, moe.shape_vocab(shape, cap, act)) is None:
+                yield (f"cap={cap} {moe.MOE.name_of(c)}",
                        lambda c=c, x=x, xs=xs, tw=tw, ti=ti, m_valid=m_valid: moe.a8w4_moe_dyn(
                            x, st["W"], tw, ti, m_valid, x_scale=xs, expert_offset=e0,
                            num_experts=EGl, act=act, situ=_situ(act), config=c))

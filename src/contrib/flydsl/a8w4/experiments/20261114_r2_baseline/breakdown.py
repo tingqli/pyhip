@@ -1,4 +1,7 @@
-"""Per-kernel breakdown (cold cache, torch profiler) + e2e of the tuned configs on the
+"""NOTE: uses config_name / lookup_config / run_config, removed in refactor D (now
+``ops.moe.name_of / pick / run``); run this at commit 5d0b861 or earlier.
+
+Per-kernel breakdown (cold cache, torch profiler) + e2e of the tuned configs on the
 MiMo TP8 / EP8 shapes.
 
     cd src/contrib/flydsl && HIP_VISIBLE_DEVICES=0 python a8w4/experiments/20261114_r2_baseline/breakdown.py tp8 1 2 4 8 16

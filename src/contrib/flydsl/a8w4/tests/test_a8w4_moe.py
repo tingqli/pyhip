@@ -14,7 +14,7 @@
   SiTUv2 dispatch (the clamp is exercised, betas are checked);
 * CUDA-graph capture: only graph-safe configs are picked, replay matches eager;
   ``a8w4_moe_dyn``: one graph replayed with different device-side valid counts;
-* ``dyn_config``: EP kernels only.
+* ``MOE_DYN.pick``: EP kernels only.
 """
 
 import csv
@@ -25,19 +25,11 @@ import pytest
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-from a8w4 import (  # noqa: E402
-    a8w4_moe,
-    a8w4_moe_dyn,
-    dyn_config,
-    lookup_config,
-    prepare_weights,
-    run_config,
-    shuffle_mxfp4,
-    supported,
-)
+from a8w4 import a8w4_moe, a8w4_moe_dyn, prepare_weights, shuffle_mxfp4  # noqa: E402
 from a8w4 import ref as R  # noqa: E402
-from a8w4.moe import FIELDS  # noqa: E402
+from a8w4.moe import MOE, MOE_DYN, shape_vocab  # noqa: E402
 from a8w4.ref import COS_TOL  # noqa: E402
+from a8w4.tune import FIELDS  # noqa: E402
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
@@ -110,7 +102,7 @@ def test_moe_dyn_ref():
     H, I, E, EGl, K, e0 = SHAPES["ep8"]
     raw = weights("ep8")[1]
     for fp8 in (False, True):
-        inp = R.moe_dyn_test(*SHAPES["ep8"], num_tokens=512, valid=37, fp8=fp8, seed=3)
+        inp = R.moe_dyn_test(*SHAPES["ep8"], capacity=512, num_tokens=37, fp8=fp8, seed=3)
         out = R.moe_dyn_ref(**inp)
         assert out.shape == (512, H) and not out[37:].any()
         x = inp["x"][:37]
@@ -163,11 +155,11 @@ def test_tp_prep_vs_aiter(tokens, bm):
 def test_cuda_graph(case, tokens):
     H, I, E, EGl, K, e0 = SHAPES[case]
     W, x, tw, ti, ref = data(case, tokens, seed=5)
-    cfg = lookup_config((H, I, E, EGl, K), tokens, capturing=True)
+    cfg = MOE.pick(shape_vocab((H, I, E, EGl, K), tokens, "silu"), capturing=True)
     assert cfg["kind"] != "tp1kq"
     # eager, the config the capture picks (a8w4_moe may pick another: tp8 4096 = tp1kq);
     # warm-up: compiles it, allocates the kernels' workspaces
-    eager = run_config(cfg, x, W, tw, ti, expert_offset=e0, num_experts=EGl)
+    eager = MOE.run(cfg, x, W, tw, ti, expert_offset=e0, num_experts=EGl)
     torch.cuda.synchronize()
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
@@ -185,7 +177,7 @@ def test_situv2_dispatch(case, tokens):
     """SiTUv2 calls pick from the table's situv2 rows (EP shape: an EP kernel)."""
     H, I, E, EGl, K, e0 = SHAPES[case]
     shape = (H, I, E, EGl, K)
-    kind = lookup_config(shape, tokens, act="situv2")["kind"]
+    kind = MOE.pick(shape_vocab(shape, tokens, "situv2"))["kind"]
     assert kind.startswith("ep" if case == "ep8" else "tp"), kind
     W, x, tw, ti, ref = data(case, tokens, act="situv2", situ=R.SITU, seed=7)
     raw = weights(case)[1]
@@ -217,21 +209,25 @@ def test_table_act(tmp_path):
             w.writerows(rows)
         return str(path)
 
+    def pick(op, act, path):
+        return op.pick(shape_vocab(shape, 64, act, op=op), table=path)
+
     both = write(tmp_path / "both.csv", FIELDS, rows)
-    for pick in (lookup_config, dyn_config):
-        assert pick(shape, 64, csv_path=both)["cfg"] == "t16"
-        assert pick(shape, 64, act="situv2", csv_path=both)["cfg"] == "s32"
+    for op in (MOE, MOE_DYN):
+        assert pick(op, "silu", both)["cfg"] == "t16"
+        assert pick(op, "situv2", both)["cfg"] == "s32"
     silu = rows[:2]
     old = write(tmp_path / "old.csv", [f for f in FIELDS if f != "act"], silu)
     for path in (write(tmp_path / "silu.csv", FIELDS, silu), old):
-        assert lookup_config(shape, 64, act="situv2", csv_path=path)["cfg"] == "t16"
+        assert pick(MOE, "situv2", path)["cfg"] == "t16"
 
 
 def test_dyn_cuda_graph():
     """One capture serves any device-side valid count; the estimate (128) may be below
     it: the workgroups stride over the actual tiles."""
     def buffer(valid, seed):  # a receive buffer of 512 rows, fp8 x
-        return R.moe_dyn_test(*SHAPES["ep8"], num_tokens=512, valid=valid, fp8=True, seed=seed)
+        return R.moe_dyn_test(*SHAPES["ep8"], capacity=512, num_tokens=valid, fp8=True,
+                              seed=seed)
 
     buf = buffer(512, seed=1)
     del buf["est_tokens"]  # the capture's estimate: 128
@@ -252,13 +248,14 @@ def test_dyn_cuda_graph():
         R.moe_dyn_check(out, R.moe_dyn_ref(**new), m_valid=new["m_valid"])
 
 
-def test_dyn_config():
+def test_dyn_pick():
     H, I, E, EGl, K, e0 = SHAPES["ep8"]
     for tokens in (1, 300, 3000, 40000):
-        cfg = dyn_config((H, I, E, EGl, K), tokens)
-        assert cfg["kind"] == "ep3k" and supported(cfg, (H, I, E, EGl, K))
+        vocab = shape_vocab((H, I, E, EGl, K), tokens, "silu", op=MOE_DYN)
+        cfg = MOE_DYN.pick(vocab)
+        assert cfg["kind"] == "ep3k" and MOE_DYN.why_not(cfg, vocab) is None
     with pytest.raises(ValueError):  # TP8 shape: 256 local experts, no EP kernels
-        dyn_config(SHAPES["tp8"][:5], 16)
+        MOE_DYN.pick(shape_vocab(SHAPES["tp8"][:5], 16, "silu", op=MOE_DYN))
 
 
 if __name__ == "__main__":

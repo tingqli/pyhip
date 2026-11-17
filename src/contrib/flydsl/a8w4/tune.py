@@ -47,18 +47,13 @@ if __package__ in (None, ""):  # run as a script: make the package importable
 import torch  # noqa: E402
 
 from . import ref as R  # noqa: E402
-from .moe import (  # noqa: E402
-    DEFAULT_CSV,
-    FIELDS,
-    MOE,
-    _load_table,
-    a8w4_moe,
-    config_name,
-    default_config,
-    lookup_config,
-    shape_vocab,
-)
+from .moe import DEFAULT_CSV, MOE, a8w4_moe, shape_vocab  # noqa: E402
 from .ref import COS_TOL  # noqa: E402
+
+# the table's columns: the vocabulary names that key it (ops.moe reads them), the bucket
+# num_tokens, the config name and its time, the accuracy metric
+FIELDS = ["model_dim", "inter_dim", "experts", "experts_global", "topk", "routing", "act",
+          "num_tokens", "config", "us", "cos"]
 
 # (H, I, E local, E global, topk, expert_offset). XiaomiMiMo/MiMo-V2.6-Flash(-RL):
 # hidden 4096, moe_intermediate 2048, 256 routed experts, top-8, SiLU.
@@ -134,7 +129,7 @@ def tune(shape, e0, tokens, out_path, routing="uniform", iters=20, rounds=3, log
     copies = None
     for tok in tokens:
         cfgs = MOE.candidates(shape_vocab(shape, tok, act))  # the ones that run tok rows of act
-        times = {config_name(c): [] for c in cfgs}
+        times = {MOE.name_of(c): [] for c in cfgs}
         cos = dict.fromkeys(times, 0.0)
         bad = {}
         for rnd in range(rounds):
@@ -175,7 +170,7 @@ def tune(shape, e0, tokens, out_path, routing="uniform", iters=20, rounds=3, log
 
 
 def _points(csv_path, shape, routing, act):
-    rows = _load_table(csv_path, os.path.getmtime(csv_path)).get((*shape, routing, act))
+    rows = MOE.points(shape_vocab(shape, None, act, routing), table=csv_path)
     if not rows:
         raise SystemExit(f"no rows for {shape} {routing} {act} in {csv_path}")
     return rows
@@ -190,12 +185,11 @@ def show(shape, csv_path, routing="uniform", act="silu"):
         us0, best = cands[0]
         tp = next(((u, c) for u, c in cands if c["kind"].startswith("tp")), (None, None))
         ep = next(((u, c) for u, c in cands if c["kind"].startswith("ep")), (None, None))
-        safe = lookup_config(shape, n, act=act, capturing=True, routing=routing,
-                             csv_path=csv_path)
-        cell = lambda uc: (config_name(uc[1]), f"{uc[0]:.1f}") if uc[1] else ("-", "-")  # noqa: E731
-        print(f"| {n} | {config_name(best)} | {us0:.1f} | {' | '.join(cell(tp))} | "
+        safe = MOE.pick(shape_vocab(shape, n, act, routing), capturing=True, table=csv_path)
+        cell = lambda uc: (MOE.name_of(uc[1]), f"{uc[0]:.1f}") if uc[1] else ("-", "-")  # noqa: E731
+        print(f"| {n} | {MOE.name_of(best)} | {us0:.1f} | {' | '.join(cell(tp))} | "
               f"{' | '.join(cell(ep))} | "
-              f"{'' if safe == best else config_name(safe)} |")
+              f"{'' if safe == best else MOE.name_of(safe)} |")
 
 
 def verify(shape, e0, tokens, csv_path, routing="uniform", iters=20, log=print, act="silu",
@@ -209,17 +203,17 @@ def verify(shape, e0, tokens, csv_path, routing="uniform", iters=20, log=print, 
         if copies is None:
             copies = itertools.cycle(R.weight_copies(inputs["W"], wcopies)).__next__
         expected = R.moe_ref(**inputs)
-        cfg = lookup_config(shape, tok, act=act, routing=routing, csv_path=csv_path)
+        cfg = MOE.pick(shape_vocab(shape, tok, act, routing), table=csv_path)
         fn = lambda W=inputs["W"]: a8w4_moe(**dict(inputs, W=W), routing=routing,  # noqa: E731
-                                            csv_path=csv_path)
+                                            table=csv_path)
         c = R.cos_diff(expected, fn().float())
         us = R.time_cold(lambda: fn(copies()), iters=iters)
-        dflt = default_config(shape, tok, act)
+        dflt = MOE.pick(shape_vocab(shape, tok, act), table=None)
         dus = R.time_cold(lambda: MOE.run(dflt, **dict(inputs, W=copies())), iters=iters)
         n = next((p for p in sorted(pts) if p >= tok), max(pts))
         tus = next(u for u, cc in pts[n] if cc == cfg)
-        log(f"tok {tok:6d} -> point {n:6d}: {config_name(cfg):24s} {us:8.1f} us (table {tus:8.1f})"
-            f" | default {config_name(dflt):24s} {dus:8.1f} us | x{dus / us:.2f} | cos {c:.1e}"
+        log(f"tok {tok:6d} -> point {n:6d}: {MOE.name_of(cfg):24s} {us:8.1f} us (table {tus:8.1f})"
+            f" | default {MOE.name_of(dflt):24s} {dus:8.1f} us | x{dus / us:.2f} | cos {c:.1e}"
             + ("" if c < COS_TOL else " BAD"))
 
 
@@ -385,7 +379,7 @@ def main():
     shape, e0 = _case(args)
     if args.mode == "candidates":
         for c in candidates(shape):
-            print(config_name(c))
+            print(MOE.name_of(c))
     elif args.mode == "tune":
         tune(shape, e0, args.t or TOKENS, args.out or args.csv, args.routing, args.iters,
              args.rounds, log, args.act, args.wcopies)

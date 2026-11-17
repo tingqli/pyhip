@@ -8,21 +8,11 @@
     # EP on an all-to-all receive buffer (valid row count on device, e.g. MORI):
     out = a8w4_moe_dyn(x, W, topk_weights, topk_ids, m_valid, x_scale=..., ...)
 
-``ops.moe`` / ``ops.moe_dyn``: the ops (``pyhip.kit``) behind them, for tests and tools.
-See README.md.
+``ops.moe`` / ``ops.moe_dyn``: the ops (``pyhip.kit``) behind them: ``ops.moe(...)``
+runs the config the tuned table picks (``ops.moe.pick(vocab)``), ``ops.moe.run(cfg, ...)``
+a given one; tests, tune and bench use them. See README.md.
 """
 
-from ._ops import ops  # noqa: F401
-from .moe import (  # noqa: F401
-    DEFAULT_CSV,
-    a8w4_moe,
-    a8w4_moe_dyn,
-    config_name,
-    default_config,
-    dyn_config,
-    lookup_config,
-    parse_config,
-    run_config,
-    supported,
-)
+from ._ops import DEFAULT_CSV, ops  # noqa: F401
+from .moe import a8w4_moe, a8w4_moe_dyn  # noqa: F401
 from .weights import prepare_weights, shuffle_mxfp4, weight_shape  # noqa: F401

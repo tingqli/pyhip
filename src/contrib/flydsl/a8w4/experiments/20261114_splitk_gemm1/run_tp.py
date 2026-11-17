@@ -1,4 +1,7 @@
-"""TP8 MiMo shape (I = 256, 256 local experts): the split-K EP gemm1 (ep_gemm_sk) in
+"""NOTE: uses config_name / lookup_config / run_config, removed in refactor D (now
+``ops.moe.name_of / pick / run``); run this at commit 5d0b861 or earlier.
+
+TP8 MiMo shape (I = 256, 256 local experts): the split-K EP gemm1 (ep_gemm_sk) in
 place of tp_gemm1 in the tuned "tp2k" path (aiter moe_sorting -> row quant -> gemm1
 -> tp_gemm2). Everything but gemm1 is the tuned config's (same sorting, same
 gemm2, same q8s A2 buffer: fp8 [sorted, I] | f32 [sorted, I/128]).

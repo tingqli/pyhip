@@ -21,7 +21,7 @@ import statistics
 import sys
 from collections import defaultdict
 
-from .moe import DEFAULT_CSV, config_name, lookup_config
+from .moe import DEFAULT_CSV, MOE, shape_vocab
 
 README = os.path.join(os.path.dirname(os.path.abspath(__file__)), "README.md")
 H, TOPK = 4096, 8
@@ -252,9 +252,9 @@ def stats(table=DEFAULT_CSV):
         for t, a, b, g in gain:
             print(f"  {t:6d}: silu {a:28s} situv2 {b:28s} situv2 gain {g:+.2f}%")
         for tok in (4096,):
-            a = lookup_config(shape, tok, act="silu", capturing=True, csv_path=table)
-            b = lookup_config(shape, tok, act="situv2", capturing=True, csv_path=table)
-            print(f"  capture {tok}: silu {config_name(a)} | situv2 {config_name(b)}")
+            a, b = (MOE.pick(shape_vocab(shape, tok, act), capturing=True, table=table)
+                    for act in ("silu", "situv2"))
+            print(f"  capture {tok}: silu {MOE.name_of(a)} | situv2 {MOE.name_of(b)}")
 
 
 if __name__ == "__main__":

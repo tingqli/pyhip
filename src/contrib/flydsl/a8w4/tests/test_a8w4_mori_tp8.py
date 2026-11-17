@@ -45,9 +45,10 @@ import torch
 import torch.distributed as dist
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-from a8w4 import a8w4_moe, config_name, lookup_config  # noqa: E402
+from a8w4 import a8w4_moe  # noqa: E402
 from a8w4 import ref as R  # noqa: E402
 from a8w4.bench import dist as D  # noqa: E402
+from a8w4.moe import MOE, shape_vocab  # noqa: E402
 
 WORLD = D.WORLD
 MODEL = (4096, 2048, 256, 8)  # MiMo-V2.6-Flash: hidden, moe_intermediate, experts, top-k
@@ -235,7 +236,8 @@ def _bench(layer, x, tw, ti, graphs, kind, iters, warmup, spin):
         late += (h1 > SPIN_US) + (h2 > SPIN_US)  # the GPU may have waited for the host
     if not graphs:
         layer.W = W
-    cfg = config_name(lookup_config(SHAPE, x.shape[0], act=layer.act, capturing=bool(graphs)))
+    cfg = MOE.name_of(MOE.pick(shape_vocab(SHAPE, x.shape[0], layer.act),
+                               capturing=bool(graphs)))
     return dict(cfg=cfg, ar=layer.ar_path(x, kind), iso=iso, e2e=e2e, late=late)
 
 

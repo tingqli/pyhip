@@ -1,4 +1,7 @@
-"""Does tp_prep's row order inside an expert (LDS atomic arrival, not token order as
+"""NOTE: imports run.py, which uses the API removed in refactor D; run this at commit
+5d0b861 or earlier.
+
+Does tp_prep's row order inside an expert (LDS atomic arrival, not token order as
 moe_sorting) change the time of the GEMM kernels that follow? Times ONLY the tuned
 config's GEMM kernels (cold L2, interleaved rounds) on the routing from
   aiter  moe_sorting (+ quantize_rows)

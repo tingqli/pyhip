@@ -34,7 +34,7 @@ import torch
 
 from .. import ref as R
 from ..kernels import ep_gemm as EG
-from ..moe import MOE, config_name, default_config, lookup_config, parse_config, shape_vocab
+from ..moe import MOE, shape_vocab
 from ..tune import CASES, COS_TOL  # noqa: F401 - COS_TOL: re-exported for the tools
 
 PKG_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -233,8 +233,10 @@ def parse_variant(text):
         base = f"ep3k {base}"
     if base not in ("@table", "@auto"):
         try:
-            parse_config(base)
-        except (AssertionError, IndexError, KeyError, ValueError):
+            cfg = MOE.parse(base)
+        except (IndexError, KeyError, ValueError):
+            cfg = None
+        if cfg is None or (cfg["kind"] == "ep3k" and cfg["cfg"] not in EG.CFGS):
             raise SystemExit(f"variant {text!r}: {base!r} is not a config name\n\n{VARIANT_HELP}")
     v = Variant(label or text, text, base=base)
     for item in filter(None, (s.strip() for s in ov.split(","))):
@@ -267,17 +269,20 @@ def resolve(v, case, tokens):
     if v.func is not None:
         f = v.func
         return Resolved(v.label, v.spec, v.spec, lambda x, W, tw, ti: f(x, W, tw, ti, **kw))
-    if v.base == "@table":
-        cfg = lookup_config(case.shape, tokens, act=case.act, routing=case.routing)
-    elif v.base == "@auto":
-        cfg = default_config(case.shape, tokens, case.act)
-    else:
-        cfg = parse_config(v.base)
+    try:
+        if v.base == "@table":
+            cfg = MOE.pick(shape_vocab(case.shape, tokens, case.act, case.routing))
+        elif v.base == "@auto":
+            cfg = MOE.pick(shape_vocab(case.shape, tokens, case.act), table=None)
+        else:
+            cfg = MOE.parse(v.base)
+    except ValueError as e:  # no config can run the case
+        return str(e)
     cfg = {**cfg, **v.overrides}
     why = MOE.why_not(cfg, shape_vocab(case.shape, tokens, case.act))
     if why:
-        return f"{config_name(cfg)}: {why}"
-    return Resolved(v.label, v.spec, config_name(cfg),
+        return f"{MOE.name_of(cfg)}: {why}"
+    return Resolved(v.label, v.spec, MOE.name_of(cfg),
                     lambda x, W, tw, ti: MOE.run(cfg, x, W, tw, ti, **kw), cfg=cfg,
                     bm=MOE.meta(cfg, "tile_m"), cached=MOE.meta(cfg, "cached_loads"))
 

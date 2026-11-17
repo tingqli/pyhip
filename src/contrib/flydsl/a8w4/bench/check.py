@@ -22,7 +22,7 @@ import argparse
 import torch
 
 from .. import ref as R
-from ..moe import supported
+from ..moe import MOE, shape_vocab
 from . import core
 
 POISON = {torch.bfloat16: float("nan"), torch.float32: float("nan"), torch.uint8: 0x7F,
@@ -116,8 +116,8 @@ def main(argv=None):
                 jit = stability(fn, a.repeats)
                 bw = bool(torch.equal(base, out)) if a.bitwise else None
                 g = None
-                if a.graph and r.cfg is not None and not supported(
-                        r.cfg, case.shape, act=case.act, capturing=True, tokens=T):
+                if a.graph and r.cfg is not None and MOE.why_not(
+                        r.cfg, shape_vocab(case.shape, T, case.act), capturing=True):
                     g = "n/a (not graph-safe)"
                 elif a.graph:
                     g = graph_replay(fn)
