@@ -30,7 +30,9 @@ from a8w4 import (  # noqa: E402
     dyn_config,
     lookup_config,
     parse_config,
+    prepare_weights,
     run_config,
+    shuffle_mxfp4,
     supported,
 )
 from a8w4 import ref as R  # noqa: E402
@@ -71,6 +73,53 @@ def test_weights_layout():
     n = W["w2_scale"].numel() - W["w2_exp"].numel() * 4
     assert W["w2_exp"].data_ptr() == W["w2_scale"][n:].data_ptr()
     assert W["w1_exp"].shape == W["w1"].shape[:2] and W["w2_exp"].shape == W["w2"].shape[:2]
+
+
+def test_decode_fd2():
+    """decode_fd2 of the prepared weights == the mxfp4 values, except the groups >= 12
+    exponents below their channel's max: 0 (the fd2 form drops them, as the kernels)."""
+    E, H, I = 2, 512, 256
+    _, raw = R.make_weights(E, H, I, seed=4)
+    for k in ("w1s", "w2s"):  # rows 0-7 of expert 1: groups 11 (kept), 12, 13 below the max
+        s = raw[k].view(torch.uint8)[1, :8]
+        top = s.max(dim=-1, keepdim=True).values
+        s[:, -1:] = top
+        s[:, :3] = top - torch.tensor([13, 12, 11], dtype=torch.uint8, device="cuda")
+    W = prepare_weights(*shuffle_mxfp4(raw["w1q"], raw["w1s"], raw["w2q"], raw["w2s"]))
+    for e in range(E):
+        for i, got in zip((1, 2), R.decode_fd2(W, e)):
+            q, s = raw[f"w{i}q"][e], raw[f"w{i}s"][e].view(torch.uint8)
+            want = R._mxfp4_to_f32(q, s).view(*s.shape, 32)
+            drop = s.int() <= s.int().amax(-1, keepdim=True) - 12
+            assert int(drop.sum()) == (16 if e else 0)
+            want[drop] = 0
+            assert torch.equal(got, want.view(got.shape)), (e, i)
+
+
+@pytest.mark.parametrize("case", list(SHAPES))
+def test_moe_ref_prepared(case):
+    """moe_ref on the prepared weights == ref_moe on the mxfp4 tensors, bit for bit (the
+    random weights have no dropped groups)."""
+    H, I, E, EGl, K, e0 = SHAPES[case]
+    W, raw = weights(case)
+    x, tw, ti = R.make_routing(77, H, EGl, K, seed=2)
+    assert torch.equal(R.moe_ref(x, W, tw, ti, expert_offset=e0, num_experts=EGl),
+                       R.ref_moe(x, tw, ti, raw, e0))
+    out = R.moe_ref(x, W, tw, ti, expert_offset=e0, act="situv2", situ=R.SITU)
+    assert torch.equal(out, R.ref_moe(x, tw, ti, raw, e0, "situv2", R.SITU))
+
+
+def test_moe_dyn_ref():
+    H, I, E, EGl, K, e0 = SHAPES["ep8"]
+    W, raw = weights("ep8")
+    m_valid = torch.tensor([37], dtype=torch.int32, device="cuda")
+    for fp8 in (False, True):
+        x, xs, tw, ti, x_ref = recv_buffer(512, 37, seed=3, fp8=fp8)
+        out = R.moe_dyn_ref(x, W, tw, ti, m_valid, x_scale=xs, expert_offset=e0,
+                            num_experts=EGl)
+        assert out.shape == (512, H) and not out[37:].any()
+        ref = R.ref_moe(x_ref[:37], tw[:37], ti[:37], raw, e0, quant_x=not fp8)
+        assert torch.equal(out[:37], ref)
 
 
 @pytest.mark.parametrize("case,name", [(c, n) for c in SHAPES for n in CONFIGS[c]])
