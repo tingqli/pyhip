@@ -31,6 +31,7 @@ from a8w4 import (  # noqa: E402
     dyn_config,
     lookup_config,
     prepare_weights,
+    run_config,
     shuffle_mxfp4,
     supported,
 )
@@ -164,16 +165,18 @@ def test_cuda_graph(case, tokens):
     W, x, tw, ti, ref = data(case, tokens, seed=5)
     cfg = lookup_config((H, I, E, EGl, K), tokens, capturing=True)
     assert cfg["kind"] != "tp1kq"
-    fn = lambda: a8w4_moe(x, W, tw, ti, expert_offset=e0, num_experts=EGl)  # noqa: E731
-    eager = fn()  # warm-up: compiles, allocates the kernels' workspaces
+    # eager, the config the capture picks (a8w4_moe may pick another: tp8 4096 = tp1kq);
+    # warm-up: compiles it, allocates the kernels' workspaces
+    eager = run_config(cfg, x, W, tw, ti, expert_offset=e0, num_experts=EGl)
     torch.cuda.synchronize()
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
-        out = fn()
+        out = a8w4_moe(x, W, tw, ti, expert_offset=e0, num_experts=EGl)
     for _ in range(3):  # replays reuse the workspaces / counters
         g.replay()
         torch.cuda.synchronize()
         assert R.cos_diff(ref, out.float()) < COS_TOL
+    # the TP kernels' atomic adds: two eager runs differ by ~5e-6
     assert R.cos_diff(eager.float(), out.float()) < 1e-5
 
 
