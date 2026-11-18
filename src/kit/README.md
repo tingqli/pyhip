@@ -39,7 +39,7 @@ kit 不规定 solver 用什么写（FlyDSL、Triton、HIP、torch 都行），�
 | **problem** | 一个具体问题 | 一组 dim 值（dict） |
 | **dim** | problem 的一个维度（形状、dtype、路由方式……） | `<op>_problem` 的参数（`seed` 除外）；`@dim` 给某些 dim 命名取值 |
 | **key** | 查表时精确匹配的 dim | 表头里是 dim 名的列（由 `Tuning(keys=)` 写出） |
-| **bucket** | 查表时非精确匹配的那一个 dim（取 ≥ 调用值的第一个调优点） | 表头里的 `~<dim>` 列（由 `Tuning(bucket=)` 写出） |
+| **bucket** | 查表时非精确匹配的那一个 dim（取 ≥ 调用值的第一个调优点） | 表头里的 `~<dim>` 列（由 `Tuning(...).set_bucket(dim)` 写出） |
 | **inputs** | 一个 problem 的接口参数 | `<op>_problem` 的返回值、`<op>_ref` 的参数 |
 | **solver** | 一种解法：一个实现函数，名字是函数名里 `<op>_` 之后的部分 | `<op>_<solver>`（`axpy_tiled` 是 solver `tiled`） |
 | **knob** | solver 的调节旋钮 | solver 的仅限关键字参数；`@knob` 给出取值 |
@@ -176,10 +176,12 @@ from axpy_ops import ops
 
 from pyhip.kit.tune import Tuning
 
-# how axpy is tuned: one problem per dtype, n tuned at three points (matched inexactly
-# by the dispatch), x and y rotated through copies while timing
-TUNING = Tuning(ops.axpy, problems=ops.axpy.problems("dtype"), bucket="n",
-                points=(1000, 4096, 1 << 20), rotate=("x", "y"))
+# how axpy is tuned: n is the bucket (matched inexactly by the dispatch), tuned at three
+# points; dtype is not given: every value of axpy_problem's @dim (problems axpy-bf16 and
+# axpy-fp32); x and y rotated through copies while timing
+TUNING = (Tuning(ops.axpy, rotate=("x", "y"))
+          .set_bucket("n")
+          .add_problem("axpy", n=(1000, 4096, 1 << 20)))
 ```
 
 ### 3.3 测试：`test_axpy.py`
@@ -213,13 +215,14 @@ test_axpy = op_tests(ops.axpy, ops.axpy.problems(dim("n", (1000, 65536), id="n{}
 4
 ```
 
-命令行在命令名之后是 `<模块>:<Tuning 名>`：
+命令行在命令名之后是 `<模块>:<Tuning 名>`，再往后是 problem id 或组名（组名代表组里的每个 problem）：
 
 ```
 $ python -m pyhip.kit problems axpy_tune:TUNING
-bf16 {'dtype': 'bf16'}
-fp32 {'dtype': 'fp32'}
-$ python -m pyhip.kit configs axpy_tune:TUNING bf16
+axpy
+  axpy-bf16 {'dtype': 'bf16'} n: 3 points 1000..1048576
+  axpy-fp32 {'dtype': 'fp32'} n: 3 points 1000..1048576
+$ python -m pyhip.kit configs axpy_tune:TUNING axpy-bf16
 torch
 tiled b1024
 tiled b16384
@@ -228,13 +231,13 @@ tiled b16384
 ### 3.5 调优
 
 ```
-$ python -m pyhip.kit tune axpy_tune:TUNING bf16           # 默认：TUNING 的 points 和表
-[02:03:56] axpy bf16 {'dtype': 'bf16'}: 3 configs, 8 copies of ['x', 'y']
-[02:03:57] n   1000: torch 6.0 | tiled b1024 6.0 | tiled b16384 6.0
-[02:03:57] n   4096: torch 5.9 | tiled b16384 5.9 | tiled b1024 14.2
-[02:03:57] n 1048576: torch 6.2 | tiled b16384 130.1  (1 n/a: AssertionError)
-$ python -m pyhip.kit tune axpy_tune:TUNING fp32 -t 4096 --out part.csv   # 写到另一个文件
-$ python -m pyhip.kit merge axpy_tune:TUNING part.csv                     # 合并进 TUNING 的表
+$ python -m pyhip.kit tune axpy_tune:TUNING axpy-bf16      # 默认：这个 problem 的点，TUNING 的表
+[06:48:19] axpy axpy-bf16 {'dtype': 'bf16'}: 3 configs, 8 copies of ['x', 'y']
+[06:48:20] n   1000: tiled b1024 6.0 | tiled b16384 6.0 | torch 6.1
+[06:48:20] n   4096: torch 5.9 | tiled b16384 5.9 | tiled b1024 14.4
+[06:48:20] n 1048576: torch 6.4 | tiled b16384 130.0  (1 n/a: AssertionError)
+$ python -m pyhip.kit tune axpy_tune:TUNING axpy-fp32 -t 4096 --out part.csv   # 写到另一个文件
+$ python -m pyhip.kit merge axpy_tune:TUNING part.csv                          # 合并进 TUNING 的表
 merged 3 rows from 1 files into /tmp/kitdemo/axpy_tuned.csv
 ```
 
@@ -242,14 +245,14 @@ merged 3 rows from 1 files into /tmp/kitdemo/axpy_tuned.csv
 
 ```
 dtype,~n,config,us,err
-bf16,1000,torch,6.0,2.2e-03
 bf16,1000,tiled b1024,6.0,2.2e-03
 bf16,1000,tiled b16384,6.0,2.2e-03
+bf16,1000,torch,6.1,2.2e-03
 bf16,4096,torch,5.9,2.0e-03
 bf16,4096,tiled b16384,5.9,2.0e-03
-bf16,4096,tiled b1024,14.2,2.0e-03
-bf16,1048576,torch,6.2,3.0e-03
-bf16,1048576,tiled b16384,130.1,3.0e-03
+bf16,4096,tiled b1024,14.4,2.0e-03
+bf16,1048576,torch,6.4,3.0e-03
+bf16,1048576,tiled b16384,130.0,3.0e-03
 fp32,4096,torch,6.0,0.0e+00
 fp32,4096,tiled b16384,6.0,0.0e+00
 fp32,4096,tiled b1024,12.4,0.0e+00
@@ -258,31 +261,33 @@ fp32,4096,tiled b1024,12.4,0.0e+00
 查看和验证：
 
 ```
-$ python -m pyhip.kit show axpy_tune:TUNING bf16           # 每个调优点：最快的配置、每个 solver 最快的配置
+$ python -m pyhip.kit show axpy_tune:TUNING axpy-bf16      # 每个调优点：最快的配置、每个 solver 最快的配置
 | n | best | us | best torch | us | best tiled | us | capture pick |
 |---:|---|---:|---|---:|---|---:|---|
-| 1000 | torch | 6.0 | torch | 6.0 | tiled b1024 | 6.0 |  |
+| 1000 | tiled b1024 | 6.0 | torch | 6.1 | tiled b1024 | 6.0 |  |
 | 4096 | torch | 5.9 | torch | 5.9 | tiled b16384 | 5.9 |  |
-| 1048576 | torch | 6.2 | torch | 6.2 | tiled b16384 | 130.1 |  |
-$ python -m pyhip.kit verify axpy_tune:TUNING bf16 -t 10 3000 2000000   # 经 op(...) 分派，也测调优点之间的值
-[02:04:05] n     10 -> point   1000: torch       5.9 us (table      6.0) | err 3.1e-03
-[02:04:05] n   3000 -> point   4096: torch       6.1 us (table      5.9) | err 3.4e-03
-[02:04:05] n 2000000 -> point 1048576: torch     7.0 us (table      6.2) | err 2.6e-03
+| 1048576 | torch | 6.4 | torch | 6.4 | tiled b16384 | 130.0 |  |
+$ python -m pyhip.kit verify axpy_tune:TUNING axpy-bf16 -t 10 3000 2000000   # 经 op(...) 分派，也测调优点之间的值
+[06:48:49] n     10 -> point   1000: tiled b1024       5.9 us (table      6.0) | err 3.1e-03
+[06:48:49] n   3000 -> point   4096: torch             6.1 us (table      5.9) | err 3.4e-03
+[06:48:49] n 2000000 -> point 1048576: torch           7.1 us (table      6.4) | err 2.6e-03
 ```
+
+`show`、`verify`、`configs`、`tune` 也可以给组名（例如 `show axpy_tune:TUNING axpy`），依次处理组里的每个 problem。
 
 多张卡一起调所有 problem，再和旧表比较：
 
 ```
 $ python -m pyhip.kit tune-all axpy_tune:TUNING --gpus 0-1 --per-job 1 --out /tmp/kitdemo/all
-[02:04:41] bf16: GPUs [0], 3 points
-[02:04:41] fp32: GPUs [1], 3 points
-[02:04:47] all jobs done in 0.1 min
+[06:48:57] axpy-bf16: GPUs [0], 3 points
+[06:48:57] axpy-fp32: GPUs [1], 3 points
+[06:49:03] all jobs done in 0.1 min
 no BAD configs
 merged 16 rows from 2 files into /tmp/kitdemo/all/axpy_tuned.new.csv
 next: python -m pyhip.kit compare /tmp/kitdemo/axpy_tuned.csv /tmp/kitdemo/all/axpy_tuned.new.csv
       cp /tmp/kitdemo/all/axpy_tuned.new.csv /tmp/kitdemo/axpy_tuned.csv
 $ python -m pyhip.kit compare axpy_tuned.csv /tmp/kitdemo/all/axpy_tuned.new.csv
-dtype=bf16 ~n=1000  old torch   6.0  new torch   6.0  old-cfg-now   6.0 +0.0%
+dtype=bf16 ~n=1000  old tiled b1024    6.0  new tiled b1024    6.0  old-cfg-now    6.0  +0.0%
 ...
 ```
 
@@ -308,9 +313,9 @@ ops.axpy(x, y, table=None)
 ```
 $ python -m pytest -q test_axpy.py --co
 test_axpy.py::test_axpy[axpy-n1000-bf16-dims]
-test_axpy.py::test_axpy[axpy-n1000-bf16-torch]
 test_axpy.py::test_axpy[axpy-n1000-bf16-tiled b1024]
 test_axpy.py::test_axpy[axpy-n1000-bf16-tiled b16384]
+test_axpy.py::test_axpy[axpy-n1000-bf16-torch]
 ...
 test_axpy.py::test_axpy[axpy-n65536-bf16-torch]
 test_axpy.py::test_axpy[axpy-n65536-bf16-tiled b16384]   # 用 1048576 点的行：tiled b1024 没进表，不测
@@ -323,27 +328,29 @@ $ python -m pytest -q test_axpy.py -k "bf16 and tiled"
 ### 3.8 A/B 计时和正确性检查
 
 ```
-$ python -m pyhip.kit ab axpy_tune:TUNING bf16 -t 4096 1000000 -v @table "tiled b16384" --rounds 3 --out exp
+$ python -m pyhip.kit ab axpy_tune:TUNING axpy-bf16 -t 4096 1000000 -v @table "tiled b16384" --rounds 3 --out exp
+axpy problem axpy-bf16: {'dtype': 'bf16'}
+
 every call cold: L2 flush, the next of 8 copies of ['x', 'y']; 3 rounds x 16 calls; ...
 ...
 #### 1000000 n (seed 1000007)
 
 | variant | config | us | delta % | rounds min-max | verdict | err ref | err base |
 |---|---|---:|---:|---:|---|---:|---:|
-| @table | `torch` | 6.1 | +0.0 | 6.1-6.1 | base | 2.9e-03 | 0 |
-| @table#2 | `torch` | 6.1 | +0.0 | 6.1-6.2 | noise floor | 2.9e-03 | 0 |
-| tiled b16384 | `tiled b16384` | 127.7 | +1981.7 | 127.3-128.5 | slower | 2.9e-03 | 0 |
-| *noise band +-0.3%* |  |  |  |  |  |  |  |
+| @table | `torch` | 6.2 | +0.0 | 6.1-6.2 | base | 2.9e-03 | 0 |
+| @table#2 | `torch` | 6.2 | +0.3 | 6.2-6.2 | noise floor | 2.9e-03 | 0 |
+| tiled b16384 | `tiled b16384` | 126.7 | +1952.3 | 126.3-127.5 | slower | 2.9e-03 | 0 |
+| *noise band +-0.6%* |  |  |  |  |  |  |  |
 
 #### summary: base in us, the others delta vs the base; ~ = within the noise band
 
 | variant | config | 4096 | 1000000 |
 |---|---|---:|---:|
-| @table | `torch` | 5.9 us | 6.1 us |
-| @table#2 | `torch` | +0.0%~ | +0.0%~ |
-| tiled b16384 | `tiled b16384` | +0.0%~ | +1981.7% |
+| @table | `torch` | 6.0 us | 6.2 us |
+| @table#2 | `torch` | -0.7%~ | +0.3%~ |
+| tiled b16384 | `tiled b16384` | -0.7%~ | +1952.3% |
 
-$ python -m pyhip.kit check axpy_tune:TUNING fp32 -t 1000 1000000 -v @table "tiled b1024" "mine=py:mine.py:axpy" --graph --diff-tol 1e-6
+$ python -m pyhip.kit check axpy_tune:TUNING axpy-fp32 -t 1000 1000000 -v @table "tiled b1024" "mine=py:mine.py:axpy" --graph --diff-tol 1e-6
 | n | variant | config | err ref | err base | repeat | bitwise | graph | result |
 |---:|---|---|---:|---:|---:|---|---|---|
 | 1000 | @table | `torch` | 0 | 0 | 0 | - | 0 | OK |
@@ -396,7 +403,7 @@ kit 不提供“这个配置能不能跑”的声明。solver 遇到跑不了的
 
 标记只把自己记在 `f.kit_marks` 里并原样返回 `f`；`@op_register` 必须写在最外层（它注册时检查下面的标记，写在它上面的标记会报错）。
 
-**`@dim(names, values, id=None, name=None)`**（只用在 `<op>_problem` 上，或作为 `op.problems` 的临时轴）：给 dim 的取值命名。它只说明有哪些取值、叫什么，不决定测哪些、调哪些。
+**`@dim(names, values, id=None, name=None)`**（只用在 `<op>_problem` 上，或作为 `op.problems` 的临时轴）：给 dim 的取值命名。它只说明有哪些取值、叫什么；测哪些由 `op.problems(...)` 点名，调哪些由 `Tuning.add_problem` 决定（`add_problem` 没给的 dim 取它的全部取值）。
 
 ```python
 @dim("act", ("silu", "gelu"), id="{}")                       # 一列值；id 是只有一个 {} 的格式串（默认 name + "{}"）
@@ -523,51 +530,64 @@ problem 逐个运行，当前 problem 的输入和参考答案只算一次，换
 
 ### 8.1 Tuning
 
-调优的设置全部在一个 `Tuning` 对象里，通常放在使用者自己的小脚本里（a8w4：`tune.py` 的 `TUNING`）：
+调优的设置全部在一个 `Tuning` 对象里，通常放在使用者自己的小脚本里（a8w4：`tune.py` 的 `TUNING`）。构造时给 op 和全局设置，再用链式调用给出分桶维和要调的 problem：
 
 ```python
 from pyhip.kit.tune import Tuning
 
-TUNING = Tuning(op, *, problems, bucket, points, keys=None, rotate=(), table=<注册表的表>)
+TUNING = (Tuning(op, *, keys=None, rotate=(), table=<注册表的表>)
+          .set_bucket(dim)
+          .add_problem(name, **dims)
+          .add_problem(...))                    # 每组调一次
 ```
 
-| 参数 | 含义 |
+| 设置 | 含义 |
 |---|---|
-| `problems` | 要调的 problem：`op.problems(...)`，不含分桶维（它的值按点设置）。id 就是命令行里的 problem 名（例如 `tp8-silu`） |
-| `bucket` | 分桶的 dim：在 `points` 上调优，分派时非精确匹配。写进表头为 `~<dim>` |
-| `points` | 分桶维上的调优点（`tune` / `tune-all` 的默认 `-t`）。最快配置容易变化的地方（通常是小值）要密，最大的点要覆盖实际会遇到的最大调用 |
 | `keys` | 表里存、分派时精确匹配的 dim（默认：除分桶维以外的全部 dim）。没列进来的 dim 必须确实不影响哪个配置最快（例如 a8w4 的 `expert_offset` 只是给 expert 改了编号） |
 | `rotate` | 计时时轮换副本的接口参数（通常是权重）：每次调用读一份最近没读过的副本，见第 10 节 |
 | `table` | `tune` / `merge` 写、`show` / `verify` 读的表（默认注册表的表，也就是分派读的那张） |
+| `set_bucket(dim)` | 分桶的 dim：在各组给的点上调优，分派时非精确匹配，写进表头为 `~<dim>`。要在 `add_problem` 之前调用 |
+| `add_problem(name, **dims)` | 加一组 problem，`name` 是这组的名字；可以调用多次 |
 
-属性：`op`、`problems`（`{id: problem}`）、`bucket`、`column`（`~<dim>`）、`points`、`keys`、`rotate`、`table`；方法 `fields(metrics)`（表头）、`problem(id, sets)`（取一个 problem 并应用 `--set`）。
+`add_problem` 怎么展开成 problem：
+
+- **给了的 dim**：list、tuple、range 是多个取值，其他是一个取值（取值本身是 tuple 时要再包一层：`d=[(1, 2)]`）。
+- **没给的 dim**：在 `<op>_problem` 的某个 `@dim` 上时，取这个 `@dim` 的全部取值（多个 dim 一起的 `@dim` 要么全给，要么都不给）；否则取 `<op>_problem` 的默认值；都没有时报错。
+- **分桶维**：它的取值是这组 problem 的调优点（`tune` / `tune-all` 的默认 `-t`）；没给时取它的 `@dim` 取值。最快配置容易变化的地方（通常是小值）要密，最大的点要覆盖实际会遇到的最大调用。
+- 其余各 dim 的取值做笛卡尔积，每个组合是一个 problem。problem 的 id 是 `name`，再用 `-` 接上每个有多个取值的 dim 的 id（它的 `@dim` id，否则 `<dim><值>`），按 dim 的顺序。只有一个 problem 的组，id 就是 `name`。
+
+例如 a8w4 的 `add_problem("mimo-flash2.6-tp8", num_tokens=TOKENS, model_dim=4096, inter_dim=256, experts=256, experts_global=256, topk=8, expert_offset=0, routing="uniform")`：`act` 没给，取 `moe_problem` 上 `@dim("act", ("silu", "situv2"))` 的全部取值，得到 `mimo-flash2.6-tp8-silu` 和 `mimo-flash2.6-tp8-situv2` 两个 problem，各在 `TOKENS` 的每个点上调。
+
+命令行里的 problem 参数可以是 problem id，也可以是组名（组里的每个 problem）。
+
+属性：`op`、`bucket`、`column`（`~<dim>`）、`keys`、`rotate`、`table`、`problems`（`{id: problem}`，分桶维为 None）、`points`（`{id: 调优点}`）、`groups`（`{组名: [id, ...]}`）；方法 `fields(metrics)`（表头）、`select(names)`（problem id 或组名 → problem id）、`problem(id, sets)`（取一个 problem 并应用 `--set`）。
 
 ### 8.2 一次调优的 dim 值从哪来
 
 三个来源，后面的覆盖前面的：
 
-1. **Tuning 的 problem**：`problems` 里的一个；没给的 dim 取 `<op>_problem` 的默认值。`problems` 命令列出全部 problem 和它们的值。
+1. **Tuning 的 problem**：`add_problem` 展开出的一个。`problems` 命令列出全部组、problem 和它们的值。
 2. **`--set name=value ...`**：覆盖 problem 里任意一个 dim。名字必须是 dim；knob 不能 set（knob 的取值由 `@knob` 枚举），`seed` 也不能（它不是 dim，调优器把它设为 101 × 点 + 轮次）。值按 `<op>_problem` 默认值的类型转换；没有默认值时依次尝试 int、float，否则当作 str。
-3. **分桶维**：取 `-t` 的每个值，不写 `-t` 时用 `Tuning(points=)`；即使对分桶维用了 `--set` 也会被覆盖。
+3. **分桶维**：取 `-t` 的每个值，不写 `-t` 时用这个 problem 的调优点；即使对分桶维用了 `--set` 也会被覆盖。
 
 ```
-$ python -m pyhip.kit tune axpy_tune:TUNING bf16 --set dtype=fp32 -t 2048 --out set.csv
-[02:05:24] axpy bf16 {'dtype': 'fp32'}: 3 configs, 8 copies of ['x', 'y']
-[02:05:25] n   2048: torch 6.5 | tiled b16384 6.5 | tiled b1024 8.7
+$ python -m pyhip.kit tune axpy_tune:TUNING axpy-bf16 --set dtype=fp32 -t 2048 --out set.csv
+[06:48:51] axpy axpy-bf16 {'dtype': 'fp32'}: 3 configs, 8 copies of ['x', 'y']
+[06:48:52] n   2048: torch 6.0 | tiled b16384 6.0 | tiled b1024 8.2
 $ head -2 set.csv
 dtype,~n,config,us,err
-fp32,2048,torch,6.5,0.0e+00
-$ python -m pyhip.kit tune axpy_tune:TUNING bf16 --set block=4
+fp32,2048,torch,6.0,0.0e+00
+$ python -m pyhip.kit tune axpy_tune:TUNING axpy-bf16 --set block=4
 --set 'block=4': expected name=value, name in ['n', 'dtype']
 ```
 
-`configs`、`show`、`verify`、`tune-all`（作用于每个 problem）和 `ab`、`check` 也接受同样的 `--set`。a8w4 的写法相同，例如 `python -m a8w4.tune tune tp8-silu --set routing=hot -t 1 2 4 --out /tmp/p.csv`。
+`configs`、`show`、`verify`、`tune-all`（作用于每个 problem）和 `ab`、`check` 也接受同样的 `--set`。a8w4 的写法相同，例如 `python -m a8w4.tune tune mimo-flash2.6-tp8-silu --set routing=hot -t 1 2 4 --out /tmp/p.csv`。
 
 注意：
 
 - **只有 key 列进表**：`--set` 一个不在 `keys` 里的 dim（例如 a8w4 的 `expert_offset`）只改变输入，不改变表里的 key。
 - **调出来的行要能被分派选中**：调用时的 key 来自 `<op>_dims` 的返回值和调用时传的提示；`<op>_dims` 不返回的 dim 按 `<op>_problem` 的默认值匹配。所以用 `--set routing=hot` 调出来的行，只有 `ops.moe(..., routing="hot")` 这样的调用才会选中。
-- **长期使用的值放进 Tuning**：`--set` 适合临时、一次性的调优。一个 shape 要长期保留时，把它加进 `<op>_problem` 的 `@dim` 取值并在 `Tuning(problems=)` 里引用：它会成为新的 problem，`tune-all` 会自动调它；测试文件里引用它，生成的测试也会覆盖它。
+- **长期使用的值放进 Tuning**：`--set` 适合临时、一次性的调优。一个 shape 要长期保留时，用 `add_problem` 把它加进 `Tuning`：它会成为新的一组 problem，`tune-all` 会自动调它；测试从 `Tuning` 取 problem 时（a8w4 的 `test_moe`），生成的测试也会覆盖它。
 
 ### 8.3 命令
 
@@ -575,9 +595,11 @@ $ python -m pyhip.kit tune axpy_tune:TUNING bf16 --set block=4
 python -m pyhip.kit <命令> <模块>:<Tuning 名> [参数...] [选项]
 ```
 
+P 是 problem id 或组名（可以给多个，组名代表组里的每个 problem）。
+
 | 命令 | 用法 | 作用 |
 |---|---|---|
-| `problems` | `problems M:T` | 列出调优的 problem |
+| `problems` | `problems M:T` | 列出各组和它们的 problem、调优点 |
 | `configs` | `configs M:T P [-t V]` | 列出全部配置（knob 的取值函数用第一个点或 `-t` 的值） |
 | `tune` | `tune M:T P [-t V ...] [--out T.csv]` | 在每个点上调优，合并进 `--out`（默认 `--table`，再默认 Tuning 的表） |
 | `merge` | `merge M:T A.csv B.csv ...` | 把若干张表合并进 `--table`（默认 Tuning 的表） |
@@ -605,7 +627,7 @@ python -m pyhip.kit <命令> <模块>:<Tuning 名> [参数...] [选项]
 **`tune-all`**：
 
 - 先检查 GPU 是否空闲（3 次 rocm-smi 采样，GFX 使用率 > 10% 就退出；`--force` 跳过），再拿每张卡的 `/tmp/gpu-<i>.lock`。
-- 每 `--per-job` 张卡一组，每组调一个 problem：组内第 g 张卡负责 `points[g::per_job]`。组空出来后接着做下一个 problem。
+- 每 `--per-job` 张卡一组，每组调一个 problem：组内第 g 张卡负责这个 problem 的调优点（或 `-t`）的 `[g::per_job]`。组空出来后接着做下一个 problem。
 - 每个子进程是一条 `python -m pyhip.kit tune ...`，输出 `DIR/<problem>_<g>.csv` 和 `.log`。
 - 全部完成后汇总所有日志里的 BAD 行，合并出 `DIR/<表名>.new.csv`，并打印下一步的 `compare` 和 `cp` 命令。
 
@@ -614,7 +636,7 @@ python -m pyhip.kit <命令> <模块>:<Tuning 名> [参数...] [选项]
 ```python
 from pyhip.kit import tune as kt
 
-prob = TUNING.problem("bf16", ["dtype=fp32"])     # {'n': None, 'dtype': 'fp32'}
+prob = TUNING.problem("axpy-bf16", ["dtype=fp32"])  # {'n': None, 'dtype': 'fp32'}
 kt.tune(TUNING, prob, [2048], "out.csv")
 ```
 
@@ -675,7 +697,7 @@ python -m pyhip.kit ab    M:T P -t V [V ...] -v SPEC [SPEC ...] [选项]
 python -m pyhip.kit check M:T P -t V [V ...] -v SPEC [SPEC ...] [选项]
 ```
 
-problem、`--set` 和输入都和 `kit.tune` 相同（同一个 `Tuning`）：每个 `-t` 值作为分桶值，输入由 `<op>_problem` 生成（seed = `--seed` + 值，ab 的第 s 个样本再加 1000 × s），每次计时的调用读 `rotate` 输入的下一份副本（第 10 节；这些输入随值或样本换了对象时重新复制）。参考答案来自 `<op>_ref`，比较用 `<op>_check`（它返回的第一个指标就是报告里的列，例如 `err`、`cos`）。
+problem、`--set` 和输入都和 `kit.tune` 相同（同一个 `Tuning`；给组名时依次处理组里的每个 problem）：每个 `-t` 值作为分桶值，输入由 `<op>_problem` 生成（seed = `--seed` + 值，ab 的第 s 个样本再加 1000 × s），每次计时的调用读 `rotate` 输入的下一份副本（第 10 节；这些输入随值或样本换了对象时重新复制）。参考答案来自 `<op>_ref`，比较用 `<op>_check`（它返回的第一个指标就是报告里的列，例如 `err`、`cos`）。
 
 **变体写法**：
 
@@ -734,10 +756,10 @@ rec = kb.Recorder(out_dir, name, kb.run_meta(tool, args, prog="python -m mypkg.b
 | 东西 | 文件 |
 |---|---|
 | 注册表（去哪里查表） | [`_ops.py`](../contrib/flydsl/a8w4/_ops.py)：`Registry("a8w4", table=DEFAULT_CSV)` |
-| 问题 | [`ref.py`](../contrib/flydsl/a8w4/ref.py)：`moe_ref`、`moe_problem`（`@dim` shape / act / routing）、`moe_check`（cos 误差）、`moe_dims`，以及 `moe_dyn_*`（`@dim` shape / fp8 / act / routing） |
+| 问题 | [`ref.py`](../contrib/flydsl/a8w4/ref.py)：`moe_ref`、`moe_problem`（`@dim` act / routing；shape 不用 `@dim`，在 `TUNING` 里逐组给出）、`moe_check`（cos 误差）、`moe_dims`，以及 `moe_dyn_*`（`@dim` shape / fp8 / act / routing） |
 | solver | [`moe.py`](../contrib/flydsl/a8w4/moe.py)：`moe_tp2k`、`moe_tp1k`、`moe_tp1kq`（`@no_capture`）、`moe_ep3k`（共用的 `stack`，`**over` 覆盖项）、`moe_ep1k`；`@knob`、`@meta(tile_m=..., cached_loads=...)` |
-| 调优 | [`tune.py`](../contrib/flydsl/a8w4/tune.py)：`TOKENS` 和 `TUNING`（problem 是 shape × act，bucket `num_tokens`，key 不含 `expert_offset`，轮换 `W`）；`python -m a8w4.tune <cmd>` 等同于 `python -m pyhip.kit <cmd> a8w4.tune:TUNING`，另加 a8w4 自己的报告 |
-| 测试 | [`tests/test_a8w4_ops.py`](../contrib/flydsl/a8w4/tests/test_a8w4_ops.py)：`op_tests(MOE, MOE.problems("shape", dim("num_tokens", (1, 77, 600), id="t{}"), "act"))`，以及 `moe_dyn` 的接收缓冲区预设 |
+| 调优 | [`tune.py`](../contrib/flydsl/a8w4/tune.py)：`TOKENS` 和 `TUNING`（`set_bucket("num_tokens")`；每个 MiMo-V2.6-Flash shape 一组 `add_problem("mimo-flash2.6-tp8", num_tokens=TOKENS, ...)`，act 没给，取全部取值；key 不含 `expert_offset`，轮换 `W`）；`python -m a8w4.tune <cmd>` 等同于 `python -m pyhip.kit <cmd> a8w4.tune:TUNING`，另加 a8w4 自己的报告 |
+| 测试 | [`tests/test_a8w4_ops.py`](../contrib/flydsl/a8w4/tests/test_a8w4_ops.py)：`TUNING` 的每个 problem 在 1、77、600 tokens 上的 `op_tests(MOE, ...)`，以及 `moe_dyn` 的接收缓冲区预设 |
 | 实验工具 | [`bench/core.py`](../contrib/flydsl/a8w4/bench/core.py)：用 `kit.bench` 的钩子在 `TUNING` 上包装出 `python -m a8w4.bench ab / check` |
 
 调优表 `configs/a8w4_moe_tuned.csv` 的表头是 `model_dim,inter_dim,experts,experts_global,topk,routing,act,~num_tokens,config,us,cos`。
@@ -766,5 +788,10 @@ kit 自身的测试：[`tests/kit/test_kit.py`](../../tests/kit/test_kit.py)（�
 | `unknown argument(s) [...]` | `op(...)` 的关键字参数既不是接口参数也不是 dim |
 | `a tuned table has at most one bucket column` | 表头里有多个 `~` 列 |
 | `not a pyhip.kit.tune.Tuning` | 命令名之后的参数要指向一个 `Tuning` 对象（`模块:名字`） |
+| `no tune problem or group 'x'` | 命令行的 problem 参数既不是 problem id 也不是组名；`problems` 命令列出全部 |
+| `add_problem(...): call set_bucket first` / `set_bucket(...): call it before add_problem` | 先 `set_bucket`，再 `add_problem` |
+| `add_problem(...): give the points of the bucket` | 分桶维没有 `@dim`：在 `add_problem` 里给出它的调优点，例如 `num_tokens=TOKENS` |
+| `add_problem(...): give [...] (no ..._problem default, no @dim)` | 这些 dim 没有默认值也没有 `@dim`：在 `add_problem` 里给出 |
+| `add_problem(...): [...] already name a group or a problem` | 组名和 problem id 共用一个名字空间：换一个组名 |
 | `variants [...] may read the rotated inputs with cached loads ...` | `--copies` < 8 时计时会偏向走 cache 读的 solver：用 `--copies` ≥ 8（默认 8）；solver 确实不走 cache 读时给它加 `@meta(cached_loads=False)` |
 | `GPUs busy (GFX use %)` / `GPU g is locked by another job` | `tune-all` 发现卡被占用：等一下，或者换 `--gpus`；`--force` 只跳过前一个（空闲检查），不跳过锁 |

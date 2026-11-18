@@ -1,25 +1,26 @@
 """Tune an op into its tuned table, and inspect the table (torch; ``python -m pyhip.kit``).
 
-    python -m pyhip.kit problems   a8w4.tune:TUNING             # the tune problems: tp8-silu ...
-    python -m pyhip.kit configs    a8w4.tune:TUNING tp8-silu    # every config of every solver
-    python -m pyhip.kit tune       a8w4.tune:TUNING tp8-silu -t 1 2 4 --out /tmp/p0.csv
-    python -m pyhip.kit merge      a8w4.tune:TUNING /tmp/p*.csv # into the tuning's table
-    python -m pyhip.kit show       a8w4.tune:TUNING tp8-silu    # per point: the fastest configs
-    python -m pyhip.kit verify     a8w4.tune:TUNING ep8-silu -t 1 100 3000
+    python -m pyhip.kit problems   a8w4.tune:TUNING                # groups and their problems
+    python -m pyhip.kit configs    a8w4.tune:TUNING mimo-flash2.6-tp8-silu   # every config
+    python -m pyhip.kit tune       a8w4.tune:TUNING mimo-flash2.6-tp8 -t 1 2 4 --out /tmp/p0.csv
+    python -m pyhip.kit merge      a8w4.tune:TUNING /tmp/p*.csv    # into the tuning's table
+    python -m pyhip.kit show       a8w4.tune:TUNING mimo-flash2.6-tp8   # per point: the fastest
+    python -m pyhip.kit verify     a8w4.tune:TUNING mimo-flash2.6-ep8-silu -t 1 100 3000
     python -m pyhip.kit tune-all   a8w4.tune:TUNING [PROBLEM ...] --gpus 0-7 --per-job 4 --out /tmp/t
     python -m pyhip.kit compare    OLD.csv NEW.csv
 
 ``<module>:<name>``: an importable module and the name of the ``Tuning`` in it that
 declares how to tune the op (see ``Tuning``): the problems, the bucket dim and its
 points, the key dims the table stores, the inputs the timed calls rotate, the table.
+A PROBLEM argument is a problem id or a group name (``add_problem``: all its problems).
 
 ``--set name=value`` overrides dim values of a problem (another shape, a routing).
-``tune``: per point, ``--rounds`` rounds, each with fresh inputs (``<op>_problem``, seed
-101 * point + round); per round every config runs once (one that raises cannot run
-the problem: n/a), is checked against ``<op>_ref`` (``<op>_check``: a failure is BAD)
-and timed cold (``kit.timing.time_cold``, the ``rotate`` inputs cycling through
-``--copies`` copies), the configs interleaved. Every config that ran and passed is
-stored: the median time, the worst metric of the check.
+``tune``: per point (default: the problem's), ``--rounds`` rounds, each with fresh
+inputs (``<op>_problem``, seed 101 * point + round); per round every config runs once
+(one that raises cannot run the problem: n/a), is checked against ``<op>_ref``
+(``<op>_check``: a failure is BAD) and timed cold (``kit.timing.time_cold``, the
+``rotate`` inputs cycling through ``--copies`` copies), the configs interleaved. Every
+config that ran and passed is stored: the median time, the worst metric of the check.
 """
 
 import argparse
@@ -46,46 +47,160 @@ _DEFAULT = object()  # table=: the registry's
 
 
 class Tuning:
-    """How to tune ``op`` (all of it, in one place):
+    """How to tune ``op`` (all of it, in one place), declared by chaining:
 
-    * ``problems``: [(id, problem)] (``op.problems(...)``); the bucket is set per point;
-    * ``bucket``: the dim tuned at ``points``, matched inexactly by the dispatch (the
+        TUNING = (Tuning(op, keys=..., rotate=("W",))
+                  .set_bucket("num_tokens")
+                  .add_problem("mimo-tp8", num_tokens=TOKENS, model_dim=4096, inter_dim=256))
+
+    * ``set_bucket(dim)``: the dim tuned at points, matched inexactly by the dispatch (the
       first tuned point >= the call's value; the other key dims match exactly);
+    * ``add_problem(name, **dims)``: a group of problems named ``name``, see there; call
+      it once per group;
     * ``keys``: the dims the table stores (default: every dim but the bucket); a dim
       left out must not change which config is fastest (e.g. an expert offset);
     * ``rotate``: interface arguments the timed calls cycle through copies of (e.g.
       the weights: ``kit.timing.copies``);
     * ``table``: the table ``tune`` / ``merge`` write and ``show`` / ``verify`` read
       (default: the registry's, which the dispatch reads).
+
+    ``problems`` {id: problem (the bucket None)}, ``points`` {id: the bucket's values},
+    ``groups`` {name: [id, ...]}.
     """
 
-    def __init__(self, op, *, problems, bucket, points, keys=None, rotate=(), table=_DEFAULT):
+    def __init__(self, op, *, keys=None, rotate=(), table=_DEFAULT):
         where = f"Tuning({op.name})"
-        if bucket not in op.dim_names:
-            raise TypeError(f"{where}: bucket {bucket!r} is not a dim {list(op.dim_names)}")
-        keys = tuple(n for n in op.dim_names if n != bucket) if keys is None else tuple(keys)
-        if _unknown(keys, op.dim_names) or bucket in keys or len(set(keys)) < len(keys):
-            raise TypeError(f"{where}: keys {list(keys)}: distinct dims, not the bucket")
+        if keys is not None:
+            keys = tuple(keys)
+            if _unknown(keys, op.dim_names) or len(set(keys)) < len(keys):
+                raise TypeError(f"{where}: keys {list(keys)}: distinct dims of "
+                                f"{op.name}_problem {list(op.dim_names)}")
         if isinstance(rotate, str) or _unknown(rotate, op._ref_names):
             raise TypeError(f"{where}: rotate {rotate!r}: names of {op.name}_ref's parameters")
-        self.op, self.bucket, self.points = op, bucket, tuple(points)
-        self.column = _table.BUCKET + bucket  # the bucket's column: ~<dim>
-        self.keys, self.rotate = keys, tuple(rotate)
+        self.op, self.bucket, self._keys, self.rotate = op, None, keys, tuple(rotate)
         self.table = op.registry.table if table is _DEFAULT else table
-        self.problems = {}
-        for pid, prob in problems:
-            if pid in self.problems:
-                raise TypeError(f"{where}: two problems {pid!r}")
-            self.problems[pid] = {**op._blank, **prob, bucket: None}
+        self.problems, self.points, self.groups = {}, {}, {}
 
     def __repr__(self):
-        return (f"Tuning({self.op.name}, problems={list(self.problems)}, bucket={self.bucket!r}, "
-                f"{len(self.points)} points)")
+        return (f"Tuning({self.op.name}, bucket={self.bucket!r}, groups={list(self.groups)}, "
+                f"{len(self.problems)} problems)")
+
+    @property
+    def keys(self):
+        if self._keys is not None:
+            return self._keys
+        return tuple(n for n in self.op.dim_names if n != self.bucket)
+
+    @property
+    def column(self):
+        """The bucket's column: ``~<dim>``."""
+        if self.bucket is None:
+            raise TypeError(f"{self!r}: no bucket; call set_bucket")
+        return _table.BUCKET + self.bucket
+
+    def set_bucket(self, dim):
+        """The dim tuned at points (each group's values of it); before ``add_problem``."""
+        op, where = self.op, f"Tuning({self.op.name}).set_bucket({dim!r})"
+        if dim not in op.dim_names:
+            raise TypeError(f"{where}: not a dim {list(op.dim_names)}")
+        if self.problems:
+            raise TypeError(f"{where}: call it before add_problem")
+        if self._keys is not None and dim in self._keys:
+            raise TypeError(f"{where}: keys {list(self._keys)} hold the bucket")
+        self.bucket = dim
+        return self
+
+    def add_problem(self, name, **dims):
+        """Add the group ``name``: the Cartesian product of the values of ``dims`` (a list,
+        tuple or range: several values; anything else: one) and of the ``@dim`` axes of
+        ``<op>_problem`` none of whose dims is given (all their values, e.g. every act). A
+        dim neither given nor on such an axis takes its ``<op>_problem`` default. The
+        bucket's values are the points of the group's problems (not given: its ``@dim``
+        values). A problem's id: ``name``, then "-" and the id of each value that varies
+        (its ``@dim`` id, else ``<dim><value>``), in the order of the dims."""
+        op, b = self.op, self.bucket
+        where = f"Tuning({op.name}).add_problem({name!r})"
+        if b is None:
+            raise TypeError(f"{where}: call set_bucket first")
+        if not re.fullmatch(r"[\w.+-]+", str(name)):
+            raise TypeError(f"{where}: a name of letters, digits and _ . + -")
+        bad = _unknown(dims, op.dim_names)
+        if bad:
+            raise TypeError(f"{where}: {bad} are not dims of {op.name}_problem "
+                            f"{list(op.dim_names)}")
+        vals = {k: tuple(v) if isinstance(v, (list, tuple, range)) else (v,)
+                for k, v in dims.items()}
+        empty = [k for k, v in vals.items() if not v]
+        if empty:
+            raise TypeError(f"{where}: no values for {empty}")
+        points = vals.pop(b, None)
+        if points is None:
+            ax = op._axes.get(b)
+            if ax is None or len(ax.names) > 1:
+                raise TypeError(f"{where}: give the points of the bucket: {b}=[...]")
+            points = tuple(d[b] for _, d in ax.points())
+        order = op.dim_names.index
+        axes, fixed = [], {}  # axes: (position of the first dim, [(id, {dim: value})])
+        for k, vs in vals.items():
+            if isinstance(dims[k], (list, tuple, range)):
+                axes.append((order(k), [(self._id(k, v), {k: v}) for v in vs]))
+            else:
+                fixed[k] = vs[0]
+        for ax in op._axes.values():
+            given = [n for n in ax.names if n in dims or n == b]
+            if len(given) == len(ax.names):
+                continue
+            if given:
+                raise TypeError(f"{where}: give all of the @dim {ax.name!r} dims "
+                                f"{list(ax.names)} or none of them (all its values)")
+            axes.append((min(map(order, ax.names)), ax.points()))
+        covered = {*dims, b, *(n for ax in op._axes.values() for n in ax.names)}
+        missing = [n for n in op.dim_names if n not in covered and n not in op._defaults]
+        if missing:
+            raise TypeError(f"{where}: give {missing} (no {op.name}_problem default, no @dim)")
+        axes.sort(key=lambda a: a[0])
+        combos = list(itertools.product(*(pts for _, pts in axes)))
+        new = {}
+        for combo in combos:
+            prob = {**op._blank, **op._defaults, **fixed}
+            for _, d in combo:
+                prob.update(d)
+            new["-".join([name, *(tok for tok, _ in combo)])] = {**prob, b: None}
+        if len(new) < len(combos):
+            raise TypeError(f"{where}: two problems print as the same id: {list(new)}")
+        clash = sorted(({*new, name} & {*self.problems, *self.groups}))
+        if clash:
+            raise TypeError(f"{where}: {clash} already name a group or a problem")
+        self.groups[name] = list(new)
+        self.problems.update(new)
+        self.points.update(dict.fromkeys(new, points))
+        return self
+
+    def _id(self, k, v):
+        """The id of value ``v`` of dim ``k`` in problem ids."""
+        ax = self.op._axes.get(k)
+        if ax is not None and ax.names == (k,):
+            try:
+                return ax.token({k: v})
+            except ValueError:  # a dict @dim without this value
+                pass
+        return f"{k}{v}"
 
     def fields(self, metrics):
         """The table header: key columns, the bucket column (``~<dim>``), config, us, the
         check's metrics."""
         return [*self.keys, self.column, "config", "us", *metrics]
+
+    def select(self, names):
+        """The problem ids of ``names`` (problem ids or group names), each once."""
+        out = []
+        for n in names:
+            ids = self.groups.get(n) or ([n] if n in self.problems else None)
+            if ids is None:
+                raise SystemExit(f"{self.op.name}: no tune problem or group {n!r}; groups: "
+                                 f"{list(self.groups)}; problems: {list(self.problems)}")
+            out += [i for i in ids if i not in out]
+        return out
 
     def problem(self, pid, sets=()):
         """Problem ``pid`` with ``sets`` ("name=value") applied."""
@@ -314,8 +429,9 @@ def lock_gpus(gpus):
 def tune_all(spec, t, pids, gpus, per_job, points, out_dir, *, rounds=3, iters=20,
              ncopies=NCOPIES, sets=(), force=False, log=print):
     """Every problem of ``pids`` on ``per_job`` GPUs (GPU g of the group takes
-    points[g::per_job]); groups of ``gpus`` take the next problem when they free up.
-    Then the BAD lines of all logs and a merged <out_dir>/<table name>.new.csv."""
+    points[g::per_job]; ``points`` None: each problem's own); groups of ``gpus`` take the
+    next problem when they free up. Then the BAD lines of all logs and a merged
+    <out_dir>/<table name>.new.csv."""
     if len(gpus) < per_job:
         raise SystemExit(f"--per-job {per_job} needs at least that many --gpus ({gpus})")
     for pid in pids:
@@ -341,9 +457,10 @@ def tune_all(spec, t, pids, gpus, per_job, points, out_dir, *, rounds=3, iters=2
             if gi in running or not todo:
                 continue
             pid = todo.pop(0)
+            pts = list(points or t.points[pid])
             procs = []
             for g, gpu in enumerate(grp):
-                shard = points[g::per_job]
+                shard = pts[g::per_job]
                 if not shard:
                     continue
                 stem = os.path.join(out_dir, f"{pid}_{g}")
@@ -357,7 +474,7 @@ def tune_all(spec, t, pids, gpus, per_job, points, out_dir, *, rounds=3, iters=2
                         cmd, stdout=fh, stderr=subprocess.STDOUT,
                         env=dict(env, HIP_VISIBLE_DEVICES=str(gpu)))))
             running[gi] = procs
-            log(f"{pid}: GPUs {grp}, {len(points)} points")
+            log(f"{pid}: GPUs {grp}, {len(pts)} points")
         time.sleep(2)
     log(f"all jobs done in {(time.time() - t0) / 60:.1f} min")
     logs = sorted(glob.glob(os.path.join(out_dir, "*_[0-9]*.log")))
@@ -386,11 +503,11 @@ def parser(prog="python -m pyhip.kit"):
     p.add_argument("cmd", choices=["problems", "configs", "tune", "merge", "show", "verify",
                                    "tune-all", "compare"])
     p.add_argument("spec", help="<module>:<Tuning name> (compare: the old table)")
-    p.add_argument("args", nargs="*", help="a problem (configs / tune / show / verify), "
-                                           "problems (tune-all; default all), tables (merge, "
+    p.add_argument("args", nargs="*", help="problems or groups (configs / tune / show / "
+                                           "verify; tune-all: default all), tables (merge, "
                                            "compare)")
     p.add_argument("-t", "--points", nargs="+", default=None,
-                   help="bucket values (default: the tuning's points; verify: a few)")
+                   help="bucket values (default: the problem's points; verify: a few)")
     p.add_argument("--set", nargs="+", default=[], metavar="NAME=VALUE",
                    help="override dim values of the problem")
     p.add_argument("--table", default=None, help="the table (default: the tuning's)")
@@ -418,28 +535,39 @@ def main(argv=None, prog="python -m pyhip.kit"):
     path = a.table or t.table
     pts = [_guess(v) for v in a.points] if a.points else None
     if a.cmd == "problems":
-        for pid, prob in t.problems.items():
-            print(pid, {k: v for k, v in prob.items() if v is not None})
+        for g, pids in t.groups.items():
+            print(g)
+            for pid in pids:
+                p = t.points[pid]
+                print(f"  {pid} {({k: v for k, v in t.problems[pid].items() if v is not None})}"
+                      f" {t.bucket}: {len(p)} points {p[0]}..{p[-1]}")
         return 0
     if a.cmd == "merge":
         return merge(a.args, path)
     if a.cmd == "tune-all":
-        return tune_all(a.spec, t, a.args or list(t.problems), gpu_list(a.gpus), a.per_job,
-                        pts or list(t.points), a.out or "/tmp/kit_tune",
+        return tune_all(a.spec, t, t.select(a.args) if a.args else list(t.problems),
+                        gpu_list(a.gpus), a.per_job, pts, a.out or "/tmp/kit_tune",
                         rounds=a.rounds, iters=a.iters, ncopies=a.copies, sets=a.set,
                         force=a.force, log=log)
-    if len(a.args) != 1:
-        raise SystemExit(f"{a.cmd}: one problem, one of {list(t.problems)}")
-    prob = t.problem(a.args[0], a.set)
-    if a.cmd == "configs":
-        for cfg in op.configs(dict(prob, **{t.bucket: (pts or t.points or [None])[0]})):
-            print(op.name_of(cfg))
-    elif a.cmd == "tune":
-        tune(t, prob, pts or list(t.points), a.out or path, rounds=a.rounds, iters=a.iters,
-             ncopies=a.copies, log=log, pid=a.args[0])
-    elif a.cmd == "show":
-        show(t, prob, path)
-    else:
-        verify(t, prob, pts or [1, 3, 20, 100, 300, 1000, 3000, 10000], path, iters=a.iters,
-               ncopies=a.copies, log=log)
+    if not a.args:
+        raise SystemExit(f"{a.cmd}: problems or groups; groups: {list(t.groups)}; problems: "
+                         f"{list(t.problems)}")
+    pids = t.select(a.args)
+    for pid in pids:
+        prob = t.problem(pid, a.set)
+        if a.cmd == "configs":
+            if len(pids) > 1:
+                print(f"# {pid}")
+            for cfg in op.configs(dict(prob, **{t.bucket: (pts or t.points[pid])[0]})):
+                print(op.name_of(cfg))
+        elif a.cmd == "tune":
+            tune(t, prob, pts or list(t.points[pid]), a.out or path, rounds=a.rounds,
+                 iters=a.iters, ncopies=a.copies, log=log, pid=pid)
+        elif a.cmd == "show":
+            if len(pids) > 1:
+                print(f"\n#### {pid}\n")
+            show(t, prob, path)
+        else:
+            verify(t, prob, pts or [1, 3, 20, 100, 300, 1000, 3000, 10000], path,
+                   iters=a.iters, ncopies=a.copies, log=log)
     return 0

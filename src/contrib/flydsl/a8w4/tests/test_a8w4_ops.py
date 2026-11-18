@@ -18,6 +18,7 @@ from pyhip.kit.testing import op_tests
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from a8w4 import ops  # noqa: E402
+from a8w4.tune import TUNING  # noqa: E402
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
@@ -26,8 +27,9 @@ pytestmark = pytest.mark.skipif(
 
 MOE, MOE_DYN = ops.moe, ops.moe_dyn
 
-# every shape x activation at 1, 77 and 600 tokens
-test_moe = op_tests(MOE, MOE.problems("shape", dim("num_tokens", (1, 77, 600), id="t{}"), "act"))
+# every tuned problem (tune.TUNING: shape x act) at 1, 77 and 600 tokens
+test_moe = op_tests(MOE, [(f"{pid}-t{n}", dict(p, num_tokens=n))
+                          for pid, p in TUNING.problems.items() for n in (1, 77, 600)])
 # an EP all-to-all receive buffer of capacity rows, num_tokens of them valid
 test_moe_dyn = op_tests(MOE_DYN, MOE_DYN.problems(
     "shape", dim("capacity, num_tokens", {"v0": (512, 0), "v1": (512, 1), "v37": (512, 37),

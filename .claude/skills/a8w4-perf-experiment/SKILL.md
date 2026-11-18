@@ -113,7 +113,7 @@ Needs all 8 GPUs idle (`rocm-smi --showuse`). Full-layer comparisons vs MORI: th
    TP-layer changes also the three 8-GPU tests.
 3. Selection changed: `python -m a8w4.tune tune-all --gpus 0-7 --out /tmp/a8w4_tune`
    (idle check, locks, BAD/FAIL report, merged table), `tune compare`, copy the table,
-   `tune verify --case ... -t ...`.
+   `tune verify <problem or group> -t ...` (`python -m a8w4.tune problems` lists them).
 4. README: `python -m a8w4.tune readme --write` (§7.2-7.4), then §4 / §5.6 / §6 / §10 / §11
    by hand; `configs/README.md` if the table changed; `tune readme --check` passes.
 

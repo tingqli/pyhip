@@ -263,7 +263,6 @@ def _weights(experts, model_dim, inter_dim):
 
 
 @op_register
-@dim(_SHAPE, SHAPES, name="shape")
 @dim("act", ACTS, id="{}")
 @dim("routing", ROUTINGS, id="{}")
 def moe_problem(model_dim, inter_dim, experts, experts_global, topk, expert_offset, num_tokens,

@@ -1,11 +1,14 @@
 """A/B timing and correctness of an op's configs by name (torch; ``python -m pyhip.kit``).
 
-    python -m pyhip.kit ab    a8w4.tune:TUNING ep8-silu -t 1024 4096 -v "ep3k m64" "pf1=ep3k m64:g2.pf=1"
-    python -m pyhip.kit check a8w4.tune:TUNING tp8-silu -t 1 77 4096 -v @table "tp1k bcm2 ks1" --graph
+    python -m pyhip.kit ab    a8w4.tune:TUNING mimo-flash2.6-ep8-silu -t 1024 4096 \\
+        -v "ep3k m64" "pf1=ep3k m64:g2.pf=1"
+    python -m pyhip.kit check a8w4.tune:TUNING mimo-flash2.6-tp8 -t 1 77 4096 \\
+        -v @table "tp1k bcm2 ks1" --graph
 
-The problem and the inputs are ``kit.tune``'s (a ``Tuning``): a tune problem (``--set``
-overrides), the bucket value per ``-t``, ``<op>_problem`` with seed ``--seed`` + value
-(+ 1000 * sample). The answer is ``<op>_ref``, the comparison ``<op>_check`` (its first
+The problem and the inputs are ``kit.tune``'s (a ``Tuning``): a tune problem (a group:
+each of its problems; ``--set`` overrides), the bucket value per ``-t``, ``<op>_problem``
+with seed ``--seed`` + value (+ 1000 * sample). The answer is ``<op>_ref``, the
+comparison ``<op>_check`` (its first
 metric is the column reported, e.g. cos). Every timed call is cold (``kit.timing``): an
 L2 flush and the next of ``--copies`` copies of the tuning's ``rotate`` inputs.
 
@@ -552,7 +555,8 @@ def parser(prog="python -m pyhip.kit"):
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("cmd", choices=["ab", "check"])
     ap.add_argument("spec", help="<module>:<Tuning name>")
-    ap.add_argument("problem", help="a tune problem (python -m pyhip.kit problems <spec>)")
+    ap.add_argument("problem", help="a tune problem or group (python -m pyhip.kit problems "
+                                      "<spec>)")
     ap.add_argument("-t", "--points", nargs="+", required=True, help="bucket values")
     ap.add_argument("-v", "--variants", nargs="+", default=["@table"],
                     help="variant specs; the first is the base (default: @table)")
@@ -586,13 +590,18 @@ def main(argv=None, prog="python -m pyhip.kit"):
     from . import _guess
 
     t = resolve_tuning(a.spec)
-    prob = t.problem(a.problem, a.set)
     pts = [_guess(v) for v in a.points]
     rec = Recorder(a.out, a.name or a.cmd, run_meta(a.cmd, a, prog))
-    desc = f"{t.op.name} problem {a.problem}: {({k: v for k, v in prob.items() if v is not None})}"
-    if a.cmd == "ab":
-        return ab(t, prob, pts, a.variants, rounds=a.rounds, iters=a.iters, samples=a.samples,
-                  seed=a.seed, dup=not a.no_dup, ref=not a.no_ref, bitwise=a.bitwise,
-                  diff_tol=a.diff_tol, ncopies=a.copies, rec=rec, describe=desc)
-    return 1 if check(t, prob, pts, a.variants, seed=a.seed, repeats=a.repeats, graph=a.graph,
-                      bitwise=a.bitwise, diff_tol=a.diff_tol, rec=rec, describe=desc) else 0
+    bad = 0
+    for pid in t.select([a.problem]):
+        prob = t.problem(pid, a.set)
+        desc = f"{t.op.name} problem {pid}: {({k: v for k, v in prob.items() if v is not None})}"
+        if a.cmd == "ab":
+            ab(t, prob, pts, a.variants, rounds=a.rounds, iters=a.iters, samples=a.samples,
+               seed=a.seed, dup=not a.no_dup, ref=not a.no_ref, bitwise=a.bitwise,
+               diff_tol=a.diff_tol, ncopies=a.copies, rec=rec, describe=desc)
+        else:
+            bad += check(t, prob, pts, a.variants, seed=a.seed, repeats=a.repeats,
+                         graph=a.graph, bitwise=a.bitwise, diff_tol=a.diff_tol, rec=rec,
+                         describe=desc)
+    return 1 if bad else 0

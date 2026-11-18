@@ -338,8 +338,7 @@ def test_tune(tmp_path, monkeypatch):
 
     src = TOY.replace("ops = Registry()", "ops = Registry(table=TABLE)") + (
         "\nfrom pyhip.kit.tune import Tuning\n"
-        "TUNING = Tuning(ops.axpy, problems=ops.axpy.problems('alpha'), bucket='n', "
-        "points=(4, 6))\n")
+        "TUNING = Tuning(ops.axpy).set_bucket('n').add_problem('toy')\n")
     mod = types.ModuleType("kit_toy_tune")
     mod.TABLE = str(tmp_path / "tuned.csv")
     exec(compile(src, "toy.py", "exec"), mod.__dict__)
@@ -351,22 +350,56 @@ def test_tune(tmp_path, monkeypatch):
         kt.resolve("kit_toy_tune:ops")
     with pytest.raises(SystemExit, match="expected <module>:<Tuning name>"):
         kt.resolve("axpy")
-    assert list(t.problems) == ["a1", "a2"] and t.problems["a2"] == dict(n=None, alpha=2.0)
-    assert t.problem("a1", ["alpha=3"]) == dict(n=None, alpha=3)
+    # alpha not given: each of its @dim values; the bucket n not given: its @dim values
+    assert t.groups == {"toy": ["toy-a1", "toy-a2"]}
+    assert t.problems == {"toy-a1": dict(n=None, alpha=1.0), "toy-a2": dict(n=None, alpha=2.0)}
+    assert t.points == {"toy-a1": (4, 6), "toy-a2": (4, 6)}
+    assert t.select(["toy"]) == ["toy-a1", "toy-a2"]
+    assert t.select(["toy-a2", "toy"]) == ["toy-a2", "toy-a1"]
+    with pytest.raises(SystemExit, match="no tune problem or group 'nope'"):
+        t.select(["nope"])
+    assert t.problem("toy-a1", ["alpha=3"]) == dict(n=None, alpha=3)
     with pytest.raises(SystemExit, match="name in \\['n', 'alpha'\\]"):
-        t.problem("a1", ["seed=5"])  # not a dim
+        t.problem("toy-a1", ["seed=5"])  # not a dim
     with pytest.raises(SystemExit, match="no tune problem"):
-        t.problem("a3")
+        t.problem("toy")  # a group
     assert t.fields(["err"]) == ["alpha", "~n", "config", "us", "err"]
-    for kw, match in ((dict(bucket="x"), "not a dim"), (dict(keys=("n",)), "keys"),
-                      (dict(rotate=("z",)), "rotate"),
-                      (dict(problems=[("p", {}), ("p", {})]), "two problems")):
+    # given values: a list / tuple / range are several (the varying ones name the problems)
+    t2 = (kt.Tuning(op).set_bucket("n").add_problem("big", n=range(8, 10), alpha=[1.0, 3.0])
+          .add_problem("one", n=4, alpha=2.0))
+    assert t2.groups == {"big": ["big-a1", "big-alpha3.0"], "one": ["one"]}
+    assert t2.points == {"big-a1": (8, 9), "big-alpha3.0": (8, 9), "one": (4,)}
+    assert t2.problems["big-alpha3.0"] == dict(n=None, alpha=3.0)
+    g = _ops("def g_ref(x): pass\n@dim('a, b', {'x': (1, 2), 'y': (3, 4)}, name='ab')\n"
+             "def g_problem(a, b, m, k=1): pass").g
+    tg = kt.Tuning(g).set_bucket("k").add_problem("p", k=[1, 2], m=5)
+    assert tg.problems == {"p-x": dict(a=1, b=2, m=5, k=None), "p-y": dict(a=3, b=4, m=5, k=None)}
+    tg = kt.Tuning(g).set_bucket("k")
+    for args, kw, match in ((("p",), dict(m=1), "points of the bucket"),
+                            (("p",), dict(k=1), r"give \['m'\]"),
+                            (("p",), dict(k=1, m=1, a=1), "all of the @dim 'ab'"),
+                            (("p",), dict(k=1, m=1, z=1), "not dims"),
+                            (("p",), dict(k=[], m=1), "no values"),
+                            (("a b",), dict(k=1, m=1), "a name of")):
         with pytest.raises(TypeError, match=match):
-            kt.Tuning(op, **{**dict(problems=[], bucket="n", points=()), **kw})
+            tg.add_problem(*args, **kw)
+    tg.add_problem("p", k=1, m=1)
+    for name in ("p", "p-x"):
+        with pytest.raises(TypeError, match="already name"):
+            tg.add_problem(name, k=1, m=2)
+    for build, match in ((lambda: kt.Tuning(op).add_problem("p"), "set_bucket first"),
+                         (lambda: kt.Tuning(op).set_bucket("x"), "not a dim"),
+                         (lambda: kt.Tuning(op, keys=("n",)).set_bucket("n"), "hold the bucket"),
+                         (lambda: kt.Tuning(op, keys=("z",)), "keys"),
+                         (lambda: kt.Tuning(op, rotate=("z",)), "rotate"),
+                         (lambda: tg.set_bucket("k"), "before add_problem")):
+        with pytest.raises(TypeError, match=match):
+            build()
     assert kt.gpu_list("0-2,5") == [0, 1, 2, 5]
     monkeypatch.setattr(kt, "time_cold", lambda fn, iters: (fn(), 1.5)[1])
     logs = []
-    kt.tune(t, t.problems["a1"], [4, 6], mod.TABLE, rounds=2, iters=1, log=logs.append, pid="a1")
+    kt.tune(t, t.problems["toy-a1"], [4, 6], mod.TABLE, rounds=2, iters=1, log=logs.append,
+            pid="toy-a1")
     fields, rows = table.read(mod.TABLE)
     assert fields == ("alpha", "~n", "config", "us", "err")
     got = [(r["~n"], r["config"]) for r in rows]
@@ -374,8 +407,17 @@ def test_tune(tmp_path, monkeypatch):
         + [("6", c) for c in ("loop", "tiled b2", "queue fast", "queue slow")]  # b4 can't run 6
     assert rows[0]["us"] == "1.5" and rows[0]["alpha"] == "1.0" and float(rows[0]["err"]) == 0
     assert "(1 n/a: AssertionError)" in logs[-1]
-    assert [op.name_of(c) for c in op.tuned(dict(t.problems["a1"], n=5))] == [
+    assert [op.name_of(c) for c in op.tuned(dict(t.problems["toy-a1"], n=5))] == [
         "loop", "tiled b2", "queue fast", "queue slow"]  # the dispatch reads what tune wrote
+    # the command line: a group selects each of its problems
+    out = []
+    monkeypatch.setattr("builtins.print", lambda *a, **k: out.append(" ".join(map(str, a))))
+    kt.main(["problems", "kit_toy_tune:TUNING"])
+    assert out == ["toy", "  toy-a1 {'alpha': 1.0} n: 2 points 4..6",
+                   "  toy-a2 {'alpha': 2.0} n: 2 points 4..6"]
+    out.clear()
+    kt.main(["configs", "kit_toy_tune:TUNING", "toy"])
+    assert out[0] == "# toy-a1" and out.count("loop") == 2
 
 
 def test_bench(tmp_path, monkeypatch):
@@ -395,7 +437,7 @@ def test_bench(tmp_path, monkeypatch):
         f.write("alpha,~n,config,us,err\n1.0,4,loop,2.0,0\n1.0,4,tiled b4,1.0,0\n")
     exec(compile(src, "toy.py", "exec"), mod.__dict__)
     op = mod.ops.axpy
-    t = kt.Tuning(op, problems=op.problems("alpha"), bucket="n", points=(4, 6))
+    t = kt.Tuning(op).set_bucket("n").add_problem("toy", alpha=1.0)
     prob = dict(n=None, alpha=1.0)
 
     # variants: [label=]base[:k=v,...] and py:<file>:<func>
@@ -476,7 +518,7 @@ def test_bench(tmp_path, monkeypatch):
 
     monkeypatch.setattr(kb, "Timer", Timer)
     monkeypatch.setattr(kb, "_rotated", lambda names, inp, n: [{k: inp[k] for k in names}])
-    tx = kt.Tuning(op, problems=op.problems("alpha"), bucket="n", points=(4, 6), rotate=("x",))
+    tx = kt.Tuning(op, rotate=("x",)).set_bucket("n").add_problem("toy", alpha=1.0)
     kb.ab(tx, prob, [4, 6], ["loop"], dup=False, rec=kb.Recorder(None, None, meta))
     assert timed == [4, 6]
 

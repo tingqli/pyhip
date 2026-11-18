@@ -5,23 +5,23 @@ a8w4.tune:TUNING ...`` (``pyhip.kit.tune``: every config of every solver, per
 token count, ALL results stored; the dispatch picks the fastest one allowed in its
 context), plus the a8w4 reports on the table (``tables.py``).
 
-    python -m a8w4.tune problems                                # tp8-silu, tp8-situv2, ...
-    python -m a8w4.tune configs tp8-silu
+    python -m a8w4.tune problems                     # groups mimo-flash2.6-tp8 / -tp4 / -ep8
+    python -m a8w4.tune configs mimo-flash2.6-tp8-silu
     # one process per GPU, disjoint token lists, then merge:
-    HIP_VISIBLE_DEVICES=0 python -m a8w4.tune tune tp8-silu -t 1 2 4 --out /tmp/p0.csv
+    HIP_VISIBLE_DEVICES=0 python -m a8w4.tune tune mimo-flash2.6-tp8-silu -t 1 2 4 --out /tmp/p0.csv
     python -m a8w4.tune merge /tmp/p*.csv                       # into configs/a8w4_moe_tuned.csv
-    python -m a8w4.tune show tp8-silu
-    python -m a8w4.tune verify ep8-silu -t 1 100 3000
+    python -m a8w4.tune show mimo-flash2.6-tp8                  # a group: each of its problems
+    python -m a8w4.tune verify mimo-flash2.6-ep8-silu -t 1 100 3000
     # another shape / routing: --set model_dim=... inter_dim=... routing=hot
-    # the shipped table's problems on 8 idle GPUs (4 per problem), BAD report, merged:
+    # every problem of TUNING on 8 idle GPUs (4 per problem), BAD report, merged:
     python -m a8w4.tune tune-all --gpus 0-7 --out /tmp/a8w4_tune
     python -m a8w4.tune compare configs/a8w4_moe_tuned.csv /tmp/a8w4_tune/a8w4_moe_tuned.new.csv
     python -m a8w4.tune readme --check                          # README 7.2-7.4 vs the table
     python -m a8w4.tune stats                                   # situv2 vs silu rows
 
 Run from the directory that contains ``a8w4/`` (or put it on PYTHONPATH). Everything
-about tuning is ``TUNING`` below: the problems (``ref.moe_problem``'s shapes x activations),
-the token counts, the table's keys and the rotated weights. SiTUv2 runs with
+about tuning is ``TUNING`` below: the problem groups (a shape each, x every act), the
+token counts, the table's keys and the rotated weights. SiTUv2 runs with
 ``ref.SITU`` (its betas / clamp are launch arguments: no effect on the time). See
 configs/README.md for the commands that produced the shipped table.
 """
@@ -45,19 +45,23 @@ from .moe import MOE  # noqa: E402
 TOKENS = (1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 320, 384, 448, 512,
           640, 768, 1024, 1280, 1536, 2048, 2560, 3072, 4096, 6144, 8192, 12288, 16384, 24576,
           32768)
-# how the shipped table is tuned: the problems are ref.SHAPES x activations (moe_problem's
-# @dim shape / act), num_tokens at TOKENS; the table is keyed by the shape, routing and
-# act (not expert_offset: it only renames the local experts); the timed calls rotate
-# copies of the weights W
-TUNING = kit_tune.Tuning(
-    MOE, problems=MOE.problems("shape", "act"), bucket="num_tokens", points=TOKENS,
-    keys=("model_dim", "inter_dim", "experts", "experts_global", "topk", "routing", "act"),
-    rotate=("W",))
+# how the shipped table is tuned: the MiMo-V2.6-Flash per-rank shapes (EP8: rank 3), each
+# at every act of moe_problem's @dim (problems <group>-silu, <group>-situv2), num_tokens
+# at TOKENS; the table is keyed by the shape, routing and act (not expert_offset: it only
+# renames the local experts); the timed calls rotate copies of the weights W
+TUNING = (
+    kit_tune.Tuning(MOE, keys=("model_dim", "inter_dim", "experts", "experts_global", "topk",
+                               "routing", "act"), rotate=("W",))
+    .set_bucket("num_tokens")
+    .add_problem("mimo-flash2.6-tp8", num_tokens=TOKENS, model_dim=4096, inter_dim=256,
+                 experts=256, experts_global=256, topk=8, expert_offset=0, routing="uniform")
+    .add_problem("mimo-flash2.6-tp4", num_tokens=TOKENS, model_dim=4096, inter_dim=512,
+                 experts=256, experts_global=256, topk=8, expert_offset=0, routing="uniform")
+    .add_problem("mimo-flash2.6-ep8", num_tokens=TOKENS, model_dim=4096, inter_dim=2048,
+                 experts=32, experts_global=256, topk=8, expert_offset=96, routing="uniform"))
 # the table's columns: the key dims, the bucket num_tokens, the config name and its time,
 # moe_check's metric
 FIELDS = TUNING.fields(["cos"])
-# the problems of the shipped table (configs/README.md): tune-all's default
-JOBS = ("tp8-situv2", "ep8-situv2", "tp8-silu", "ep8-silu", "tp4-silu", "tp4-situv2")
 REPORTS = ("compare", "readme", "stats")
 
 
@@ -84,8 +88,6 @@ def main(argv=None):
             return tables.readme(a.csv, write=a.write, check=a.check)
         return tables.stats(a.csv)
     cmd, rest = argv[0], argv[1:]
-    if cmd == "tune-all" and not kit_tune.parser().parse_args([cmd, "m:op", *rest]).args:
-        rest = [*JOBS, *rest]  # default: the shipped table's problems
     return kit_tune.main([cmd, f"{__package__}.tune:TUNING", *rest], prog="python -m a8w4.tune")
 
 

@@ -46,8 +46,8 @@ out = a8w4_moe_dyn(x8, W, topk_weights, topk_ids, m_valid, x_scale=x8_scale,
 
 ```bash
 pytest -q a8w4/tests/test_a8w4_ops.py a8w4/tests/test_a8w4_moe.py   # 正确性（gfx942）
-python -m a8w4.tune show   tp8-silu                    # 查看调优表：每个 token 数选中的配置
-python -m a8w4.tune verify ep8-silu                    # 按表实际调用：耗时、正确性
+python -m a8w4.tune show   mimo-flash2.6-tp8       # 查看调优表：每个 token 数选中的配置
+python -m a8w4.tune verify mimo-flash2.6-ep8-silu  # 按表实际调用：耗时、正确性
 pytest -q a8w4/tests/test_a8w4_mori_ep8.py                   # 8 卡 EP8 整层：MORI dispatch + a8w4_moe_dyn + MORI combine 对参考实现
 python a8w4/tests/test_a8w4_mori_ep8.py --act silu situv2     # 整层性能（总 token 64..4096），SiLU / SiTUv2 对比；更多用法见 8.1 节
 pytest -q a8w4/tests/test_a8w4_mori_tp8.py                   # 8 卡 TP8 整层：a8w4_moe + all-reduce（aiter custom / RCCL）对参考实现
@@ -165,7 +165,7 @@ a8w4/
   experiments/                 历次实验：index.csv（一行一个实验）、log_YYYYMMDD.md、各实验目录；_launch.py 是旧实验脚本用的 _run_compiled
   configs/a8w4_moe_tuned.csv   调优表（每个点保存全部配置的耗时）
   configs/README.md            调优表的内容与生成命令
-  tests/test_a8w4_ops.py       pytest：每个 solver 的每个调优过的配置对参考实现，由算子生成（op_tests(MOE, MOE.problems(...))，要测的 problem 写在这个文件里）
+  tests/test_a8w4_ops.py       pytest：每个 solver 的每个调优过的配置对参考实现，由算子生成（op_tests：moe 测 tune.TUNING 的每个 problem，moe_dyn 的 problem 写在这个文件里）
   tests/test_a8w4_moe.py       pytest：参考实现、查表、CUDA graph 等其余性质
   tests/test_a8w4_mori_ep8.py  8 卡 EP8 整层（MORI dispatch → a8w4_moe_dyn → MORI combine）：pytest 查正确性，命令行测性能（8.1 节）
   tests/test_a8w4_mori_tp8.py  8 卡 TP8 整层（a8w4_moe → all-reduce），EP8 脚本的 TP 对照：pytest 查正确性，命令行测性能（8.2 节）
@@ -448,7 +448,7 @@ ARB 是每个 K-tile 每行 A 的字节数，默认 256。`t16` 的 gemm2 用窄
 
 ### 6.3 tuner（`pyhip.kit.tune`，`python -m a8w4.tune`）
 
-调优是通用的（`pyhip.kit.tune`），a8w4 的全部调优设置在 `tune.py` 的 `TUNING` 里：problem 是 `ref.moe_problem` 的 `@dim` shape × act（`tp8-silu`、`tp8-situv2`、`tp4-silu`、`tp4-situv2`、`ep8-silu`、`ep8-situv2`，EP8 用 rank 3 的 expert_offset 96），分桶维 `num_tokens` 取 `TOKENS` 的 35 个点，表的 key 是 (H, I, E, E_global, topk, routing, act)（`expert_offset` 只是给 expert 改编号，不进表），计时时轮换权重 `W`。`--set name=value` 改 problem 的 dim（新 shape、routing）。表头由 `TUNING` 写出：key 列、`~num_tokens`、`config`、`us`、`moe_check` 返回的 `cos`。
+调优是通用的（`pyhip.kit.tune`），a8w4 的全部调优设置在 `tune.py` 的 `TUNING` 里：分桶维 `num_tokens`（`set_bucket`），每个 MiMo-V2.6-Flash shape 一组 problem（`add_problem("mimo-flash2.6-tp8", num_tokens=TOKENS, model_dim=4096, ...)`，组 `mimo-flash2.6-tp8`、`mimo-flash2.6-tp4`、`mimo-flash2.6-ep8`，EP8 用 rank 3 的 expert_offset 96）。act 没给，取 `moe_problem` 上 `@dim` act 的全部取值，所以每组有 `<组名>-silu`、`<组名>-situv2` 两个 problem，各在 `TOKENS` 的 35 个点上调。表的 key 是 (H, I, E, E_global, topk, routing, act)（`expert_offset` 只是给 expert 改编号，不进表），计时时轮换权重 `W`。命令行里 problem 参数可以给组名（组里的每个 problem）。`--set name=value` 改 problem 的 dim（新 shape、routing）。表头由 `TUNING` 写出：key 列、`~num_tokens`、`config`、`us`、`moe_check` 返回的 `cos`。
 
 - **配置**（`configs <problem>`，即 `MOE.configs`：各 solver 的全部配置。kernel 跑不了的配置运行时抛异常，记为 n/a，不进表）：
   - tp2k：bm × g1bcm × g2，共 8 个；
@@ -472,23 +472,23 @@ ARB 是每个 K-tile 每行 A 的字节数，默认 256。`t16` 的 gemm2 用窄
 
 ```bash
 cd <包含 a8w4/ 的目录>
-python -m a8w4.tune problems                       # 调优的 problem
-python -m a8w4.tune configs ep8-silu
+python -m a8w4.tune problems                       # 调优的组和 problem
+python -m a8w4.tune configs mimo-flash2.6-ep8-silu
 # 整表：8 张空闲卡，每个 problem 用 4 张卡、各跑 1/4 的 token 数；先查 GPU 空闲并加
 # /tmp/gpu-N.lock，结束时汇总 BAD 并合并成 <out>/a8w4_moe_tuned.new.csv
 python -m a8w4.tune tune-all --gpus 0-7 --out /tmp/a8w4_tune
 python -m a8w4.tune compare configs/a8w4_moe_tuned.csv /tmp/a8w4_tune/a8w4_moe_tuned.new.csv
 # 单卡手动调几个点
-HIP_VISIBLE_DEVICES=0 python -m a8w4.tune tune ep8-silu -t 1024 4096 --out /tmp/ep8_0.csv
+HIP_VISIBLE_DEVICES=0 python -m a8w4.tune tune mimo-flash2.6-ep8-silu -t 1024 4096 --out /tmp/ep8_0.csv
 python -m a8w4.tune merge /tmp/ep8_*.csv          # 合并进 configs/a8w4_moe_tuned.csv
-python -m a8w4.tune show   ep8-silu
-python -m a8w4.tune verify ep8-silu -t 1 100 3000 20000
+python -m a8w4.tune show   mimo-flash2.6-ep8      # 组名：silu 和 situv2 各一张表
+python -m a8w4.tune verify mimo-flash2.6-ep8-silu -t 1 100 3000 20000
 python -m a8w4.tune readme --check                # README 7.2–7.4 与表一致吗（--write 重新生成）
 python -m a8w4.tune stats                         # situv2 与 silu 行的对比（6.3 末尾的数字）
-# situv2：problem 换成 <shape>-situv2，结果写成 act=situv2 的行（完整命令见 configs/README.md）
+# situv2：problem 换成 <组名>-situv2，结果写成 act=situv2 的行（完整命令见 configs/README.md）
 
-# 新 shape：从一个 problem 出发改 dim（长期用就加进 ref.SHAPES，它会成为 TUNING 的 problem）
-python -m a8w4.tune tune tp8-silu --set model_dim=6144 experts=384 experts_global=384 --out /tmp/new.csv
+# 新 shape：从一个 problem 出发改 dim（长期用就在 tune.py 的 TUNING 里 add_problem 一组）
+python -m a8w4.tune tune mimo-flash2.6-tp8-silu --set model_dim=6144 experts=384 experts_global=384 --out /tmp/new.csv
 ```
 
 - **调优时机器要空闲**：调优时 8 张卡各跑一个进程，事后在空闲卡上单独复测，大 batch 的结果与表中数值相差 ±5–8%，方向不固定。
@@ -657,8 +657,8 @@ profile 中的 kernel 名：
 ## 8. 正确性与测试
 
 - **参考实现**：`ref.moe_ref` / `moe_dyn_ref` 是 fp32 参考，参数与 `a8w4_moe` / `a8w4_moe_dyn` 相同（读 prepare 后的权重，用 `decode_fd2` 解码）；`ref_moe` 是读未 shuffle 的 mxfp4 张量的旧接口，三者共用一个 fp32 核心。它们按 kernel 的方式模拟 fp8 量化：x 每行量化一次，中间结果每（行, 128 列）量化一次。剩下的差别只来自累加顺序和 bf16 输出。阈值是 cos 差 < 5e-3，实测 1e-5 到 3.5e-4。
-- **`tests/test_a8w4_ops.py`**：由算子生成（`op_tests(MOE, MOE.problems(...))`，`pyhip.kit.testing`），要测的 problem 就写在这个文件里。每个 problem × 它在调优表里那个点的全部配置（`ops.moe.tuned`，即分派可能选到的配置）跑一项：`MOE.run(cfg, **inputs)` 对 `moe_ref` / `moe_dyn_ref`，用 `moe_check` / `moe_dyn_check` 判（bf16、shape、cos 差 < 5e-3）。本机 360 项（含每个 problem 的 dims 项），全部通过，首次约 3 分钟（编译），之后约 20 秒。
-  - `test_moe`：tp8 / tp4 / ep8 三个 shape（EP 用 rank 3、全局专家 id）× tokens 1 / 77 / 600 × silu / situv2；
+- **`tests/test_a8w4_ops.py`**：由算子生成（`op_tests`，`pyhip.kit.testing`），要测的 problem 写在这个文件里：`moe` 取 `tune.TUNING` 的每个 problem，`moe_dyn` 用 `MOE_DYN.problems(...)`。每个 problem × 它在调优表里那个点的全部配置（`ops.moe.tuned`，即分派可能选到的配置）跑一项：`MOE.run(cfg, **inputs)` 对 `moe_ref` / `moe_dyn_ref`，用 `moe_check` / `moe_dyn_check` 判（bf16、shape、cos 差 < 5e-3）。本机 360 项（含每个 problem 的 dims 项），全部通过，首次约 3 分钟（编译），之后约 20 秒。
+  - `test_moe`：`TUNING` 的每个 problem（tp8 / tp4 / ep8 三个 shape × silu / situv2，EP 用 rank 3、全局专家 id）× tokens 1 / 77 / 600；
   - `test_moe_dyn`：EP8 接收缓冲区，容量 512 时有效行数 0 / 1 / 37 / 300，容量 2048 时 1500（TR epilogue）；无效行填 NaN 和随机 id；× bf16 / fp8 分组 scale 输入 × silu / situv2，表里该点的 ep3k 预设；
   - 每个 problem 另有一项 `...-dims`：`moe_dims(**inputs)` 与 problem 一致；
   - 没调过的配置不测：只保证调优表里的配置（kernel 不支持的组合会在 tune 时抛异常，不进表）；
@@ -844,7 +844,7 @@ python a8w4/tests/test_a8w4_mori_tp8.py --allreduce aiter --act silu situv2 \
 
 3. 调优：`tune` 在每个 problem 上跑新 solver 的全部配置，能跑并通过检查的写进表，merge 之后分派就能选到。测试不用另写：`pytest -q a8w4/tests/test_a8w4_ops.py -k <solver>` 会跑表里的这些配置。调优之前可以用 `bench check -v "<配置名>"` 先查正确性；第一次加 `PYHIP_FLYDSL_CHECK=1` 跑。
 
-按某个激活调优：problem 用 `<shape>-<act>`（例如 `tp8-situv2`），结果写成该 act 的一组行（CSV 的 act 列），命令见 [configs/README.md](configs/README.md)。新的 act 要先加进 `ref.ACTS`（`moe_problem` 的 `@dim("act", ...)`），它就会成为 `TUNING` 的 problem。
+按某个激活调优：problem 用 `<组名>-<act>`（例如 `mimo-flash2.6-tp8-situv2`），结果写成该 act 的一组行（CSV 的 act 列），命令见 [configs/README.md](configs/README.md)。新的 act 要先加进 `ref.ACTS`（`moe_problem` 的 `@dim("act", ...)`），`TUNING` 的每组都会多出这个 act 的 problem。
 
 ### 9.4 修改 kernel 的流程
 
