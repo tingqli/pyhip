@@ -12,7 +12,7 @@ older form on the unshuffled mxfp4 tensors. All share one fp32 core.
 
 The problem side of the ops ``moe`` and ``moe_dyn`` (``pyhip.kit``, registered into
 ``_ops.ops``; the kernels are the solvers in ``moe.py``): ``<op>_ref`` the interface and
-the answer, ``<op>_test`` the inputs of one problem (its parameters but ``seed``: the
+the answer, ``<op>_problem`` the inputs of one problem (its parameters but ``seed``: the
 dims), ``<op>_check`` the tolerance, ``<op>_dims`` the dims of a call. Cold-cache timing
 (``flush_cache``, ``weight_copies``,
 ``time_cold``, ``WCOPIES``) is ``pyhip.kit.timing``, re-exported here.
@@ -243,7 +243,7 @@ def cos_diff(x, y):
 
 
 # =============================================================================
-# ops moe / moe_dyn: test problems, tolerance, dims of a call
+# ops moe / moe_dyn: problems, tolerance, dims of a call
 # =============================================================================
 
 COS_TOL = 5e-3  # vs the fp8-emulating fp32 reference (typical 1e-5 .. 1e-4)
@@ -257,7 +257,7 @@ SHAPES = {
 _SHAPE = "model_dim, inter_dim, experts, experts_global, topk, expert_offset"
 
 
-@functools.lru_cache(maxsize=1)  # the test cases run shape by shape
+@functools.lru_cache(maxsize=1)  # the tests run problem by problem
 def _weights(experts, model_dim, inter_dim):
     return make_weights(experts, model_dim, inter_dim)[0]
 
@@ -266,8 +266,8 @@ def _weights(experts, model_dim, inter_dim):
 @dim(_SHAPE, SHAPES, name="shape")
 @dim("act", ACTS, id="{}")
 @dim("routing", ROUTINGS, id="{}")
-def moe_test(model_dim, inter_dim, experts, experts_global, topk, expert_offset, num_tokens,
-             routing="uniform", act="silu", *, seed=0):
+def moe_problem(model_dim, inter_dim, experts, experts_global, topk, expert_offset, num_tokens,
+                routing="uniform", act="silu", *, seed=0):
     """Inputs of ``moe_ref`` / ``a8w4_moe``: random mxfp4 weights of ``experts`` local
     experts (``make_weights``, cached per shape), ``make_routing(seed=seed)`` over
     ``experts_global``; SiTUv2 with ``SITU``."""
@@ -306,8 +306,8 @@ def moe_dims(x, W, topk_weights, topk_ids, *, expert_offset=0, num_experts=None,
 @dim("fp8", {"bf16": False, "fp8": True})
 @dim("act", ACTS, id="{}")
 @dim("routing", ROUTINGS, id="{}")
-def moe_dyn_test(model_dim, inter_dim, experts, experts_global, topk, expert_offset,
-                 capacity, num_tokens, fp8=False, act="silu", routing="uniform", *, seed=0):
+def moe_dyn_problem(model_dim, inter_dim, experts, experts_global, topk, expert_offset,
+                    capacity, num_tokens, fp8=False, act="silu", routing="uniform", *, seed=0):
     """Inputs of ``moe_dyn_ref`` / ``a8w4_moe_dyn``: an EP all-to-all receive buffer of
     ``capacity`` rows. Rows [0, num_tokens) are tokens with >= 1 local route (global
     ids); the rows past them are stale (NaN x, random ids) and must not be read. fp8: x

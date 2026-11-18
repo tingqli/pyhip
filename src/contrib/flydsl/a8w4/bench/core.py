@@ -30,7 +30,7 @@ from pyhip.kit.timing import (  # noqa: F401 - re-exported for the bench tools
 
 from .. import ref as R
 from ..kernels import ep_gemm as EG
-from ..moe import MOE, shape_dims
+from ..moe import MOE, shape_problem
 from ..ref import COS_TOL, SHAPES  # noqa: F401 - COS_TOL: re-exported for the tools
 
 PKG_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -82,14 +82,15 @@ class Case:
 
     def interface(self, tokens, seed, local=0):
         """The interface arguments of one sample (``moe_ref`` / ``a8w4_moe``): the routing
-        of ``inputs``, the cached random weights of the shape (``ref.moe_test``'s)."""
+        of ``inputs``, the cached random weights of the shape (``ref.moe_problem``'s)."""
         H, I, E, EGl, K = self.shape
         x, tw, ti = self.inputs(tokens, seed, local)
         return dict(x=x, W=R._weights(E, H, I), topk_weights=tw, topk_ids=ti, **self.kwargs())
 
-    def dims(self, tokens=None):
-        """The ``ops.moe`` dims of the case at ``tokens``."""
-        return dict(shape_dims(self.shape, tokens, self.act, self.routing), expert_offset=self.e0)
+    def problem(self, tokens=None):
+        """The ``ops.moe`` problem of the case at ``tokens``."""
+        return dict(shape_problem(self.shape, tokens, self.act, self.routing),
+                    expert_offset=self.e0)
 
     def describe(self):
         H, I, E, EGl, K = self.shape
@@ -182,7 +183,7 @@ def annotate(case):
 
 VARIANT_HELP = """\
 variant spec: [label=]<base>[:<override>,...]  or  [label=]py:<module | file.py>:<func>
-  base      a config name (python -m a8w4.tune candidates <case>), e.g. "tp1k bcm1 ks1",
+  base      a config name (python -m a8w4.tune configs <problem>), e.g. "tp1k bcm1 ks1",
             "ep3k l128"; a bare ep_gemm.CFGS name ("l128" = "ep3k l128"); "@table" (the
             tuned table's pick at each token count)
   override  ep3k only: g1.<k>=v / g2.<k>=v (ep_gemm1 / ep_gemm2 kwargs: pf, bcm, acm, sch,
@@ -198,8 +199,8 @@ examples: "ep3k m64"  "pf1=m64:g2.pf=1"  "c=l128:g1.bcm=0,g2.bcm=0"
 def alias(base):
     """A bare ep_gemm.CFGS name is that ep3k preset; an unknown ep3k preset is refused."""
     base = f"ep3k {base}" if base in EG.CFGS else base
-    kind, _, cfg = base.partition(" ")
-    if kind == "ep3k" and cfg not in EG.CFGS:
+    solver, _, cfg = base.partition(" ")
+    if solver == "ep3k" and cfg not in EG.CFGS:
         raise SystemExit(f"{base!r} is not a config name: no preset {cfg!r} in "
                          f"ep_gemm.CFGS\n\n{VARIANT_HELP}")
     return base
@@ -224,7 +225,7 @@ class Resolved:
 def resolve(v, case, tokens):
     """``kit.bench.resolve`` on the case -> Resolved with ``run(x, W, tw, ti)``, or a str
     (no tuned config for ``@table``)."""
-    r = kb.resolve(MOE, v, case.dims(tokens))
+    r = kb.resolve(MOE, v, case.problem(tokens))
     if isinstance(r, str):
         return r
     kw = case.kwargs()

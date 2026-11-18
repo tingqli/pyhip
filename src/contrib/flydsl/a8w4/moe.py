@@ -17,19 +17,20 @@ ids. Either way ``out`` is this rank's partial sum; the caller reduces across ra
 dispatch): capacity-sized inputs whose valid row count is a device tensor, x in bf16
 or in fp8 with per-(token, 128) scales; no host sync, CUDA-graph safe.
 
-Kernel families = the functions ``moe_<kind>`` below (all consume the same ``W``; see
-README.md). ``@op_register`` adds them, after the reference / test functions of
-``ref.py``, to the package's ops (``_ops.py``): ``MOE`` = ``ops.moe``, ``MOE_DYN`` =
-``ops.moe_dyn``. A config is ``{"kind": kind, knob: value, ...}``, its knobs' grid is
-the ``@knob``s; a config that cannot run a call raises (the kernels' asserts).
-``MOE(...)`` / ``MOE.pick(dims)`` pick one from the tuned table (``pyhip.kit``
-dispatch): only tuned keys are guaranteed, an untuned one raises ValueError.
+Solvers = the functions ``moe_<solver>`` below (all consume the same ``W``; see
+README.md). ``@op_register`` adds them, after the problem side of ``ref.py``
+(``moe_ref`` / ``moe_problem`` / ...), to the package's ops (``_ops.py``): ``MOE`` =
+``ops.moe``, ``MOE_DYN`` = ``ops.moe_dyn``. A config is ``{"solver": name, knob: value,
+...}``, the knobs' values are the ``@knob``s; a config that cannot run a call raises (the
+kernels' asserts). ``MOE(...)`` / ``MOE.pick(problem)`` pick one from the tuned table
+(``pyhip.kit`` dispatch): only tuned keys are guaranteed, an untuned one raises
+ValueError.
   tp2k   prep -> gemm1 (q8s epilogue) -> gemm2 (atomic scatter)
   tp1k   prep -> one fused gemm1 + gemm2 kernel (BM 64)
   tp1kq  same, persistent work-queue kernel (inter_dim 256 only; NOT graph-safe)
   ep3k   ep_prep (local sort + x quant + tile schedule) -> ep gemm1 -> ep gemm2
   ep1k   one persistent launch: routing + x quant + gemm1 + gemm2 (M <= 512)
-TP kinds' prep: all experts local -> tp_prep (ONE launch: sort over all experts + x row
+TP solvers' prep: all experts local -> tp_prep (ONE launch: sort over all experts + x row
 quant + out zeroing); an expert slice (EP shapes) -> aiter moe_sorting with an
 expert_mask + quantize_rows.
 """
@@ -40,7 +41,7 @@ import torch
 
 from pyhip.kit import knob, meta, no_capture, stack
 
-from . import ref as _ref  # noqa: F401 - registers the ops' ref / test / check / dims first
+from . import ref as _ref  # noqa: F401 - registers the ops' ref / problem / check / dims first
 from ._ops import DEFAULT_CSV, op_register, ops  # noqa: F401 - DEFAULT_CSV re-exported
 from .kernels import ep_gemm as EG
 from .kernels import ep_small as ES
@@ -53,7 +54,7 @@ from .kernels.row_quant import quantize_rows
 from .weights import weight_shape
 
 EP_SMALL_MAXM = 512  # ep1k compile-time token capacity
-EP_CFGS = ("t16", "s16", "s32", "m64", "l128", "l128c")  # the ep3k presets of the grid
+EP_CFGS = ("t16", "s16", "s32", "m64", "l128", "l128c")  # the ep3k presets of its @knob
 
 _DROP = "-"  # an ep3k override value that removes the key (the kernel default applies)
 
@@ -86,7 +87,7 @@ ep3k_space = stack(  # moe_ep3k and moe_dyn_ep3k
 
 
 # =============================================================================
-# kernel families
+# solvers
 # =============================================================================
 
 _MASKS = {}
@@ -227,8 +228,8 @@ def moe_dyn_ep3k(x, W, topk_weights, topk_ids, m_valid, *, x_scale=None, expert_
 MOE, MOE_DYN = ops.moe, ops.moe_dyn
 
 
-def shape_dims(shape, tokens=None, act=None, routing=None, op=MOE):
-    """The dims of ``op`` for ``shape`` = (H, I, E local, E global, topk), ``tokens``
+def shape_problem(shape, tokens=None, act=None, routing=None, op=MOE):
+    """The problem of ``op`` for ``shape`` = (H, I, E local, E global, topk), ``tokens``
     rows (``num_tokens``), ``act`` and ``routing``; the other dims None (unknown). For
     the tools that work on shape tuples."""
     H, I, E, EGl, topk = shape
@@ -249,7 +250,7 @@ def a8w4_moe(x, W, topk_weights, topk_ids, *, expert_offset=0, num_experts=None,
     topk_ids int32 [M, topk] (global expert ids). expert_offset / num_experts: the
     rank owns global experts [expert_offset, expert_offset + E) of num_experts
     (defaults: 0 / E = TP). act: "silu" | "situv2" (situ: dict(situ_beta,
-    situ_linear_beta, swiglu_limit); all kernel families).
+    situ_linear_beta, swiglu_limit); all solvers).
 
     ``MOE(...)`` (``ops.moe``; ``moe_dims`` checks the inputs). ``dispatch`` goes to it:
     ``config=`` (a config dict or name to force, e.g. ``"tp1k bcm1 ks1"``), ``table=``

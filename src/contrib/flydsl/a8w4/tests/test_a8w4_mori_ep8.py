@@ -48,7 +48,7 @@ from a8w4 import a8w4_moe_dyn  # noqa: E402
 from a8w4 import ref as R  # noqa: E402
 from a8w4.bench import dist as D  # noqa: E402
 from a8w4.bench.dist import E_GLOBAL, E_LOCAL, H, I, TOPK, WORLD  # noqa: E402
-from a8w4.moe import MOE_DYN, shape_dims  # noqa: E402
+from a8w4.moe import MOE_DYN, shape_problem  # noqa: E402
 
 try:
     import mori
@@ -206,7 +206,7 @@ def _bench(layer, x, tw, ti, count, args, iters, warmup, spin):
         iso.append(t)
         e2e.append(t2)
         late += (h1 > SPIN_US) + (h2 > SPIN_US)  # the GPU may have waited for the host
-    cfg = (MOE_DYN.pick(shape_dims(SHAPE, args[1], "silu", op=MOE_DYN))["cfg"] if args[0]
+    cfg = (MOE_DYN.pick(shape_problem(SHAPE, args[1], "silu", op=MOE_DYN))["cfg"] if args[0]
            else "-")
     return dict(recv=count, cfg=cfg, iso=iso, e2e=e2e, late=late)
 

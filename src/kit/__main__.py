@@ -1,5 +1,5 @@
-"""``python -m pyhip.kit <cmd> <module>:<op> ...``: the tuner and table tools
-(``pyhip.kit.tune``: cases, candidates, tune, merge, show, verify, tune-all, compare) and
+"""``python -m pyhip.kit <cmd> <module>:<Tuning name> ...``: the tuner and table tools
+(``pyhip.kit.tune``: problems, configs, tune, merge, show, verify, tune-all, compare) and
 the A/B and correctness tools (``pyhip.kit.bench``: ab, check)."""
 
 import sys

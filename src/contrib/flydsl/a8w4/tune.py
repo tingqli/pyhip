@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """Tuner of ``a8w4_moe``: ``python -m a8w4.tune <cmd> ...`` is ``python -m pyhip.kit <cmd>
-a8w4.tune:TUNING ...`` (``pyhip.kit.tune``: every grid config of every kernel family, per
+a8w4.tune:TUNING ...`` (``pyhip.kit.tune``: every config of every solver, per
 token count, ALL results stored; the dispatch picks the fastest one allowed in its
 context), plus the a8w4 reports on the table (``tables.py``).
 
     python -m a8w4.tune problems                                # tp8-silu, tp8-situv2, ...
-    python -m a8w4.tune candidates tp8-silu
+    python -m a8w4.tune configs tp8-silu
     # one process per GPU, disjoint token lists, then merge:
     HIP_VISIBLE_DEVICES=0 python -m a8w4.tune tune tp8-silu -t 1 2 4 --out /tmp/p0.csv
     python -m a8w4.tune merge /tmp/p*.csv                       # into configs/a8w4_moe_tuned.csv
@@ -20,7 +20,7 @@ context), plus the a8w4 reports on the table (``tables.py``).
     python -m a8w4.tune stats                                   # situv2 vs silu rows
 
 Run from the directory that contains ``a8w4/`` (or put it on PYTHONPATH). Everything
-about tuning is ``TUNING`` below: the problems (``ref.moe_test``'s shapes x activations),
+about tuning is ``TUNING`` below: the problems (``ref.moe_problem``'s shapes x activations),
 the token counts, the table's keys and the rotated weights. SiTUv2 runs with
 ``ref.SITU`` (its betas / clamp are launch arguments: no effect on the time). See
 configs/README.md for the commands that produced the shipped table.
@@ -45,7 +45,7 @@ from .moe import MOE  # noqa: E402
 TOKENS = (1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 320, 384, 448, 512,
           640, 768, 1024, 1280, 1536, 2048, 2560, 3072, 4096, 6144, 8192, 12288, 16384, 24576,
           32768)
-# how the shipped table is tuned: the problems are ref.SHAPES x activations (moe_test's
+# how the shipped table is tuned: the problems are ref.SHAPES x activations (moe_problem's
 # @dim shape / act), num_tokens at TOKENS; the table is keyed by the shape, routing and
 # act (not expert_offset: it only renames the local experts); the timed calls rotate
 # copies of the weights W

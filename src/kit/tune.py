@@ -1,7 +1,7 @@
 """Tune an op into its tuned table, and inspect the table (torch; ``python -m pyhip.kit``).
 
     python -m pyhip.kit problems   a8w4.tune:TUNING             # the tune problems: tp8-silu ...
-    python -m pyhip.kit candidates a8w4.tune:TUNING tp8-silu    # the grid configs
+    python -m pyhip.kit configs    a8w4.tune:TUNING tp8-silu    # every config of every solver
     python -m pyhip.kit tune       a8w4.tune:TUNING tp8-silu -t 1 2 4 --out /tmp/p0.csv
     python -m pyhip.kit merge      a8w4.tune:TUNING /tmp/p*.csv # into the tuning's table
     python -m pyhip.kit show       a8w4.tune:TUNING tp8-silu    # per point: the fastest configs
@@ -14,8 +14,8 @@ declares how to tune the op (see ``Tuning``): the problems, the bucket dim and i
 points, the key dims the table stores, the inputs the timed calls rotate, the table.
 
 ``--set name=value`` overrides dim values of a problem (another shape, a routing).
-``tune``: per point, ``--rounds`` rounds, each with fresh inputs (``<op>_test``, seed
-101 * point + round); per round every grid config runs once (one that raises cannot run
+``tune``: per point, ``--rounds`` rounds, each with fresh inputs (``<op>_problem``, seed
+101 * point + round); per round every config runs once (one that raises cannot run
 the problem: n/a), is checked against ``<op>_ref`` (``<op>_check``: a failure is BAD)
 and timed cold (``kit.timing.time_cold``, the ``rotate`` inputs cycling through
 ``--copies`` copies), the configs interleaved. Every config that ran and passed is
@@ -92,14 +92,14 @@ class Tuning:
         if pid not in self.problems:
             raise SystemExit(f"{self.op.name}: no tune problem {pid!r}; problems: "
                              f"{list(self.problems)}")
-        c = dict(self.problems[pid])
+        prob = dict(self.problems[pid])
         for s in sets:
             k, eq, v = s.partition("=")
             if not eq or k not in self.op.dim_names:
                 raise SystemExit(f"--set {s!r}: expected name=value, name in "
                                  f"{list(self.op.dim_names)}")
-            c[k] = _cell(v, self.op._test_defaults.get(k))
-        return c
+            prob[k] = _cell(v, self.op._defaults.get(k))
+        return prob
 
 
 def resolve(spec):
@@ -141,27 +141,27 @@ class _Rotation:
         return {k: f() for k, (_, f) in self.cyc.items()}
 
 
-def _inputs(op, dims, seed):
-    return op.test(**dims, seed=seed) if op._seeded else op.test(**dims)
+def _inputs(op, problem, seed):
+    return op.problem(**problem, seed=seed) if op._seeded else op.problem(**problem)
 
 
-def tune(t, c, points, out, *, rounds=3, iters=20, ncopies=NCOPIES, log=print, pid=""):
-    """Tune problem ``c`` of ``t`` at ``points`` into the table ``out`` (see the module
+def tune(t, problem, points, out, *, rounds=3, iters=20, ncopies=NCOPIES, log=print, pid=""):
+    """Tune ``problem`` of ``t`` at ``points`` into the table ``out`` (see the module
     docstring)."""
     op, b = t.op, t.bucket
-    known = {k: v for k, v in c.items() if v is not None and k != b}
-    log(f"{op.name} {pid} {known}: {len(op.configs(dict(c, **{b: points[0]})))} candidates, "
-        f"{ncopies} copies of {list(t.rotate)}")
+    known = {k: v for k, v in problem.items() if v is not None and k != b}
+    log(f"{op.name} {pid} {known}: {len(op.configs(dict(problem, **{b: points[0]})))} "
+        f"configs, {ncopies} copies of {list(t.rotate)}")
     rot = _Rotation(t.rotate, ncopies)
     for p in points:
-        dims = dict(c, **{b: p})
-        cfgs = op.configs(dims)
+        prob = dict(problem, **{b: p})
+        cfgs = op.configs(prob)
         names = [op.name_of(cfg) for cfg in cfgs]
         times = {n: [] for n in names}
         metrics = {n: {} for n in names}
         bad, na = {}, {}
         for rnd in range(rounds):
-            inputs = _inputs(op, dims, 101 * p + rnd)
+            inputs = _inputs(op, prob, 101 * p + rnd)
             rot.bind(inputs)
             expected = op.ref(**inputs)
             for cfg, name in zip(cfgs, names):
@@ -186,7 +186,7 @@ def tune(t, c, points, out, *, rounds=3, iters=20, ncopies=NCOPIES, log=print, p
             if name in bad or name in na:
                 continue
             us = sorted(times[name])[len(times[name]) // 2]
-            rows.append(dict({k: dims[k] for k in t.keys}, **{t.column: p}, config=name,
+            rows.append(dict({k: prob[k] for k in t.keys}, **{t.column: p}, config=name,
                              us=f"{us:.1f}", **{k: f"{v:.1e}" for k, v in metrics[name].items()}))
         rows.sort(key=lambda r: float(r["us"]))
         if rows:
@@ -194,56 +194,57 @@ def tune(t, c, points, out, *, rounds=3, iters=20, ncopies=NCOPIES, log=print, p
                                               (*t.keys, t.column, "config", "us")]))
         top = " | ".join(f"{r['config']} {r['us']}" for r in rows[:3])
         msgs = [f"{n}: {m}" for n, m in bad.items()]
-        kinds = sorted(set(na.values()))
+        errs = sorted(set(na.values()))
         log(f"{b} {p:6}: {top}" + (f"  [{'; '.join(msgs)}]" if msgs else "")
-            + (f"  ({len(na)} n/a: {', '.join(kinds)})" if na else ""))
+            + (f"  ({len(na)} n/a: {', '.join(errs)})" if na else ""))
         torch.cuda.empty_cache()
 
 
-def _points(op, c, path):
-    pts = op.points(c, table=path)
+def _points(op, problem, path):
+    pts = op.points(problem, table=path)
     if not pts:
-        known = {k: v for k, v in c.items() if v is not None}
+        known = {k: v for k, v in problem.items() if v is not None}
         raise SystemExit(f"{op.name}: no rows for {known} in {path}")
     return pts
 
 
-def show(t, c, path=None, out=print):
-    """Markdown, per point: the fastest config, the fastest of each solver kind
-    and the capture pick when it differs."""
+def show(t, problem, path=None, out=print):
+    """Markdown, per point: the fastest config, the fastest of each solver and the
+    capture pick when it differs."""
     op, b, path = t.op, t.bucket, path or t.table
-    pts = _points(op, c, path)
-    kinds = [k for k in op.impls if any(cfg["kind"] == k for _, cs in pts for _, cfg in cs)]
-    out(f"| {b} | best | us | " + " | ".join(f"best {k} | us" for k in kinds)
+    pts = _points(op, problem, path)
+    solvers = [s for s in op.solvers
+               if any(cfg["solver"] == s for _, cs in pts for _, cfg in cs)]
+    out(f"| {b} | best | us | " + " | ".join(f"best {s} | us" for s in solvers)
         + " | capture pick |")
-    out("|---:|---|---:|" + "---|---:|" * len(kinds) + "---|")
-    for n, cands in pts:
-        us0, best = cands[0]
+    out("|---:|---|---:|" + "---|---:|" * len(solvers) + "---|")
+    for n, cfgs in pts:
+        us0, best = cfgs[0]
         cells = []
-        for k in kinds:
-            u, cfg = next(((u, cfg) for u, cfg in cands if cfg["kind"] == k), (None, None))
+        for s in solvers:
+            u, cfg = next(((u, cfg) for u, cfg in cfgs if cfg["solver"] == s), (None, None))
             cells += [op.name_of(cfg), f"{u:.1f}"] if cfg else ["-", "-"]
         try:
-            safe = op.pick(dict(c, **{b: n}), capturing=True, table=path)
+            safe = op.pick(dict(problem, **{b: n}), capturing=True, table=path)
             cap = "" if safe == best else op.name_of(safe)
         except ValueError:
             cap = "none"
         out(f"| {n} | {op.name_of(best)} | {us0:.1f} | " + " | ".join(cells) + f" | {cap} |")
 
 
-def verify(t, c, points, path=None, *, iters=20, ncopies=NCOPIES, log=print):
+def verify(t, problem, points, path=None, *, iters=20, ncopies=NCOPIES, log=print):
     """``op(...)`` (the table's pick) at each bucket value, also between tuned points:
     the check against ``<op>_ref`` and the time vs the table entry."""
     op, b, path = t.op, t.bucket, path or t.table
-    pts = dict(_points(op, c, path))
+    pts = dict(_points(op, problem, path))
     rot = _Rotation(t.rotate, ncopies)
     for v in points:
-        dims = dict(c, **{b: v})
-        inputs = _inputs(op, dims, 7 + v)
+        prob = dict(problem, **{b: v})
+        inputs = _inputs(op, prob, 7 + v)
         rot.bind(inputs)
         expected = op.ref(**inputs)
-        cfg = op.pick(dims, table=path)
-        hints = {k: dims[k] for k in t.keys if k not in op._ref_names}
+        cfg = op.pick(prob, table=path)
+        hints = {k: prob[k] for k in t.keys if k not in op._ref_names}
         fn = lambda over: op(**{**inputs, **over}, table=path, **hints)  # noqa: E731
         try:
             m = _check(op, fn({}), expected, inputs)
@@ -362,7 +363,7 @@ def tune_all(spec, t, pids, gpus, per_job, points, out_dir, *, rounds=3, iters=2
     logs = sorted(glob.glob(os.path.join(out_dir, "*_[0-9]*.log")))
     bad = [f"{os.path.basename(f)}: {ln.strip()}" for f in logs for ln in open(f)
            if re.search(r"\bBAD\b", ln)]
-    print("\n".join(["BAD candidates:"] + bad) if bad else "no BAD candidates")
+    print("\n".join(["BAD configs:"] + bad) if bad else "no BAD configs")
     if failed:
         print(f"FAILED processes (see their logs): {failed}")
     parts = sorted(glob.glob(os.path.join(out_dir, "*_[0-9]*.csv")))
@@ -382,10 +383,10 @@ def tune_all(spec, t, pids, gpus, per_job, points, out_dir, *, rounds=3, iters=2
 def parser(prog="python -m pyhip.kit"):
     p = argparse.ArgumentParser(prog=prog, description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("cmd", choices=["problems", "candidates", "tune", "merge", "show", "verify",
+    p.add_argument("cmd", choices=["problems", "configs", "tune", "merge", "show", "verify",
                                    "tune-all", "compare"])
     p.add_argument("spec", help="<module>:<Tuning name> (compare: the old table)")
-    p.add_argument("args", nargs="*", help="a problem (candidates / tune / show / verify), "
+    p.add_argument("args", nargs="*", help="a problem (configs / tune / show / verify), "
                                            "problems (tune-all; default all), tables (merge, "
                                            "compare)")
     p.add_argument("-t", "--points", nargs="+", default=None,
@@ -417,8 +418,8 @@ def main(argv=None, prog="python -m pyhip.kit"):
     path = a.table or t.table
     pts = [_guess(v) for v in a.points] if a.points else None
     if a.cmd == "problems":
-        for pid, c in t.problems.items():
-            print(pid, {k: v for k, v in c.items() if v is not None})
+        for pid, prob in t.problems.items():
+            print(pid, {k: v for k, v in prob.items() if v is not None})
         return 0
     if a.cmd == "merge":
         return merge(a.args, path)
@@ -429,16 +430,16 @@ def main(argv=None, prog="python -m pyhip.kit"):
                         force=a.force, log=log)
     if len(a.args) != 1:
         raise SystemExit(f"{a.cmd}: one problem, one of {list(t.problems)}")
-    c = t.problem(a.args[0], a.set)
-    if a.cmd == "candidates":
-        for cfg in op.configs(dict(c, **{t.bucket: (pts or t.points or [None])[0]})):
+    prob = t.problem(a.args[0], a.set)
+    if a.cmd == "configs":
+        for cfg in op.configs(dict(prob, **{t.bucket: (pts or t.points or [None])[0]})):
             print(op.name_of(cfg))
     elif a.cmd == "tune":
-        tune(t, c, pts or list(t.points), a.out or path, rounds=a.rounds, iters=a.iters,
+        tune(t, prob, pts or list(t.points), a.out or path, rounds=a.rounds, iters=a.iters,
              ncopies=a.copies, log=log, pid=a.args[0])
     elif a.cmd == "show":
-        show(t, c, path)
+        show(t, prob, path)
     else:
-        verify(t, c, pts or [1, 3, 20, 100, 300, 1000, 3000, 10000], path, iters=a.iters,
+        verify(t, prob, pts or [1, 3, 20, 100, 300, 1000, 3000, 10000], path, iters=a.iters,
                ncopies=a.copies, log=log)
     return 0

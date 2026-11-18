@@ -20,12 +20,12 @@ import pytest
 
 import pyhip.contrib.flydsl.a8w4 as A
 from pyhip.contrib.flydsl.a8w4 import ref
-from pyhip.contrib.flydsl.a8w4.moe import shape_dims
+from pyhip.contrib.flydsl.a8w4.moe import shape_problem
 from pyhip.kit import table as ktable
 
 TP8 = (4096, 256, 256, 256, 8)
 EP8 = (4096, 2048, 32, 256, 8)
-KINDS = ("tp2k", "tp1k", "tp1kq", "ep3k", "ep1k")
+SOLVERS = ("tp2k", "tp1k", "tp1kq", "ep3k", "ep1k")
 MOE, MOE_DYN = A.ops.moe, A.ops.moe_dyn
 
 SIGNATURES = {
@@ -57,36 +57,36 @@ def test_ref_signature(name):
 
 def test_registry():
     assert list(A.ops) == ["moe", "moe_dyn"]
-    assert list(MOE.impls) == list(KINDS)
-    assert list(MOE_DYN.impls) == ["ep3k"]
+    assert list(MOE.solvers) == list(SOLVERS)
+    assert list(MOE_DYN.solvers) == ["ep3k"]
     assert A.ops.table == A.DEFAULT_CSV and os.path.isfile(A.DEFAULT_CSV)
     assert ktable.bucket(ktable.read(A.DEFAULT_CSV)[0]) == "num_tokens"  # ~num_tokens
-    assert [MOE.capturable(dict(kind=k)) for k in KINDS] == [True, True, False, True, True]
+    assert [MOE.capturable(dict(solver=s)) for s in SOLVERS] == [True, True, False, True, True]
 
 
 @pytest.mark.parametrize("shape", [TP8, EP8])
 @pytest.mark.parametrize("tokens", [1, 77, 4096])
 @pytest.mark.parametrize("act", ["silu", "situv2"])
-def test_pick_kind(shape, tokens, act):
-    dims = shape_dims(shape, tokens, act)
-    cfg = MOE.pick(dims)
-    assert cfg["kind"] in KINDS and cfg == MOE.tuned(dims)[0]
-    assert MOE.pick(dims, capturing=True)["kind"] != "tp1kq"  # tp1kq is @no_capture
+def test_pick_solver(shape, tokens, act):
+    prob = shape_problem(shape, tokens, act)
+    cfg = MOE.pick(prob)
+    assert cfg["solver"] in SOLVERS and cfg == MOE.tuned(prob)[0]
+    assert MOE.pick(prob, capturing=True)["solver"] != "tp1kq"  # tp1kq is @no_capture
 
 
 def test_dyn_pick():
-    assert MOE_DYN.pick(shape_dims(EP8, 1, "silu", op=MOE_DYN))["kind"] == "ep3k"
+    assert MOE_DYN.pick(shape_problem(EP8, 1, "silu", op=MOE_DYN))["solver"] == "ep3k"
     with pytest.raises(ValueError):  # the MORI path needs the EP kernels: none tuned
-        MOE_DYN.pick(shape_dims(TP8, 1, "silu", op=MOE_DYN))
+        MOE_DYN.pick(shape_problem(TP8, 1, "silu", op=MOE_DYN))
 
 
 def test_untuned():
-    for dims in (shape_dims((4000, 256, 256, 256, 8), 16, "silu"),  # an untuned shape
-                 shape_dims(TP8, 16, "silu", "hot")):  # no rows of this routing
+    for prob in (shape_problem((4000, 256, 256, 256, 8), 16, "silu"),  # an untuned shape
+                 shape_problem(TP8, 16, "silu", "hot")):  # no rows of this routing
         with pytest.raises(ValueError, match="no tuned config"):
-            MOE.pick(dims)
+            MOE.pick(prob)
     with pytest.raises(ValueError, match=r"\(no table\)"):
-        MOE.pick(shape_dims(TP8, 16, "silu"), table=None)
+        MOE.pick(shape_problem(TP8, 16, "silu"), table=None)
 
 
 def test_table_config_roundtrip():

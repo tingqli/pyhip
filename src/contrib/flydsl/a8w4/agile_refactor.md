@@ -13,7 +13,7 @@
 
 ### 0.1 当前状态（每次停下来前更新）
 
-- **迭代**：I1、I1b、I2、I3、I4 已完成。I3 的范围是用户看过 I2 后改的（见 3.4 节）：`_vendor` 只留真正用到的代码，迁到 `kernels/` 下的共享模块，删掉 `_vendor/`。用户看过 I4 后决定先跳过 I4b（NaN 传播，1.1 节），先做 I5（3.2 节）。I5 已完成。之后讨论出函数级 kit 的设计（`refactor6.md`），用户 2026-11-17 让开始实现：迭代 K（3.1 节）已完成。用户看过 K 后讨论了 `refactor7.md`：A 部分（op 注册表 `@op_register`）的迭代 R（3.0a 节）已完成。之后用户委托按推荐定下 B、C 部分的问题，并说明 sglang 现有代码不再考虑（冻结 API 取消）：迭代 D（3.0 节，查表分派进 kit）已完成。用户看过 D 后决定：只保证调优表里的 key，限制交给 kernel 的 assert，迭代 E（3.0e 节，去掉 `@requires`）已完成；用户让 E 之后直接做完 T1–T4（通用 tune / bench），每完成一个就提交并 push 到 tq2：T1–T4 已完成（3.0t 节）。之后用户重新梳理了术语和分工（2026-11-18）：problem 的维度叫 dim、solver 的旋钮叫 knob，测试和调优各自集中声明：迭代 V（3.0v 节）已完成，等用户看过。I4b、I6 排在这些之后；另有一个待定问题：`ref_moe(raw)` 的调用方（`bench/core.py`、`bench/dist.py` 的 megamoe 参考、两个 MORI 测试）要不要改用 `moe_ref(W)`。
+- **迭代**：I1、I1b、I2、I3、I4 已完成。I3 的范围是用户看过 I2 后改的（见 3.4 节）：`_vendor` 只留真正用到的代码，迁到 `kernels/` 下的共享模块，删掉 `_vendor/`。用户看过 I4 后决定先跳过 I4b（NaN 传播，1.1 节），先做 I5（3.2 节）。I5 已完成。之后讨论出函数级 kit 的设计（`refactor6.md`），用户 2026-11-17 让开始实现：迭代 K（3.1 节）已完成。用户看过 K 后讨论了 `refactor7.md`：A 部分（op 注册表 `@op_register`）的迭代 R（3.0a 节）已完成。之后用户委托按推荐定下 B、C 部分的问题，并说明 sglang 现有代码不再考虑（冻结 API 取消）：迭代 D（3.0 节，查表分派进 kit）已完成。用户看过 D 后决定：只保证调优表里的 key，限制交给 kernel 的 assert，迭代 E（3.0e 节，去掉 `@requires`）已完成；用户让 E 之后直接做完 T1–T4（通用 tune / bench），每完成一个就提交并 push 到 tq2：T1–T4 已完成（3.0t 节）。之后用户重新梳理了术语和分工（2026-11-18）：problem 的维度叫 dim、solver 的旋钮叫 knob，测试和调优各自集中声明：迭代 V（3.0v 节）已完成。用户看过 V 后要求一个概念一个名字：迭代 W（3.0w 节，kind → solver、`<op>_test` → `<op>_problem` 等）已完成，等用户看过。I4b、I6 排在这些之后；另有一个待定问题：`ref_moe(raw)` 的调用方（`bench/core.py`、`bench/dist.py` 的 megamoe 参考、两个 MORI 测试）要不要改用 `moe_ref(W)`。
 - **分支**：`/sgl-workspace/pyhip` 的 `refactor/a8w4`。
 - **已有提交**：
   - 迭代 0，安全网：`64ce77c`、`d17f502`（ISA 基线在这个提交上生成）、`4e256d9`。
@@ -101,6 +101,21 @@
 - 删完后，剩下的 kernel 的 ISA 必须完全不变。不在快照矩阵里的配置，本来就走不到。
 
 ## 3. 当前迭代
+
+### 3.0w W：一个概念一个名字（已完成）
+
+用户 2026-11-18：统一成 solver，概念越少越好；检查有没有其他同一个东西两个名字的；`<op>_test` 改叫 `<op>_problem`（问题侧和解法侧对称：`<op>_problem` 的参数是 dim、`@dim` 给取值，`<op>_<solver>` 的仅限关键字参数是 knob、`@knob` 给取值）。
+
+- [x] W：只改名。
+  - solver：配置 dict 的键 `"kind"` → `"solver"`，`Op.impls` → `Op.solvers`，`<op>_<kind>` → `<op>_<solver>`；a8w4 里指 solver 的 “kernel family” / `FAMILIES` / `KINDS` → solver / `SOLVERS`（`breakdown.py` 的 kernel family 是 kernel 名前缀，另一回事，不改；README 的“TP 族 / EP 族”是一组 solver，不改）。配置名不变，调优表不动。
+  - problem：`<op>_test` → `<op>_problem`（`Op.test` → `Op.problem`，a8w4 `moe_test` / `moe_dyn_test` → `moe_problem` / `moe_dyn_problem`）；`Op` 各方法的 dict 参数 `dims` → `problem`（它就是 problem），`kit.tune` / `kit.bench` 的 `c` → `problem`；a8w4 `shape_dims` → `shape_problem`，bench 的 `Case.dims()` → `Case.problem()`。`<op>_dims` 不改：它返回一次调用看得出来的那些 dim 值。
+  - 其他同义词：README 的 data → inputs（代码一直叫 inputs）；candidates → configs（CLI 命令 `candidates` → `configs`，和 `op.configs` 同名；日志 “N configs”、“BAD configs”）；“网格点 / grid”指配置时改叫配置；`Op.meta(cfg, key, dims)` → `meta(cfg, name, problem)`（key 只指精确匹配的 dim）；内部 `extras` → `over`。
+  - 对照 HEAD：360 个测试 ID 相同；600 次查表（三个 shape × act × routing × tokens × capture）选中的配置名相同；`configs` / `show` / `problems` 输出与旧 `candidates` / `show` / `problems` 逐字相同；`readme --check` 通过；ISA IDENTICAL；kit 18、单卡 413、8 卡 3 passed。API 测试 `test_pick_kind` 改名 `test_pick_solver`。
+
+待用户定的同类问题（没改）：
+
+- a8w4 bench 的 `Case`（`--case tp8`、`case_from_args`）和 ISA 快照任务名 `moe:<case>:...`、`test_a8w4_moe.py` 的 `case` 参数：都是 shape 预设的名字（加上 act / routing / expert_offset 就是不带 bucket 的 problem）。
+- `spec` 两个意思：命令行的 `<模块>:<Tuning 名>` 和 bench 的 variant spec。
 
 ### 3.0v V：术语 dim / knob，测试和调优集中声明（已完成）
 
@@ -544,6 +559,7 @@ host 端（`moe._run_tp2k`，G1/G2 唯一的调用方）只用到 gemm1 的 `epi
 | 2026-11-17 | E 去掉 `@requires` | 限制只在 kernel 的 assert 里（164 种被拒绝的组合实测都是干净的 `AssertionError`）；只保证调优表里的 key，没调过的抛 `ValueError`；删兜底；`@no_capture`、`Op.tuned`、`Op.capturable`；生成的测试测调优过的配置（与原来没 skip 的 360 项相同）；ISA IDENTICAL；单卡 413、8 卡 3 passed | `e522ebe` |
 | 2026-11-17 | T1–T4 通用 tune / bench | `pyhip.kit.table`（表的读写、合并、比较）、`kit.timing`（冷 cache 协议、ABBA、噪声带）、`kit.tune` + `python -m pyhip.kit`（cases / candidates / tune / merge / show / verify / tune-all / compare）、`kit.bench`（ab / check）；a8w4 的 tune、bench 变成薄包装。表文件逐字节相同；tune 的候选、表头、选择相同，计时在噪声内；bench 新旧输出相同；ISA IDENTICAL；kit 18、单卡 413、8 卡 3 passed | `bebaff3` `3637665` `ef107ba` `712fc05` |
 | 2026-11-18 | V 术语 dim / knob，测试和调优集中声明 | `@dim`（problem 的取值）/ `@knob`（solver 的网格）；`op.problems`、`op_tests(op, problems)`、`Tuning`；表头 `~num_tokens` 标出 bucket，`Registry(name, table)`；去掉 relax，补调 tp4-situv2。测试 ID、候选、show 不变；分派只在 tp4-situv2 上变；ISA IDENTICAL；kit 18、单卡 413、8 卡 3 passed | `af50811` `9adc2f0` `893e3f2` |
+| 2026-11-18 | W 一个概念一个名字 | kind → solver（配置键、`Op.solvers`）；`<op>_test` → `<op>_problem`；dict 参数 `dims` → `problem`；data → inputs；CLI `candidates` → `configs`。测试 ID、分派、CLI 输出不变；ISA IDENTICAL；kit 18、单卡 413、8 卡 3 passed | 见 git log |
 
 **I4 的经验**：
 

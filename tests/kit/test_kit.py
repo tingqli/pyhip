@@ -29,7 +29,7 @@ def axpy_ref(x, y, *, alpha=1.0):
 @op_register
 @dim("n", (4, 6), id="n{}")
 @dim("alpha", {"a1": 1.0, "a2": 2.0})
-def axpy_test(n, alpha, *, seed=0):
+def axpy_problem(n, alpha, *, seed=0):
     rng = random.Random(seed + n)
     return dict(x=[rng.random() for _ in range(n)], y=[rng.random() for _ in range(n)],
                 alpha=alpha)
@@ -60,7 +60,7 @@ tiles = stack(knob("block", (2, 4), id="b{}"))
 @tiles
 @meta(rows=lambda block: block * 8, graph_safe=True)
 def axpy_tiled(x, y, *, alpha=1.0, block=2, **over):
-    assert len(x) % block == 0, f"n={len(x)} % block {block}"  # a limit: the impl raises
+    assert len(x) % block == 0, f"n={len(x)} % block {block}"  # a limit: the solver raises
     out = []
     for i in range(0, len(x), block):
         out += [alpha * a + b for a, b in zip(x[i:i + block], y[i:i + block])]
@@ -122,14 +122,14 @@ def test_registration(toy):
     assert list(ops) == ["axpy", "axpy_dyn"] and len(ops) == 2 and "axpy" in ops
     op = ops["axpy"]
     assert ops.axpy is op
-    assert (op.ref, op.test, op.check, op.dims) == (toy["axpy_ref"], toy["axpy_test"],
-                                                     toy["axpy_check"], toy["axpy_dims"])
-    assert list(op.impls) == ["loop", "tiled", "queue"]  # axpy_dyn_* go to the longer prefix
-    assert op.dim_names == ("n", "alpha")  # seed: the data's random seed, not a dim
+    assert (op.ref, op.problem, op.check, op.dims) == (toy["axpy_ref"], toy["axpy_problem"],
+                                                        toy["axpy_check"], toy["axpy_dims"])
+    assert list(op.solvers) == ["loop", "tiled", "queue"]  # axpy_dyn_*: the longer prefix
+    assert op.dim_names == ("n", "alpha")  # seed: the inputs' random seed, not a dim
     dyn = ops["axpy_dyn"]
-    assert list(dyn.impls) == ["loop"] and dyn.test is None and dyn.dim_names == ()
+    assert list(dyn.solvers) == ["loop"] and dyn.problem is None and dyn.dim_names == ()
     assert (toy["axpy_tiled"].kit_op, toy["axpy_dyn_loop"].kit_op) == ("axpy", "axpy_dyn")
-    assert repr(op) == "Op('axpy', impls=['loop', 'tiled', 'queue'])"
+    assert repr(op) == "Op('axpy', solvers=['loop', 'tiled', 'queue'])"
     assert repr(ops) == "Registry(['axpy', 'axpy_dyn'])"
     with pytest.raises(AttributeError):
         op.name = "x"
@@ -138,15 +138,15 @@ def test_registration(toy):
     with pytest.raises(AttributeError):
         ops._nope  # noqa: B018
     other = _toy()["ops"]  # a package imported twice: two independent registries
-    assert other["axpy"] is not op and list(other["axpy"].impls) == list(op.impls)
+    assert other["axpy"] is not op and list(other["axpy"].solvers) == list(op.solvers)
 
 
 def test_registration_rules():
     ref = "def f_ref(x, *, a=1): pass\n"
     _raises("def f_k(x): pass\n" + ref, r"register its <op>_ref first")
-    _raises(ref + "def f_k(x, *, a=1): pass\ndef f_test(n=1): pass",
+    _raises(ref + "def f_k(x, *, a=1): pass\ndef f_problem(n=1): pass",
             "register it before the solvers")
-    _raises(ref + "def f_dyn_test(n=1): pass", "register f_dyn_ref first")
+    _raises(ref + "def f_dyn_problem(n=1): pass", "register f_dyn_ref first")
     _raises(ref + "def f_dyn_k(x, *, a=1): pass\ndef f_dyn_ref(y): pass",
             "f_dyn_k was registered before it")
     _raises(ref + ref, "op 'f' is already registered")
@@ -183,7 +183,7 @@ def test_registration_rules():
     for f, match in ((g_bad, "each knob needs exactly one @knob"), (g_odd, "cannot parse")):
         with pytest.raises(TypeError, match=match):
             reg.register(f)
-        assert "kit_op" not in f.__dict__ and list(reg.g.impls) == ["k"]  # left no trace
+        assert "kit_op" not in f.__dict__ and list(reg.g.solvers) == ["k"]  # left no trace
     _raises("def f_ref(x, *, config=None): pass", r"\['config'\] are reserved")
     assert repr(Registry("lib")) == "Registry('lib', [])"
 
@@ -193,7 +193,7 @@ def f_ref(x, *, dt="a"):
     return ("ref",)
 
 @dim("n", (4,))
-def f_test(n, dt="a", mode="s", *, seed=0):
+def f_problem(n, dt="a", mode="s", *, seed=0):
     return dict(x=[0.0] * n, dt=dt)
 
 def f_dims(x, *, dt="a"):
@@ -250,20 +250,20 @@ def test_dispatch(tmp_path):
         pick(n=4, dt="a", table=None)
     with pytest.raises(ValueError, match="no tuned config"):
         pick(n=4, dt="a", table=str(tmp_path / "none.csv"))
-    dims = dict(op._blank, n=4, dt="a")
-    assert op.pick(dims) is op.pick(dict(dims))  # memoized
-    assert [op.name_of(c) for c in op.tuned(dict(dims, n=3))] == ["k1 b2", "k2", "k3"]
-    assert op.tuned(dict(dims, dt="d")) == [] and op.tuned(dims, table=None) == []
-    assert [(n, [op.name_of(c) for _, c in cs]) for n, cs in op.points(dims)] == [
+    prob = dict(op._blank, n=4, dt="a")
+    assert op.pick(prob) is op.pick(dict(prob))  # memoized
+    assert [op.name_of(c) for c in op.tuned(dict(prob, n=3))] == ["k1 b2", "k2", "k3"]
+    assert op.tuned(dict(prob, dt="d")) == [] and op.tuned(prob, table=None) == []
+    assert [(n, [op.name_of(c) for _, c in cs]) for n, cs in op.points(prob)] == [
         (4, ["k1 b2", "k2", "k3"]), (16, ["k3", "k1 b1"])]  # zz: not a solver
     with pytest.raises(ValueError, match="needs n"):
         op.pick(dict(op._blank, dt="a"))
-    with pytest.raises(TypeError, match="lack"):
+    with pytest.raises(TypeError, match="lacks"):
         op.pick(dict(n=4))
     # a call: dims and hints -> pick -> run
     x3, x4 = [0.0] * 3, [0.0] * 4
     assert op(x4) == ("k1", 2) and op(x4, mode="t") == ("k3",) and op(x3) == ("k1", 2)
-    assert op(x3, config="k3") == ("k3",) and op(x3, config=dict(kind="k1", b=1)) == ("k1", 1)
+    assert op(x3, config="k3") == ("k3",) and op(x3, config=dict(solver="k1", b=1)) == ("k1", 1)
     with pytest.raises(ValueError, match=r"\(no table\)"):
         op(x4, table=None)
     with pytest.raises(TypeError, match=r"unknown argument\(s\) \['bogus'\]"):
@@ -395,7 +395,7 @@ def test_bench(tmp_path, monkeypatch):
     exec(compile(src, "toy.py", "exec"), mod.__dict__)
     op = mod.ops.axpy
     t = kt.Tuning(op, problems=op.problems("alpha"), bucket="n", points=(4, 6))
-    case = dict(n=None, alpha=1.0)
+    prob = dict(n=None, alpha=1.0)
 
     # variants: [label=]base[:k=v,...] and py:<file>:<func>
     v = kb.parse_variant(op, "t=tiled b2:block=4,mode=x/1")
@@ -407,18 +407,18 @@ def test_bench(tmp_path, monkeypatch):
         kb.parse_variant(op, "nope")
     (tmp_path / "mine.py").write_text("def f(x, y, *, alpha=1.0):\n    return list(y)\n")
     py = kb.parse_variant(op, f"m=py:{tmp_path / 'mine.py'}:f")
-    r = kb.resolve(op, py, dict(case, n=4))
+    r = kb.resolve(op, py, dict(prob, n=4))
     assert (r.config, r.cfg, r.cached) == (py.spec, None, None)
     assert r.run(dict(x=[1.0], y=[2.0], alpha=3.0)) == [2.0]
 
     # resolve: the overrides become config entries; @table: the fastest tuned config
-    r = kb.resolve(op, kb.parse_variant(op, "tiled b2:block=4"), dict(case, n=4))
+    r = kb.resolve(op, kb.parse_variant(op, "tiled b2:block=4"), dict(prob, n=4))
     assert r.config == "tiled b4" and op.meta(r.cfg, "rows") == 32
     assert r.run(dict(x=[1.0] * 4, y=[1.0] * 4, alpha=2.0)) == [3.0] * 4
     table = kb.parse_variant(op, "@table")
-    assert kb.resolve(op, table, dict(case, n=4)).config == "tiled b4"
-    assert kb.resolve(op, table, dict(case, n=6)).config == "tiled b4"  # the nearest point
-    assert "no tuned config" in kb.resolve(op, table, dict(case, n=4, alpha=3.0))
+    assert kb.resolve(op, table, dict(prob, n=4)).config == "tiled b4"
+    assert kb.resolve(op, table, dict(prob, n=6)).config == "tiled b4"  # the nearest point
+    assert "no tuned config" in kb.resolve(op, table, dict(prob, n=4, alpha=3.0))
 
     # protocol check: unknown cached loads need coldrot with >= MIN_COPIES copies
     kb.check_protocols([r], ["coldrot"], kb.MIN_COPIES, False)
@@ -434,16 +434,16 @@ def test_bench(tmp_path, monkeypatch):
         with open(tmp_path / "out" / f"{name}.jsonl") as f:
             return [json.loads(line) for line in f][1:]
 
-    # check: FAIL for a config the impl can't run (the first variant that runs is the base),
+    # check: FAIL for a config the solver can't run (the first variant that runs is the base),
     # n/a (not a failure) for @table without a tuned config
-    bad = kb.check(t, case, [4, 6], ["@table", "loop", "tiled b4"], diff_tol=1e-9,
+    bad = kb.check(t, prob, [4, 6], ["@table", "loop", "tiled b4"], diff_tol=1e-9,
                    rec=kb.Recorder(str(tmp_path / "out"), "check", meta))
     assert bad == 2
     got = [(r["T"], r["variant"], r["result"][:19]) for r in records("check")]
     assert got == [(4, "@table", "OK"), (4, "loop", "OK"), (4, "tiled b4", "OK"),
                    (6, "@table", "FAIL AssertionError"), (6, "loop", "OK"),
                    (6, "tiled b4", "FAIL AssertionError")]
-    assert kb.check(t, dict(case, alpha=3.0), [4], ["loop", "@table"],
+    assert kb.check(t, dict(prob, alpha=3.0), [4], ["loop", "@table"],
                     rec=kb.Recorder(None, None, meta)) == 0
 
     # ab: timing stubbed; the base timed twice; the verdict beyond the noise band
@@ -456,13 +456,13 @@ def test_bench(tmp_path, monkeypatch):
 
     monkeypatch.setattr(kb, "Timer", lambda Ws: None)
     monkeypatch.setattr(kb, "interleaved", interleaved)
-    kb.ab(t, case, [4], ["tiled b4", "loop", "tiled b2"], rounds=2, diff_tol=1e-9,
+    kb.ab(t, prob, [4], ["tiled b4", "loop", "tiled b2"], rounds=2, diff_tol=1e-9,
           rec=kb.Recorder(str(tmp_path / "out"), "ab", meta))
     got = {r["variant"]: (r["verdict"], r["err_ref"], r["err_base"]) for r in records("ab")}
     assert got == {"tiled b4": ("base", 0.0, 0.0), "tiled b4#2": ("noise floor", 0.0, 0.0),
                    "loop": ("slower", 0.0, 0.0), "tiled b2": ("~", 0.0, 0.0)}
     with pytest.raises(SystemExit, match="the base at n 4: axpy: no tuned config"):
-        kb.ab(t, dict(case, alpha=3.0), [4], ["@table", "loop"],
+        kb.ab(t, dict(prob, alpha=3.0), [4], ["@table", "loop"],
               rec=kb.Recorder(None, None, meta))
 
 
@@ -488,7 +488,7 @@ def test_marks_return_the_function_in_written_order():
 
 def test_problems(toy):
     op = toy["ops"]["axpy"]
-    probs = op.problems("n", "alpha")  # the @dim values of axpy_test, by axis name
+    probs = op.problems("n", "alpha")  # the @dim values of axpy_problem, by axis name
     assert [pid for pid, _ in probs] == ["n4-a1", "n4-a2", "n6-a1", "n6-a2"]
     assert probs[1][1] == dict(n=4, alpha=2.0)
     assert op.problems(("alpha", ["a2"]), dim("n", (8,), id="n{}")) == [("a2-n8", dict(n=8, alpha=2.0))]
@@ -502,20 +502,20 @@ def test_problems(toy):
             op.problems(*axes)
     assert toy["ops"]["axpy_dyn"].problems() == [("", {})]
     named = _ops("def f_ref(x): pass\n@dim('m, n', {'sq': (2, 2)}, name='shape')\n"
-                 "def f_test(m, n, k=1): pass").f
+                 "def f_problem(m, n, k=1): pass").f
     assert named.problems("shape") == [("sq", dict(m=2, n=2, k=1))]
-    _raises("def f_ref(x): pass\n@dim('m, n', {'sq': (2, 2)})\ndef f_test(m, n): pass",
+    _raises("def f_ref(x): pass\n@dim('m, n', {'sq': (2, 2)})\ndef f_problem(m, n): pass",
             "needs name=")
     _raises("def f_ref(x): pass\n@dim('m', (1,), name='a')\n@dim('n', (1,), name='a')\n"
-            "def f_test(m, n): pass", "two @dim axes named 'a'")
+            "def f_problem(m, n): pass", "two @dim axes named 'a'")
 
 
 def test_axis_forms():
     p = dim("tokens, valid", {"v0": (512, 0), "v37": (512, 37)})
     assert p.points() == [("v0", dict(tokens=512, valid=0)), ("v37", dict(tokens=512, valid=37))]
     assert p.token(dict(tokens=512, valid=37)) == "v37"
-    q = knob("split", lambda dim: [s for s in (1, 2, 4) if dim % s == 0], id="ks{}")
-    assert q.points(dict(dim=6)) == [("ks1", dict(split=1)), ("ks2", dict(split=2))]
+    q = knob("split", lambda n: [s for s in (1, 2, 4) if n % s == 0], id="ks{}")
+    assert q.points(dict(n=6)) == [("ks1", dict(split=1)), ("ks2", dict(split=2))]
     for bad in (lambda: knob("a, b", (1, 2)), lambda: knob("a", {"x": 1}, id="{}"),
                 lambda: knob("a", (1,), id="a"), lambda: knob("a a", (1,)),
                 lambda: dim("a, b", {"x": (1, 2, 3)}), lambda: dim("a", "xy"),
@@ -530,20 +530,20 @@ def test_configs_and_capture(toy):
     assert [op.name_of(c) for c in cfgs] == ["loop", "tiled b2", "tiled b4", "queue fast",
                                              "queue slow"]
     assert [op.capturable(c) for c in cfgs] == [True, True, True, False, False]
-    assert op.capturable(dict(kind="tiled", block=4, extra=1))
-    with pytest.raises(AssertionError, match="n=6 % block 4"):  # limits: the impl raises
-        op.run(dict(kind="tiled", block=4), [0.0] * 6, [0.0] * 6)
+    assert op.capturable(dict(solver="tiled", block=4, extra=1))
+    with pytest.raises(AssertionError, match="n=6 % block 4"):  # limits: the solver raises
+        op.run(dict(solver="tiled", block=4), [0.0] * 6, [0.0] * 6)
     with pytest.raises(KeyError, match="no solver 'nope'"):
-        op.capturable(dict(kind="nope"))
+        op.capturable(dict(solver="nope"))
     with pytest.raises(TypeError, match="unknown knob"):
-        op.capturable(dict(kind="queue", mode="fast", extra=1))
+        op.capturable(dict(solver="queue", mode="fast", extra=1))
 
 
 def test_names(toy):
     op = toy["ops"]["axpy"]
     for cfg in op.configs(dict(n=4, alpha=1.0)):
         assert op.parse(op.name_of(cfg)) == cfg
-    cfg = dict(kind="tiled", block=4, arb=128, tag="x1", f=0.5)
+    cfg = dict(solver="tiled", block=4, arb=128, tag="x1", f=0.5)
     assert op.name_of(cfg) == "tiled b4:arb=128,tag=x1,f=0.5"
     assert op.parse("tiled b4:arb=128,tag=x1,f=0.5") == cfg
     for bad in ("tiled", "tiled bx", "tiled b4 x", "loop:a=1", "tiled b4:a", "nope b4", ""):
@@ -553,14 +553,14 @@ def test_names(toy):
 
 def test_meta_and_run(toy):
     op = toy["ops"]["axpy"]
-    assert op.meta(dict(kind="tiled", block=4), "rows") == 32
-    assert op.meta(dict(kind="tiled"), "graph_safe") is True
-    assert op.meta(dict(kind="queue", mode="slow"), "rows") is None
+    assert op.meta(dict(solver="tiled", block=4), "rows") == 32
+    assert op.meta(dict(solver="tiled"), "graph_safe") is True
+    assert op.meta(dict(solver="queue", mode="slow"), "rows") is None
     with pytest.raises(KeyError, match="no meta 'nope'"):
-        op.meta(dict(kind="loop"), "nope")
+        op.meta(dict(solver="loop"), "nope")
     x, y = [1.0, 2.0, 3.0, 4.0], [1.0, 1.0, 1.0, 1.0]
-    assert op.run(dict(kind="tiled", block=4), x, y, alpha=2.0) == [3.0, 5.0, 7.0, 9.0]
-    assert op.run(dict(kind="tiled", block=2, probe=1), x, y) == [2.0, 3.0, 4.0, 5.0]
+    assert op.run(dict(solver="tiled", block=4), x, y, alpha=2.0) == [3.0, 5.0, 7.0, 9.0]
+    assert op.run(dict(solver="tiled", block=2, probe=1), x, y) == [2.0, 3.0, 4.0, 5.0]
 
 
 def test_convention_errors():
@@ -571,19 +571,19 @@ def test_convention_errors():
             "each knob needs exactly one @knob")
     _raises(ref + "@knob('b', (1,))\ndef f_k(x, b, *, a=1): pass", "must start with exactly")
     _raises(ref + "@knob('b', (1,))\ndef f_k(x, *, a=1, b): pass", "keyword-only knob")
-    _raises(ref + "def f_test(n=1): pass\n@knob('n', (1,))\ndef f_k(x, *, a=1, n=1): pass",
+    _raises(ref + "def f_problem(n=1): pass\n@knob('n', (1,))\ndef f_k(x, *, a=1, n=1): pass",
             r"clash with the dims")
     _raises(ref + "@knob('b', (1,))\n@meta(m=lambda q: q)\ndef f_k(x, *, a=1, b=1): pass",
             r"meta 'm' uses unknown")
     _raises(ref + "@knob('b', lambda q: (1,))\ndef f_k(x, *, a=1, b=1): pass",
             "outside the dims")
     _raises(ref + "@dim('b', (1,))\ndef f_k(x, *, a=1, b=1): pass", "@dim describes the problem")
-    _raises(ref + "@dim('q', (1,))\ndef f_test(n=1): pass", "must be distinct dims")
-    _raises(ref + "@dim('n', lambda: (1,))\ndef f_test(n): pass", "a sequence or a dict")
-    _raises(ref + "@no_capture('r')\ndef f_test(n=1): pass", "only @dim marks")
-    _raises(ref + "@knob('n', (1,))\ndef f_test(n=1): pass", "only @dim marks")
-    _raises(ref + "def f_test(n=1, seed=0): pass", "seed .* must be keyword-only")
-    _raises(ref + "def f_test(*a): pass", "named parameters only")
+    _raises(ref + "@dim('q', (1,))\ndef f_problem(n=1): pass", "must be distinct dims")
+    _raises(ref + "@dim('n', lambda: (1,))\ndef f_problem(n): pass", "a sequence or a dict")
+    _raises(ref + "@no_capture('r')\ndef f_problem(n=1): pass", "only @dim marks")
+    _raises(ref + "@knob('n', (1,))\ndef f_problem(n=1): pass", "only @dim marks")
+    _raises(ref + "def f_problem(n=1, seed=0): pass", "seed .* must be keyword-only")
+    _raises(ref + "def f_problem(*a): pass", "named parameters only")
     _raises(ref + "def f_check(out): pass", "does not take the arguments")
     _raises("def f_ref(x, *, out=None): pass\ndef f_check(out, expected, **_): pass",
             "multiple values for argument 'out'")
@@ -595,7 +595,7 @@ def test_convention_errors():
     _raises(ref + "@knob('b', ('1', '2'), id='{}')\ndef f_k(x, *, a=1, b=0): pass",
             "reads back")
     ok = _ops(ref + "def f_check(out, expected, **inputs): pass\ndef f_dims(x, *, a=1): pass\n")
-    assert list(ok["f"].impls) == [] and ok.f.check is not None and ok.f.dims is not None
+    assert list(ok["f"].solvers) == [] and ok.f.check is not None and ok.f.dims is not None
 
 
 def test_default_check():
@@ -628,7 +628,7 @@ TEST_TOY = ("from pyhip.kit.testing import op_tests\nfrom toy import ops\n"
 def test_generated_tests(pytester):
     _toy_project(pytester)
     res = pytester.runpytest("-q", "-p", "no:cacheprovider")
-    # n4 cases: dims + 5 tuned configs; n6 cases: dims + 3
+    # n4 problems: dims + 5 tuned configs; n6 problems: dims + 3
     res.assert_outcomes(passed=2 * 6 + 2 * 4)
     ids = pytester.runpytest("--collect-only", "-q").stdout.lines
     assert "test_toy.py::test_ops[axpy-n4-a1-tiled b4]" in ids
@@ -640,7 +640,7 @@ def test_generated_tests_without_table(pytester):
     pytester.makepyfile(toy=TOY)
     pytester.makepyfile(test_toy=TEST_TOY)
     res = pytester.runpytest("-q", "-p", "no:cacheprovider")
-    # every grid point must run: tiled b4 fails on the n6 cases
+    # every config must run: tiled b4 fails on the n6 problems
     res.assert_outcomes(passed=4 * 6 - 2, failed=2)
     res.stdout.fnmatch_lines(["*n=6 % block 4*"])
 
@@ -657,12 +657,12 @@ def test_toy_runs_without_pytest_helpers(toy):
     op = toy["ops"]["axpy"]
     with pytest.raises(TypeError, match=r"dims \['n'\] unset"):
         op_tests(op, op.problems("alpha"))
-    for _, case in op.problems("n", "alpha"):
-        inputs = op.test(**case)
-        assert op.dims(**inputs) == {k: case[k] for k in ("n", "alpha")}
+    for _, prob in op.problems("n", "alpha"):
+        inputs = op.problem(**prob)
+        assert op.dims(**inputs) == {k: prob[k] for k in ("n", "alpha")}
         expected = op.ref(**inputs)
-        for cfg in op.configs(case):
-            if cfg.get("block", 1) > 2 and case["n"] == 6:
+        for cfg in op.configs(prob):
+            if cfg.get("block", 1) > 2 and prob["n"] == 6:
                 with pytest.raises(AssertionError):
                     op.run(cfg, **inputs)
                 continue

@@ -94,8 +94,9 @@ def main(argv=None):
         core.quiet()
     case = core.case_from_args(a)
     rec = core.Recorder(a.out, a.name, core.run_meta("check", a))
-    bad = kb.check(TUNING, case.dims(), a.tokens, a.variants, seed=a.seed, repeats=a.repeats,
-                   graph=a.graph, bitwise=a.bitwise, diff_tol=core.DIFF_TOL, rec=rec,
+    bad = kb.check(TUNING, case.problem(), a.tokens, a.variants, seed=a.seed,
+                   repeats=a.repeats, graph=a.graph, bitwise=a.bitwise,
+                   diff_tol=core.DIFF_TOL, rec=rec,
                    inputs=lambda T, seed: case.interface(T, seed, a.local_experts_per_token),
                    alias=core.alias, unit="tokens", describe=case.describe())
     if bad:

@@ -8,10 +8,10 @@
 
 - **key**：`(model_dim, inter_dim, experts, experts_global, topk, routing, act)`，精确匹配。其中 `experts` 是本卡的专家数，`experts_global` 是全局专家数。
 - **分桶列** `~num_tokens`（`~` 标出分桶维）：调用时取第一个 ≥ token 数的点。
-- **每个 token 点保存全部候选**，不只保存最快的那个：
+- **每个 token 点保存全部配置**，不只保存最快的那个：
   - `us` 是各轮的中位数（冷 cache，每次调用换一份权重，不计 host 开销，见 `pyhip.kit.timing`）；
   - `cos` 是各轮与 fp32 参考之间最大的 cos 差；
-  - cos ≥ 5e-3 或运行时抛异常（kernel 不支持）的候选不写入。
+  - cos ≥ 5e-3 或运行时抛异常（kernel 不支持）的配置不写入。
 - **查表**：
   - 只用调用时那个 `act` 的行；没调过的 act 抛 `ValueError`（先 tune）；
   - 没有 `act` 列的表里 act 不是 key。
@@ -35,7 +35,7 @@
 
 **来源**：20261115 用下面的命令整表重新生成（脚本、日志和各卡的 CSV 在 `experiments/20261115_retune2/`）。
 - 原因是计时方式改了：每次调用换一份权重（`--copies`，默认 8 份）。刷 cache 挤不掉 MALL 里每次调用都读的权重，旧表在同一份权重上反复计时，W 走 cache 的配置显得快 5–13%（上级 README 10 节第 15 条）；旧表因此在 TP8 / TP4 的 6–128 tokens 选了 `g1bcm1`，新方式下比 `g1bcm2` 慢 5–7.7%。
-- EP8 的候选多了 `ep3k l128c`（W 走 cache 的 l128），≥6144 tokens 选中它。
+- EP8 的配置多了 `ep3k l128c`（W 走 cache 的 l128），≥6144 tokens 选中它。
 - 与旧表逐点的对比见 `experiments/20261115_retune2/compare_vs_head.txt`，总结见 `experiments/log_20261115.md`。
 
 **situv2 行**：
@@ -58,7 +58,7 @@
 cd pyhip/src/contrib/flydsl
 # 默认即上表的 6 个 problem（tune.JOBS）；token 点默认 tune.TOKENS
 python -m a8w4.tune tune-all --gpus 0-7 --out /tmp/a8w4_tune
-# 结束时打印被剔除的候选（BAD，正常为空；kernel 不支持的是 n/a，只在日志里计数），并合并成 /tmp/a8w4_tune/a8w4_moe_tuned.new.csv
+# 结束时打印被剔除的配置（BAD，正常为空；kernel 不支持的是 n/a，只在日志里计数），并合并成 /tmp/a8w4_tune/a8w4_moe_tuned.new.csv
 python -m a8w4.tune compare a8w4/configs/a8w4_moe_tuned.csv /tmp/a8w4_tune/a8w4_moe_tuned.new.csv
 cp /tmp/a8w4_tune/a8w4_moe_tuned.new.csv a8w4/configs/a8w4_moe_tuned.csv
 python -m a8w4.tune readme --write                 # 上级 README 7.2–7.4
@@ -84,7 +84,7 @@ python -m pytest a8w4/tests/test_a8w4_moe.py -q -p no:cacheprovider
 
 - **新 shape**：
   - 从一个 problem 出发用 `--set` 改 dim：`tune tp8-silu --set model_dim=6144 experts=384 experts_global=384`，EP 再改 `expert_offset`；
-  - 或者在 `ref.SHAPES`（`moe_test` 的 `@dim` shape）里加一项，它就成为 `TUNING` 的 problem（`<name>-silu` 等），也进了生成的测试；
+  - 或者在 `ref.SHAPES`（`moe_problem` 的 `@dim` shape）里加一项，它就成为 `TUNING` 的 problem（`<name>-silu` 等），也进了生成的测试；
   - 之后同样 `tune`（或 `tune-all <problem>`）再 `merge`。
 - **`--set routing=hot`**：结果写成另一组行，调用时用 `a8w4_moe(..., routing="hot")` 选这组。
 - **act**：可选值见 `ref.ACTS`（problem 名的后半段）。每个 shape 的每个 act 都要调：act 是精确匹配的 key。

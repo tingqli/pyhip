@@ -48,7 +48,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 from a8w4 import a8w4_moe  # noqa: E402
 from a8w4 import ref as R  # noqa: E402
 from a8w4.bench import dist as D  # noqa: E402
-from a8w4.moe import MOE, shape_dims  # noqa: E402
+from a8w4.moe import MOE, shape_problem  # noqa: E402
 
 WORLD = D.WORLD
 MODEL = (4096, 2048, 256, 8)  # MiMo-V2.6-Flash: hidden, moe_intermediate, experts, top-k
@@ -236,7 +236,7 @@ def _bench(layer, x, tw, ti, graphs, kind, iters, warmup, spin):
         late += (h1 > SPIN_US) + (h2 > SPIN_US)  # the GPU may have waited for the host
     if not graphs:
         layer.W = W
-    cfg = MOE.name_of(MOE.pick(shape_dims(SHAPE, x.shape[0], layer.act),
+    cfg = MOE.name_of(MOE.pick(shape_problem(SHAPE, x.shape[0], layer.act),
                                capturing=bool(graphs)))
     return dict(cfg=cfg, ar=layer.ar_path(x, kind), iso=iso, e2e=e2e, late=late)
 

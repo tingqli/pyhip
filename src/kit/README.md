@@ -4,13 +4,13 @@
 
 | 东西 | 放在哪里 |
 |---|---|
-| **问题**：接口、参考答案、数据怎么生成、怎么检查、从数据反推问题 | op 自己的函数 `<op>_ref`、`<op>_test`（`@dim`）、`<op>_check`、`<op>_dims` |
-| **解法**：每个 solver 和它的旋钮 | solver 函数 `<op>_<kind>`（`@knob`、`@meta`、`@no_capture`） |
+| **问题**：接口、参考答案、输入怎么生成、怎么检查、从输入反推问题 | op 自己的函数 `<op>_ref`、`<op>_problem`（`@dim`）、`<op>_check`、`<op>_dims` |
+| **解法**：每个 solver 和它的旋钮 | solver 函数 `<op>_<solver>`（`@knob`、`@meta`、`@no_capture`） |
 | **测试**：测哪些问题 | 测试文件里的一行 `op_tests(op, problems)` |
 | **调优**：调哪些问题、哪个维度分桶、取哪些点、表里存哪些维度 | 一个 `Tuning` 对象（使用者自己的小脚本） |
 | **分派**：去哪里查表 | `Registry(name, table=)`；key 和分桶维由表头说明 |
 
-由这些函数，kit 得到：配置网格和配置名、pytest 测试、在 GPU 上调优写出的 CSV 调优表、`op(...)` 按表分派，以及按配置名做 A/B 计时和正确性检查的实验工具。
+由这些函数，kit 得到：全部配置和配置名、pytest 测试、在 GPU 上调优写出的 CSV 调优表、`op(...)` 按表分派，以及按配置名做 A/B 计时和正确性检查的实验工具。
 
 kit 不规定 solver 用什么写（FlyDSL、Triton、HIP、torch 都行），也不要求声明 solver 的适用范围：跑不了某个问题时 solver 自己抛异常（`assert` 就够了），调优时这个配置记为 n/a，不进表。
 
@@ -37,32 +37,42 @@ kit 不规定 solver 用什么写（FlyDSL、Triton、HIP、torch 都行），�
 | 术语 | 含义 | 代码里 |
 |---|---|---|
 | **problem** | 一个具体问题 | 一组 dim 值（dict） |
-| **dim** | problem 的一个维度（形状、dtype、路由方式……） | `<op>_test` 的参数（`seed` 除外）；`@dim` 给某些 dim 命名取值 |
+| **dim** | problem 的一个维度（形状、dtype、路由方式……） | `<op>_problem` 的参数（`seed` 除外）；`@dim` 给某些 dim 命名取值 |
 | **key** | 查表时精确匹配的 dim | 表头里是 dim 名的列（由 `Tuning(keys=)` 写出） |
 | **bucket** | 查表时非精确匹配的那一个 dim（取 ≥ 调用值的第一个调优点） | 表头里的 `~<dim>` 列（由 `Tuning(bucket=)` 写出） |
-| **data** | 一个 problem 的接口参数 | `<op>_test` 的返回值、`<op>_ref` 的参数 |
-| **solver** | 一个实现，名字叫 kind | `<op>_<kind>` |
-| **knob** | solver 的调节旋钮 | solver 的仅限关键字参数；`@knob` 给出取值网格 |
-| **config** | 一个 kind 加上它的 knob 值 | `{"kind": ..., knob: ...}`，配置名 `"tiled b1024"` |
-| **override** | 网格以外的 knob（实验用） | solver 的 `**over` |
+| **inputs** | 一个 problem 的接口参数 | `<op>_problem` 的返回值、`<op>_ref` 的参数 |
+| **solver** | 一种解法：一个实现函数，名字是函数名里 `<op>_` 之后的部分 | `<op>_<solver>`（`axpy_tiled` 是 solver `tiled`） |
+| **knob** | solver 的调节旋钮 | solver 的仅限关键字参数；`@knob` 给出取值 |
+| **config** | 一个 solver 加上它每个 knob 的取值 | `{"solver": "tiled", "block": 1024}`，配置名 `"tiled b1024"` |
+| **override** | knob 以外的配置项（实验用） | solver 的 `**over` |
 | **table** | (key, bucket 点, config) → 测量值 | CSV |
+
+问题侧和解法侧用同样的方式声明：函数的参数是维度，函数上的标记给出取值。
+
+| | 问题侧 | 解法侧 |
+|---|---|---|
+| 声明在 | `<op>_problem` | `<op>_<solver>` |
+| 维度 | dim（参数，`seed` 除外） | knob（仅限关键字参数） |
+| 取值 | `@dim` | `@knob` |
+| 一组取值 | problem | config（再加上 solver 名） |
+| 枚举 | `op.problems(...)` | `op.configs(problem)` |
 
 各函数之间的关系：
 
 ```mermaid
 flowchart LR
-  P[problem] -->|_test| D[data]
+  P[problem] -->|_problem| D[inputs]
   D -->|_ref| A[参考答案]
   D -->|_dims| P
   P -->|调优表| S[config]
-  D --> I["_kind(data, config)"]
+  D --> I["_solver(inputs, config)"]
   S --> I
   I --> O[out]
   O --> C[_check]
   A --> C
 ```
 
-分派走一遍这个环：data → `<op>_dims` → problem → 查表 → config → `<op>_<kind>(data, config)`。
+分派走一遍这个环：inputs → `<op>_dims` → problem → 查表 → config → `<op>_<solver>(inputs, config)`。
 
 ## 2. 模块一览
 
@@ -74,7 +84,7 @@ flowchart LR
 | `pyhip.kit.timing` | torch | 冷 cache 计时：`flush_cache`、`copies`、`time_cold`、`Timer`、`interleaved`、`noise_band`、`verdict` |
 | `pyhip.kit.tune` | torch | `Tuning`；调优器和查表工具：`tune`、`show`、`verify`、`merge`、`tune_all` |
 | `pyhip.kit.bench` | torch | 按配置名做 A/B 计时（`ab`）和正确性检查（`check`），实验记录 |
-| `python -m pyhip.kit` | | 命令行：`problems`、`candidates`、`tune`、`merge`、`show`、`verify`、`tune-all`、`compare`（`kit.tune`），`ab`、`check`（`kit.bench`） |
+| `python -m pyhip.kit` | | 命令行：`problems`、`configs`、`tune`、`merge`、`show`、`verify`、`tune-all`、`compare`（`kit.tune`），`ab`、`check`（`kit.bench`） |
 
 `pyhip.kit` 本身不 import torch：只在 torch 已加载、CUDA 已初始化时才查询当前 stream 是否在 capture。
 
@@ -109,8 +119,8 @@ def axpy_ref(x, y, *, alpha=1.0):
 
 @op_register
 @dim("dtype", ("bf16", "fp32"), id="{}")
-def axpy_test(n, dtype="bf16", *, seed=0):
-    """A problem (dims n, dtype) -> its data. seed: the data's random seed, not a dim."""
+def axpy_problem(n, dtype="bf16", *, seed=0):
+    """A problem (dims n, dtype) -> its inputs. seed: the inputs' random seed, not a dim."""
     g = torch.Generator(device="cuda").manual_seed(seed)
     x = torch.randn(n, device="cuda", generator=g).to(DTYPES[dtype])
     y = torch.randn(n, device="cuda", generator=g).to(DTYPES[dtype])
@@ -119,7 +129,7 @@ def axpy_test(n, dtype="bf16", *, seed=0):
 
 @op_register
 def axpy_dims(x, y, *, alpha=1.0):
-    """Data -> the dims of a real call (and the place to check its arguments)."""
+    """Inputs -> the dims of a real call (and the place to check its arguments)."""
     assert x.shape == y.shape and x.dtype == y.dtype, (x.shape, x.dtype, y.shape, y.dtype)
     return dict(n=x.numel(), dtype={v: k for k, v in DTYPES.items()}[x.dtype])
 
@@ -154,8 +164,8 @@ def axpy_tiled(x, y, *, alpha=1.0, block=1024):
 要点：
 
 - `axpy_ref` 定义 op `axpy`：参数就是接口（`x, y, alpha`），返回值是参考答案。
-- `axpy_test` 的参数 `n, dtype` 是 dim。`@dim("dtype", ...)` 给 dtype 的取值命名，测试和调优按名字引用它；`n` 没有 `@dim`，可以取任意值。`seed` 是数据的随机种子，不是 dim。
-- `axpy_tiled` 的 `block` 是 knob，取值网格由 `@knob` 给出。
+- `axpy_problem` 的参数 `n, dtype` 是 dim。`@dim("dtype", ...)` 给 dtype 的取值命名，测试和调优按名字引用它；`n` 没有 `@dim`，可以取任意值。`seed` 是输入的随机种子，不是 dim。
+- `axpy_tiled` 是 solver `tiled`，它的 `block` 是 knob，取值由 `@knob` 给出。
 - `tiled` 的限制（最多 64 块）不另外声明：跑不了就 `assert`。
 - `Registry` 只说明分派去哪里查表；表的 key 和分桶维写在表头里（第 6 节）。
 
@@ -180,7 +190,7 @@ from axpy_ops import ops
 from pyhip.kit import dim
 from pyhip.kit.testing import op_tests
 
-# the problems to test: two sizes x every dtype of axpy_test's @dim
+# the problems to test: two sizes x every dtype of axpy_problem's @dim
 test_axpy = op_tests(ops.axpy, ops.axpy.problems(dim("n", (1000, 65536), id="n{}"), "dtype"))
 ```
 
@@ -190,7 +200,7 @@ test_axpy = op_tests(ops.axpy, ops.axpy.problems(dim("n", (1000, 65536), id="n{}
 >>> from axpy_ops import ops
 >>> op = ops.axpy                      # 也可以写 ops["axpy"]
 >>> op, op.dim_names
-(Op('axpy', impls=['torch', 'tiled']), ('n', 'dtype'))
+(Op('axpy', solvers=['torch', 'tiled']), ('n', 'dtype'))
 >>> op.problems("dtype")               # 按名字引用 @dim；没给的 dim：默认值，没有默认值则 None
 [('bf16', {'n': None, 'dtype': 'bf16'}), ('fp32', {'n': None, 'dtype': 'fp32'})]
 >>> op.problems(("dtype", ["fp32"]), dim("n", (64, 128), id="n{}"))   # 选部分取值；临时的轴
@@ -198,7 +208,7 @@ test_axpy = op_tests(ops.axpy, ops.axpy.problems(dim("n", (1000, 65536), id="n{}
 >>> [op.name_of(c) for c in op.configs(dict(n=4096, dtype="bf16"))]
 ['torch', 'tiled b1024', 'tiled b16384']
 >>> op.parse("tiled b16384")
-{'kind': 'tiled', 'block': 16384}
+{'solver': 'tiled', 'block': 16384}
 >>> op.meta(op.parse("tiled b1024"), "tiles", dict(n=4096))
 4
 ```
@@ -209,7 +219,7 @@ test_axpy = op_tests(ops.axpy, ops.axpy.problems(dim("n", (1000, 65536), id="n{}
 $ python -m pyhip.kit problems axpy_tune:TUNING
 bf16 {'dtype': 'bf16'}
 fp32 {'dtype': 'fp32'}
-$ python -m pyhip.kit candidates axpy_tune:TUNING bf16
+$ python -m pyhip.kit configs axpy_tune:TUNING bf16
 torch
 tiled b1024
 tiled b16384
@@ -219,7 +229,7 @@ tiled b16384
 
 ```
 $ python -m pyhip.kit tune axpy_tune:TUNING bf16           # 默认：TUNING 的 points 和表
-[02:03:56] axpy bf16 {'dtype': 'bf16'}: 3 candidates, 8 copies of ['x', 'y']
+[02:03:56] axpy bf16 {'dtype': 'bf16'}: 3 configs, 8 copies of ['x', 'y']
 [02:03:57] n   1000: torch 6.0 | tiled b1024 6.0 | tiled b16384 6.0
 [02:03:57] n   4096: torch 5.9 | tiled b16384 5.9 | tiled b1024 14.2
 [02:03:57] n 1048576: torch 6.2 | tiled b16384 130.1  (1 n/a: AssertionError)
@@ -267,7 +277,7 @@ $ python -m pyhip.kit tune-all axpy_tune:TUNING --gpus 0-1 --per-job 1 --out /tm
 [02:04:41] bf16: GPUs [0], 3 points
 [02:04:41] fp32: GPUs [1], 3 points
 [02:04:47] all jobs done in 0.1 min
-no BAD candidates
+no BAD configs
 merged 16 rows from 2 files into /tmp/kitdemo/all/axpy_tuned.new.csv
 next: python -m pyhip.kit compare /tmp/kitdemo/axpy_tuned.csv /tmp/kitdemo/all/axpy_tuned.new.csv
       cp /tmp/kitdemo/all/axpy_tuned.new.csv /tmp/kitdemo/axpy_tuned.csv
@@ -284,11 +294,11 @@ from axpy_ops import ops
 
 x = torch.randn(3000, device="cuda", dtype=torch.bfloat16)
 y = torch.randn_like(x)
-out = ops.axpy(x, y, alpha=2.0)                          # dims -> {n: 3000, dtype: bf16} -> 调优点 4096 最快的配置
+out = ops.axpy(x, y, alpha=2.0)                          # axpy_dims -> {n: 3000, dtype: bf16} -> 调优点 4096 最快的配置
 out = ops.axpy(x, y, alpha=2.0, config="tiled b1024")    # 指定配置（名字或 dict），不查表
-ops.axpy.pick(dict(n=3000, dtype="bf16"))                # {'kind': 'torch'}
+ops.axpy.pick(dict(n=3000, dtype="bf16"))                # {'solver': 'torch'}
 [ops.axpy.name_of(c) for c in ops.axpy.tuned(dict(n=3000, dtype="bf16"))]
-# ['torch', 'tiled b16384', 'tiled b1024']：pick 的候选，最快的在前
+# ['torch', 'tiled b16384', 'tiled b1024']：pick 从这些配置里选，最快的在前
 ops.axpy(x, y, table=None)
 # ValueError: axpy: no tuned config for {'n': 3000, 'dtype': 'bf16'} (no table): tune it, or pass config=
 ```
@@ -345,22 +355,22 @@ $ python -m pyhip.kit check axpy_tune:TUNING fp32 -t 1000 1000000 -v @table "til
 
 | 函数 | 角色 | 签名 | 用途 |
 |---|---|---|---|
-| `<op>_ref` | 接口 + 参考答案（必需，最先注册） | 只有具名参数（不能有 `/`、`*args`、`**kwargs`，不能叫 `config` / `table`） | data → 参考答案；参数就是接口 |
-| `<op>_test` | problem → data（在 solver 之前注册） | 只有具名参数；`seed` 若有，必须是带默认值的仅限关键字参数 | 参数（`seed` 除外）就是 dim；返回一个 problem 的接口参数 dict |
+| `<op>_ref` | 接口 + 参考答案（必需，最先注册） | 只有具名参数（不能有 `/`、`*args`、`**kwargs`，不能叫 `config` / `table`） | inputs → 参考答案；参数就是接口 |
+| `<op>_problem` | problem → inputs（在 solver 之前注册） | 只有具名参数；`seed` 若有，必须是带默认值的仅限关键字参数 | 参数（`seed` 除外）就是 dim；返回一个 problem 的接口参数 dict |
 | `<op>_check` | 检查（可选） | `(out, expected, **inputs)`，前两个按位置传 | 结果错就抛异常；可返回误差指标 dict（第一项是工具报告的列）。默认 `torch.testing.assert_close`（先把 expected 转成 out 的 dtype） |
-| `<op>_dims` | data → problem（分派需要） | 接受 ref 的参数 | 返回 `{dim: 值}`；`op(...)` 每次调用都会调用它（包括传了 `config=` 时），所以这里也是检查参数的地方 |
-| `<op>_<kind>` | solver `kind` | 先是和 ref **完全相同**的参数（名字、种类、默认值），然后是带默认值的仅限关键字 knob，最后可选 `**over` | (data, config) → out |
+| `<op>_dims` | inputs → problem（分派需要） | 接受 ref 的参数 | 返回 `{dim: 值}`；`op(...)` 每次调用都会调用它（包括传了 `config=` 时），所以这里也是检查参数的地方 |
+| `<op>_<solver>` | solver（名字就是后缀） | 先是和 ref **完全相同**的参数（名字、种类、默认值），然后是带默认值的仅限关键字 knob，最后可选 `**over` | (inputs, config) → out |
 
-后缀 `ref`、`test`、`check`、`dims` 是保留的；solver 名也不能以 `_test` / `_check` / `_dims` 结尾。以 `_` 开头的函数不注册。
+后缀 `ref`、`problem`、`check`、`dims` 是保留的；solver 名也不能以 `_problem` / `_check` / `_dims` 结尾。以 `_` 开头的函数不注册。
 
-`<op>_dims` 只能反推 data 里看得出来的 dim（形状、dtype）。数据看不出来的负载性质（a8w4 的 `routing`：一次调用的 `topk_ids` 看不出是 uniform 还是 hot）由调用方作为关键字参数（提示）传入，不传时按 `<op>_test` 的默认值匹配（第 6 节）。
+`<op>_dims` 只能反推输入里看得出来的 dim（形状、dtype）。输入看不出来的负载性质（a8w4 的 `routing`：一次调用的 `topk_ids` 看不出是 uniform 还是 hot）由调用方作为关键字参数（提示）传入，不传时按 `<op>_problem` 的默认值匹配（第 6 节）。
 
 ### 4.2 配置和配置名
 
-配置是 dict：`{"kind": solver 名, knob: 值, ...}`。配置名把 kind 和各个 `@knob` 的 id 用空格连起来，例如 `"tiled b1024"`、`"tp2k bm32 g1bcm2 g2nt4"`；带 `**over` 的 solver 可以在名字后面接覆盖项 `":k=v,k=v"`（例如 `"ep3k m64:g2.pf=1"`）。
+配置是 dict：`{"solver": solver 名, knob: 值, ...}`。配置名把 solver 名和各个 `@knob` 的 id 用空格连起来，例如 `"tiled b1024"`、`"tp2k bm32 g1bcm2 g2nt4"`；带 `**over` 的 solver 可以在名字后面接覆盖项 `":k=v,k=v"`（例如 `"ep3k m64:g2.pf=1"`）。
 
 - `op.name_of(cfg)` 打印名字，`op.parse(name)` 解析回来（knob 按默认值的类型转换；覆盖项转成 int、float 或 str）。
-- 注册时会检查每个静态网格值打印后能读回原值，因此 id 里的取值不能含空格或 `:`。
+- 注册时会检查每个静态的 knob 取值打印后能读回原值，因此 id 里的取值不能含空格或 `:`。
 
 ### 4.3 限制：solver 自己抛异常
 
@@ -376,7 +386,7 @@ kit 不提供“这个配置能不能跑”的声明。solver 遇到跑不了的
 
 标记只把自己记在 `f.kit_marks` 里并原样返回 `f`；`@op_register` 必须写在最外层（它注册时检查下面的标记，写在它上面的标记会报错）。
 
-**`@dim(names, values, id=None, name=None)`**（只用在 `<op>_test` 上，或作为 `op.problems` 的临时轴）：给 dim 的取值命名。它只说明有哪些取值、叫什么，不决定测哪些、调哪些。
+**`@dim(names, values, id=None, name=None)`**（只用在 `<op>_problem` 上，或作为 `op.problems` 的临时轴）：给 dim 的取值命名。它只说明有哪些取值、叫什么，不决定测哪些、调哪些。
 
 ```python
 @dim("act", ("silu", "gelu"), id="{}")                       # 一列值；id 是只有一个 {} 的格式串（默认 name + "{}"）
@@ -385,22 +395,22 @@ kit 不提供“这个配置能不能跑”的声明。solver 遇到跑不了的
                                                               # 多个 dim 一起：dict，并且要有轴名
 ```
 
-单个 dim 的轴名就是它自己；多个 dim 一起的轴在 `<op>_test` 上必须给 `name=`，`op.problems` 按轴名引用它。
+单个 dim 的轴名就是它自己；多个 dim 一起的轴在 `<op>_problem` 上必须给 `name=`，`op.problems` 按轴名引用它。
 
-**`@knob(names, values, id=None)`**（只用在 solver 上）：knob 的取值网格。多个 `@knob` 取笛卡尔积，写在最上面的是最外层。取值也可以是 dim 的函数（只有 knob 可以）：
+**`@knob(names, values, id=None)`**（只用在 solver 上）：knob 的取值。多个 `@knob` 取笛卡尔积（每个组合是一个配置），写在最上面的是最外层。取值也可以是 dim 的函数（只有 knob 可以）：
 
 ```python
 @knob("bm", (32, 64), id="bm{}")
 @knob("split", lambda inter_dim: (1, 2, 4) if inter_dim > 256 else (1,), id="ks{}")
 ```
 
-**`@meta(**items)`**：给工具读的 solver 元数据，用 `op.meta(cfg, key, dims)` 读。值可以是常量，也可以是 dim 和 knob 的函数；带 `**over` 的函数还会收到配置的覆盖项：
+**`@meta(**items)`**：给工具读的 solver 元数据，用 `op.meta(cfg, name, problem)` 读。值可以是常量，也可以是 dim 和 knob 的函数；带 `**over` 的函数还会收到配置的覆盖项：
 
 ```python
 @meta(tile_m=lambda block_m: block_m, cached_loads=lambda g1_bcm: g1_bcm != 2)
 ```
 
-kit 自己读的只有 `cached_loads`（`kit.bench` 用它判断计时协议是否会偏向这个配置，第 11 节）；其他 key 由使用方约定（例如 a8w4 的 `tile_m`）。
+kit 自己读的只有 `cached_loads`（`kit.bench` 用它判断计时协议是否会偏向这个配置，第 11 节）；其他项由使用方约定（例如 a8w4 的 `tile_m`）。
 
 **`@no_capture(reason)`**：这个 solver 不能在 CUDA graph capture 中运行（例如把 host 计数器作为 launch 参数传入）。当前 stream 正在 capture 时，分派跳过它，选下一个最快的；`op.capturable(cfg)` 返回 False；`bench check --graph` 把它记为 n/a。
 
@@ -426,33 +436,33 @@ op_register = ops.register
 ```
 
 - `Registry.register(f)` 按函数名把 `f` 加进它的 op，检查约定，原样返回 `f`。违反约定时抛 `TypeError`，op 保持不变。
-- 顺序：`<op>_ref` 最先；`<op>_test` 在所有 solver 之前（solver 要按它的 dim 检查）；嵌套的 op（`moe_dyn`）要在它的 solver 之前注册 `moe_dyn_ref`。
-- 用错位置的标记在注册时报错：`@dim` 写在 solver 上、`@knob` 写在 `<op>_test` 上。
+- 顺序：`<op>_ref` 最先；`<op>_problem` 在所有 solver 之前（solver 要按它的 dim 检查）；嵌套的 op（`moe_dyn`）要在它的 solver 之前注册 `moe_dyn_ref`。
+- 用错位置的标记在注册时报错：`@dim` 写在 solver 上、`@knob` 写在 `<op>_problem` 上。
 - 读取：`Registry` 是 `{op 名: Op}` 的 Mapping（按注册顺序），也可以用属性：`ops.moe is ops["moe"]`。
 - 同一个包被以两个模块名导入时，会有两个互不相干的注册表。
 
 ## 5. Registry 和 Op
 
-`Registry(name=None, *, table=None)`：`table` 是分派读的调优表；None 表示没有表（`op(...)` 必须传 `config=`，测试跑整个网格）。调优的设置不在这里，在 `Tuning`（第 8 节）。
+`Registry(name=None, *, table=None)`：`table` 是分派读的调优表；None 表示没有表（`op(...)` 必须传 `config=`，测试跑全部配置）。调优的设置不在这里，在 `Tuning`（第 8 节）。
 
 | `Op` 的方法 / 属性 | 说明 |
 |---|---|
-| `name`、`ref`、`test`、`check`、`dims` | 名字和各角色的函数（没有时为 None） |
-| `impls` | `{kind: solver 函数}`（只读） |
-| `dim_names` | dim 名（`<op>_test` 的参数名，`seed` 除外） |
+| `name`、`ref`、`problem`、`check`、`dims` | 名字和各角色的函数（没有时为 None） |
+| `solvers` | `{solver 名: solver 函数}`（只读） |
+| `dim_names` | dim 名（`<op>_problem` 的参数名，`seed` 除外） |
 | `registry` | 所属的 `Registry` |
-| `problems(*axes)` | `[(id, problem)]`：各轴的笛卡尔积，第一个轴在最外层。轴可以是 `<op>_test` 上 `@dim` 的轴名（全部取值）、`(轴名, [id, ...])`（这些取值，按给出的顺序），或者一个 `dim(...)`（临时的轴）。没给的 dim 取 `<op>_test` 的默认值，没有默认值则为 None。id 用 `-` 连接各轴的 id |
-| `configs(dims)` | 所有 solver 的所有网格点，按定义顺序（`dims` 提供 `@knob` 取值函数用到的 dim）；能不能在 `dims` 上跑，要跑了才知道 |
+| `problems(*axes)` | `[(id, problem)]`：各轴的笛卡尔积，第一个轴在最外层。轴可以是 `<op>_problem` 上 `@dim` 的轴名（全部取值）、`(轴名, [id, ...])`（这些取值，按给出的顺序），或者一个 `dim(...)`（临时的轴）。没给的 dim 取 `<op>_problem` 的默认值，没有默认值则为 None。id 用 `-` 连接各轴的 id |
+| `configs(problem)` | 所有 solver 的所有配置（每个 knob 取遍 `@knob` 的值），按定义顺序（`problem` 提供 `@knob` 取值函数用到的 dim）；能不能在 `problem` 上跑，要跑了才知道 |
 | `name_of(cfg)` / `parse(name)` | 配置 ↔ 配置名 |
 | `run(cfg, *args, **kwargs)` | 用 `cfg` 的 knob（和覆盖项）调用对应 solver |
-| `meta(cfg, key, dims=None)` | `@meta` 的 `key`；函数在 `dims`、knob 和覆盖项上求值 |
+| `meta(cfg, name, problem=None)` | `@meta` 的 `name` 项；函数在 `problem`、knob 和覆盖项上求值 |
 | `capturable(cfg)` | solver 有没有 `@no_capture` |
-| `tuned(dims, table=)` | 查表得到的候选配置，最快的在前；没有行时为 `[]` |
-| `pick(dims, table=, capturing=False)` | `op(...)` 会运行的配置：`tuned` 里第一个能在当前 capture 状态下运行的；没有时 `ValueError` |
-| `points(dims, table=)` | `[(分桶值, [(us, cfg), ...])]`：这个 key 的所有调优点 |
+| `tuned(problem, table=)` | 查表得到的配置（`pick` 从中选），最快的在前；没有行时为 `[]` |
+| `pick(problem, table=, capturing=False)` | `op(...)` 会运行的配置：`tuned` 里第一个能在当前 capture 状态下运行的；没有时 `ValueError` |
+| `points(problem, table=)` | `[(分桶值, [(us, cfg), ...])]`：这个 key 的所有调优点 |
 | `op(*args, config=None, table=..., **kwargs)` | 运行 op，见第 6 节 |
 
-`dims` 参数是包含全部 dim 名的 dict（未知的值写 None）。`table=` 默认用注册表的表，也可以传另一个路径，或 None（不用表）。
+`problem` 参数是包含全部 dim 名的 dict（未知的值写 None）。`table=` 默认用注册表的表，也可以传另一个路径，或 None（不用表）。
 
 ## 6. 分派：查调优表
 
@@ -462,10 +472,10 @@ op_register = ops.register
 2. `pick` 选配置，然后运行。
 3. 传 `config=`（dict 或名字）时不查表，但仍调用 `<op>_dims` 检查参数。没有 `<op>_dims` 时只能传 `config=`。
 
-`pick(dims)` 查表的规则：
+`pick(problem)` 查表的规则：
 
-- **表头说明怎么匹配**。列名是 dim 名的列是 **key**，精确匹配；列名是 `~<dim>` 的列（最多一个）是 **bucket**，非精确匹配；`config` 列是配置名，`us` 列是时间；其余列忽略。kind 不是这个 op 的 solver 的行跳过（几个 op 可以共用一张表）。
-- `dims` 中值为 None 的 key 按 `<op>_test` 的默认值匹配。
+- **表头说明怎么匹配**。列名是 dim 名的列是 **key**，精确匹配；列名是 `~<dim>` 的列（最多一个）是 **bucket**，非精确匹配；`config` 列是配置名，`us` 列是时间；其余列忽略。配置名不属于这个 op 的 solver 的行跳过（几个 op 可以共用一张表）。
+- `problem` 中值为 None 的 key 按 `<op>_problem` 的默认值匹配。
 - bucket：取 ≥ 调用值的第一个调优点，比所有点都大时取最大的点。以 `points=(1000, 4096, 1 << 20)` 为例：
 
   | 调用的 n | 用哪个点的行 |
@@ -475,7 +485,7 @@ op_register = ops.register
   | 4097 – 1048576 | 1048576 |
   | > 1048576 | 1048576（最大的点） |
 
-- 这个 key 和点上的行按 `us` 从快到慢就是 `tuned(dims)`；`pick` 返回第一个，当前 stream 在 capture 时跳过 `@no_capture` 的 solver。都没有时抛 `ValueError`，消息里写明是没有调优行，还是所有候选都不能 capture。
+- 这个 key 和点上的行按 `us` 从快到慢就是 `tuned(problem)`；`pick` 返回第一个，当前 stream 在 capture 时跳过 `@no_capture` 的 solver。都没有时抛 `ValueError`，消息里写明是没有调优行，还是这些配置都不能 capture。
 
 缓存：
 
@@ -495,7 +505,7 @@ test_axpy = op_tests(ops.axpy, ops.axpy.problems(dim("n", (1000, 65536), id="n{}
 `op_tests(op, problems, *, table=<注册表的表>)` 必须传入要测的 problem（`op.problems(...)`；每个没有默认值的 dim 都要有值）。对每个 problem 生成：
 
 - `<op>-<problem>-dims`：`<op>_dims(**inputs)` 和 problem 一致（有 `<op>_dims` 时）；
-- `<op>-<problem>-<配置名>`：`op.run(cfg, **inputs)`，再用 `<op>_check` 和 `<op>_ref` 比较。有调优表时，配置是 `op.tuned(problem)`（分派可能选到的那些；没有行就没有这些项）；`table=None` 时是整个网格（都必须能跑）。
+- `<op>-<problem>-<配置名>`：`op.run(cfg, **inputs)`，再用 `<op>_check` 和 `<op>_ref` 比较。有调优表时，配置是 `op.tuned(problem)`（分派可能选到的那些；没有行就没有这些项）；`table=None` 时是全部配置（都必须能跑）。
 
 problem 逐个运行，当前 problem 的输入和参考答案只算一次，换到下一个时释放。用 `-k` 选择，例如 `-k "tp8 and tiled"`。一个 op 一次调用；多个 op 就写多个测试函数（a8w4：`test_moe`、`test_moe_dyn`）。
 
@@ -526,13 +536,13 @@ TUNING = Tuning(op, *, problems, bucket, points, keys=None, rotate=(), table=<�
 
 三个来源，后面的覆盖前面的：
 
-1. **Tuning 的 problem**：`problems` 里的一个；没给的 dim 取 `<op>_test` 的默认值。`problems` 命令列出全部 problem 和它们的值。
-2. **`--set name=value ...`**：覆盖 problem 里任意一个 dim。名字必须是 dim；knob 不能 set（knob 由网格枚举），`seed` 也不能（它不是 dim，调优器把它设为 101 × 点 + 轮次）。值按 `<op>_test` 默认值的类型转换；没有默认值时依次尝试 int、float，否则当作 str。
+1. **Tuning 的 problem**：`problems` 里的一个；没给的 dim 取 `<op>_problem` 的默认值。`problems` 命令列出全部 problem 和它们的值。
+2. **`--set name=value ...`**：覆盖 problem 里任意一个 dim。名字必须是 dim；knob 不能 set（knob 的取值由 `@knob` 枚举），`seed` 也不能（它不是 dim，调优器把它设为 101 × 点 + 轮次）。值按 `<op>_problem` 默认值的类型转换；没有默认值时依次尝试 int、float，否则当作 str。
 3. **分桶维**：取 `-t` 的每个值，不写 `-t` 时用 `Tuning(points=)`；即使对分桶维用了 `--set` 也会被覆盖。
 
 ```
 $ python -m pyhip.kit tune axpy_tune:TUNING bf16 --set dtype=fp32 -t 2048 --out set.csv
-[02:05:24] axpy bf16 {'dtype': 'fp32'}: 3 candidates, 8 copies of ['x', 'y']
+[02:05:24] axpy bf16 {'dtype': 'fp32'}: 3 configs, 8 copies of ['x', 'y']
 [02:05:25] n   2048: torch 6.5 | tiled b16384 6.5 | tiled b1024 8.7
 $ head -2 set.csv
 dtype,~n,config,us,err
@@ -541,13 +551,13 @@ $ python -m pyhip.kit tune axpy_tune:TUNING bf16 --set block=4
 --set 'block=4': expected name=value, name in ['n', 'dtype']
 ```
 
-`candidates`、`show`、`verify`、`tune-all`（作用于每个 problem）和 `ab`、`check` 也接受同样的 `--set`。a8w4 的写法相同，例如 `python -m a8w4.tune tune tp8-silu --set routing=hot -t 1 2 4 --out /tmp/p.csv`。
+`configs`、`show`、`verify`、`tune-all`（作用于每个 problem）和 `ab`、`check` 也接受同样的 `--set`。a8w4 的写法相同，例如 `python -m a8w4.tune tune tp8-silu --set routing=hot -t 1 2 4 --out /tmp/p.csv`。
 
 注意：
 
 - **只有 key 列进表**：`--set` 一个不在 `keys` 里的 dim（例如 a8w4 的 `expert_offset`）只改变输入，不改变表里的 key。
-- **调出来的行要能被分派选中**：调用时的 key 来自 `<op>_dims` 的返回值和调用时传的提示；`<op>_dims` 不返回的 dim 按 `<op>_test` 的默认值匹配。所以用 `--set routing=hot` 调出来的行，只有 `ops.moe(..., routing="hot")` 这样的调用才会选中。
-- **长期使用的值放进 Tuning**：`--set` 适合临时、一次性的调优。一个 shape 要长期保留时，把它加进 `<op>_test` 的 `@dim` 取值并在 `Tuning(problems=)` 里引用：它会成为新的 problem，`tune-all` 会自动调它；测试文件里引用它，生成的测试也会覆盖它。
+- **调出来的行要能被分派选中**：调用时的 key 来自 `<op>_dims` 的返回值和调用时传的提示；`<op>_dims` 不返回的 dim 按 `<op>_problem` 的默认值匹配。所以用 `--set routing=hot` 调出来的行，只有 `ops.moe(..., routing="hot")` 这样的调用才会选中。
+- **长期使用的值放进 Tuning**：`--set` 适合临时、一次性的调优。一个 shape 要长期保留时，把它加进 `<op>_problem` 的 `@dim` 取值并在 `Tuning(problems=)` 里引用：它会成为新的 problem，`tune-all` 会自动调它；测试文件里引用它，生成的测试也会覆盖它。
 
 ### 8.3 命令
 
@@ -558,7 +568,7 @@ python -m pyhip.kit <命令> <模块>:<Tuning 名> [参数...] [选项]
 | 命令 | 用法 | 作用 |
 |---|---|---|
 | `problems` | `problems M:T` | 列出调优的 problem |
-| `candidates` | `candidates M:T P [-t V]` | 列出网格配置（取值函数用第一个点或 `-t` 的值） |
+| `configs` | `configs M:T P [-t V]` | 列出全部配置（knob 的取值函数用第一个点或 `-t` 的值） |
 | `tune` | `tune M:T P [-t V ...] [--out T.csv]` | 在每个点上调优，合并进 `--out`（默认 `--table`，再默认 Tuning 的表） |
 | `merge` | `merge M:T A.csv B.csv ...` | 把若干张表合并进 `--table`（默认 Tuning 的表） |
 | `show` | `show M:T P [--table T]` | Markdown 表：每个调优点最快的配置、每个 solver 最快的配置、capture 时的选择（与最快的不同时） |
@@ -573,8 +583,8 @@ python -m pyhip.kit <命令> <模块>:<Tuning 名> [参数...] [选项]
 
 **`tune`**（每个点）：
 
-1. 跑 `--rounds` 轮，每轮用新的输入（`<op>_test`，seed = 101 × 点 + 轮次）。
-2. 每轮里每个网格配置运行一次：抛异常记为 n/a（这个点上不再尝试）；`<op>_check` 失败记为 BAD；通过的用 `kit.timing.time_cold` 冷 cache 计时，`rotate` 的输入在 `--copies` 份副本间轮换。各配置交错计时。
+1. 跑 `--rounds` 轮，每轮用新的输入（`<op>_problem`，seed = 101 × 点 + 轮次）。
+2. 每轮里每个配置运行一次：抛异常记为 n/a（这个点上不再尝试）；`<op>_check` 失败记为 BAD；通过的用 `kit.timing.time_cold` 冷 cache 计时，`rotate` 的输入在 `--copies` 份副本间轮换。各配置交错计时。
 3. 跑通并通过检查的配置都写进表：`us` 是各轮的中位数，指标列是各轮最差的值。
 4. 日志每个点一行：最快的三个配置、BAD 的原因、n/a 的个数和异常类型。
 
@@ -594,8 +604,8 @@ python -m pyhip.kit <命令> <模块>:<Tuning 名> [参数...] [选项]
 ```python
 from pyhip.kit import tune as kt
 
-c = TUNING.problem("bf16", ["dtype=fp32"])        # {'n': None, 'dtype': 'fp32'}
-kt.tune(TUNING, c, [2048], "out.csv")
+prob = TUNING.problem("bf16", ["dtype=fp32"])     # {'n': None, 'dtype': 'fp32'}
+kt.tune(TUNING, prob, [2048], "out.csv")
 ```
 
 ## 9. 表文件：kit.table
@@ -635,9 +645,9 @@ verdict(delta_pct, band)                           # "~" / "faster" / "slower"
 |---|---|---|
 | `coldrot` | 读 512 MB 刷 L2，GPU sleep，每次调用读下一份副本 | **唯一和模型一致的协议**（副本数 ≥ `MIN_COPIES` = 8） |
 | `rotate` | 副本连续调用，不刷 | 受上一次调用留在 MALL 里的数据影响 |
-| `cold` | 刷 L2 + sleep，每次读同一份输入 | MALL 保留输入，走 cache 读的实现会显得快 5–13% |
+| `cold` | 刷 L2 + sleep，每次读同一份输入 | MALL 保留输入，走 cache 读的 solver 会显得快 5–13% |
 | `bigread` | 读 2 GB 刷 + sleep，同一份输入 | 偏差同 `cold` |
-| `wflush` | 写 512 MB 再读，同一份输入 | 留下脏行，走 cache 读的实现显得慢 9–48% |
+| `wflush` | 写 512 MB 再读，同一份输入 | 留下脏行，走 cache 读的 solver 显得慢 9–48% |
 | `warm` | 不刷，同一份输入 | |
 
 - `flush_cache()`：读 512 MB。这能用干净的行挤掉 L2，但挤不掉每次调用都会再读的、留在 256 MB MALL 里的数据，所以要靠副本轮换。
@@ -653,7 +663,7 @@ python -m pyhip.kit ab    M:T P -t V [V ...] -v SPEC [SPEC ...] [选项]
 python -m pyhip.kit check M:T P -t V [V ...] -v SPEC [SPEC ...] [选项]
 ```
 
-problem、`--set` 和输入都和 `kit.tune` 相同（同一个 `Tuning`）：每个 `-t` 值作为分桶值，输入由 `<op>_test` 生成（seed = `--seed` + 值，ab 的第 s 个样本再加 1000 × s），计时时轮换 `rotate` 的输入。参考答案来自 `<op>_ref`，比较用 `<op>_check`（它返回的第一个指标就是报告里的列，例如 `err`、`cos`）。
+problem、`--set` 和输入都和 `kit.tune` 相同（同一个 `Tuning`）：每个 `-t` 值作为分桶值，输入由 `<op>_problem` 生成（seed = `--seed` + 值，ab 的第 s 个样本再加 1000 × s），计时时轮换 `rotate` 的输入。参考答案来自 `<op>_ref`，比较用 `<op>_check`（它返回的第一个指标就是报告里的列，例如 `err`、`cos`）。
 
 **变体写法**：
 
@@ -688,7 +698,7 @@ problem、`--set` 和输入都和 `kit.tune` 相同（同一个 `Tuning`）：�
 from pyhip.kit import bench as kb
 
 v = kb.parse_variant(op, "pf1=ep3k m64:g2.pf=1", alias=None)   # -> Variant
-r = kb.resolve(op, v, dims)             # -> Resolved(label, spec, config, run(inputs), cfg, cached)，或 str（没有调优配置）
+r = kb.resolve(op, v, problem)          # -> Resolved(label, spec, config, run(inputs), cfg, cached)，或 str（没有调优配置）
 kb.ab(TUNING, problem, points, specs, protocols=("coldrot",), rounds=5, iters=16, samples=1,
       seed=7, dup=True, allow_biased=False, ref=True, bitwise=False, diff_tol=None, ncopies=8,
       rec=None, inputs=None, annotate=None, alias=None, unit=None, describe=None)
@@ -699,7 +709,7 @@ rec = kb.Recorder(out_dir, name, kb.run_meta(tool, args, prog="python -m mypkg.b
 
 几个钩子：
 
-- `inputs(value, seed) -> 接口参数 dict`：替换 `<op>_test`，例如生成特殊的路由分布。
+- `inputs(value, seed) -> 接口参数 dict`：替换 `<op>_problem`，例如生成特殊的路由分布。
 - `annotate(inputs, resolved) -> (标题后缀, 记录字段)`：给每个样本加说明，例如路由到本地 expert 的行数。
 - `alias(base) -> 配置名`：base 的简写，例如 a8w4 允许直接写 ep3k 的预设名 `l128`。
 - `unit`：标题里分桶值的单位名，例如 `tokens`。
@@ -712,7 +722,7 @@ rec = kb.Recorder(out_dir, name, kb.run_meta(tool, args, prog="python -m mypkg.b
 | 东西 | 文件 |
 |---|---|
 | 注册表（去哪里查表） | [`_ops.py`](../contrib/flydsl/a8w4/_ops.py)：`Registry("a8w4", table=DEFAULT_CSV)` |
-| 问题 | [`ref.py`](../contrib/flydsl/a8w4/ref.py)：`moe_ref`、`moe_test`（`@dim` shape / act / routing）、`moe_check`（cos 误差）、`moe_dims`，以及 `moe_dyn_*`（`@dim` shape / fp8 / act / routing） |
+| 问题 | [`ref.py`](../contrib/flydsl/a8w4/ref.py)：`moe_ref`、`moe_problem`（`@dim` shape / act / routing）、`moe_check`（cos 误差）、`moe_dims`，以及 `moe_dyn_*`（`@dim` shape / fp8 / act / routing） |
 | solver | [`moe.py`](../contrib/flydsl/a8w4/moe.py)：`moe_tp2k`、`moe_tp1k`、`moe_tp1kq`（`@no_capture`）、`moe_ep3k`（共用的 `stack`，`**over` 覆盖项）、`moe_ep1k`；`@knob`、`@meta(tile_m=..., cached_loads=...)` |
 | 调优 | [`tune.py`](../contrib/flydsl/a8w4/tune.py)：`TOKENS` 和 `TUNING`（problem 是 shape × act，bucket `num_tokens`，key 不含 `expert_offset`，轮换 `W`）；`python -m a8w4.tune <cmd>` 等同于 `python -m pyhip.kit <cmd> a8w4.tune:TUNING`，另加 a8w4 自己的报告 |
 | 测试 | [`tests/test_a8w4_ops.py`](../contrib/flydsl/a8w4/tests/test_a8w4_ops.py)：`op_tests(MOE, MOE.problems("shape", dim("num_tokens", (1, 77, 600), id="t{}"), "act"))`，以及 `moe_dyn` 的接收缓冲区预设 |
@@ -728,18 +738,18 @@ kit 自身的测试：[`tests/kit/test_kit.py`](../../tests/kit/test_kit.py)（�
 |---|---|
 | `@op_register must be the outermost decorator` | `@op_register` 要写在所有 kit 标记的上面 |
 | `no registered op is a prefix of the name; register its <op>_ref first` | 先注册 `<op>_ref`（模块里写在前面） |
-| `<op>_test: register it before the solvers` | `<op>_test` 要在 solver 之前注册 |
+| `<op>_problem: register it before the solvers` | `<op>_problem` 要在 solver 之前注册 |
 | `the parameters must start with exactly those of <op>_ref` | solver 的前几个参数要和 ref 完全相同（名字、种类、默认值） |
 | `each knob needs exactly one @knob` | 每个 knob 正好一个 `@knob`，`@knob` 也不能多出不是 knob 的名字 |
-| `@dim describes the problem; it goes on <op>_test` / `only @dim marks` | `@dim` 只用在 `<op>_test` 上，`@knob` 只用在 solver 上 |
-| `seed ... must be keyword-only with a default` | `<op>_test` 写成 `def f_test(..., *, seed=0)` |
-| `dim(...) needs name=` | `<op>_test` 上多个 dim 一起的 `@dim` 要给轴名 |
+| `@dim describes the problem; it goes on <op>_problem` / `only @dim marks` | `@dim` 只用在 `<op>_problem` 上，`@knob` 只用在 solver 上 |
+| `seed ... must be keyword-only with a default` | `<op>_problem` 写成 `def f_problem(..., *, seed=0)` |
+| `dim(...) needs name=` | `<op>_problem` 上多个 dim 一起的 `@dim` 要给轴名 |
 | `knob(s) [...] clash with the dims` | knob 名和 dim 名不能相同 |
 | `... prints as '...', which reads back as ...` | id 里的取值含空格或 `:`，或者 id 格式无法区分不同的值 |
-| `no @dim 'x' on <op>_test` / `has no value [...]` | `op.problems` 引用了不存在的轴名或取值 id |
+| `no @dim 'x' on <op>_problem` / `has no value [...]` | `op.problems` 引用了不存在的轴名或取值 id |
 | `dims [...] unset` | 传给 `op_tests` 的 problem 缺少没有默认值的 dim |
 | `no tuned config for {...} in <表>: tune it, or pass config=` | 这个 key 没调优过：先 `tune`，或传 `config=` |
-| `no tuned config for {...} can run under CUDA-graph capture` | 表里这个点的候选都是 `@no_capture` 的：给能 capture 的 solver 调优 |
+| `no tuned config for {...} can run under CUDA-graph capture` | 表里这个点的配置都是 `@no_capture` 的：给能 capture 的 solver 调优 |
 | `picking a config needs <op>_dims; pass config=` | 没有 `<op>_dims` 时 `op(...)` 不能查表 |
 | `unknown argument(s) [...]` | `op(...)` 的关键字参数既不是接口参数也不是 dim |
 | `a tuned table has at most one bucket column` | 表头里有多个 `~` 列 |

@@ -4,13 +4,13 @@
     python -m pyhip.kit check a8w4.tune:TUNING tp8-silu -t 1 77 4096 -v @table "tp1k bcm2 ks1" --graph
 
 The problem and the inputs are ``kit.tune``'s (a ``Tuning``): a tune problem (``--set``
-overrides), the bucket value per ``-t``, ``<op>_test`` with seed ``--seed`` + value
+overrides), the bucket value per ``-t``, ``<op>_problem`` with seed ``--seed`` + value
 (+ 1000 * sample). The answer is ``<op>_ref``, the comparison ``<op>_check`` (its first
 metric is the column reported, e.g. cos). The timed calls cycle through copies of the
 tuning's ``rotate`` inputs (``kit.timing``).
 
 variant spec: [label=]<base>[:<k>=<v>,...]  or  [label=]py:<module | file.py>:<func>
-  base      a config name (``python -m pyhip.kit candidates <spec> <problem>``) or
+  base      a config name (``python -m pyhip.kit configs <spec> <problem>``) or
             "@table" (the tuned table's pick at each bucket value)
   k=v       overrides passed to a solver with ``**over`` (v: int, float, true /
             false, none, a/b/c a tuple, "-", anything else a string)
@@ -23,7 +23,7 @@ ab: per bucket value and sample, every variant first runs once against ``<op>_re
 base. Then ``--rounds`` ABBA rounds time ``--iters`` calls of every (protocol, variant).
 The base also runs as "<base>#2": that copy's difference is the noise floor; a
 difference gets a verdict only beyond the noise band (``kit.timing.noise_band``).
-Implementations with ``@meta(cached_loads=True)`` (they read the rotated inputs through
+Solvers with ``@meta(cached_loads=True)`` (they read the rotated inputs through
 the cache) are refused unless a protocol rotates >= MIN_COPIES copies.
 
 check: per bucket value, every variant vs ``<op>_ref``, vs the base, the worst of
@@ -143,8 +143,8 @@ def parse_variant(op, text, alias=None):
     return v
 
 
-def resolve(op, v, dims):
-    """-> Resolved, or a str: why ``v`` has no config for ``dims`` (an untuned key for
+def resolve(op, v, problem):
+    """-> Resolved, or a str: why ``v`` has no config for ``problem`` (an untuned key for
     ``@table``). The overrides become config entries (``**over`` of the solver; its
     ``@meta`` sees them). A config the solver cannot run raises at its first
     run."""
@@ -152,12 +152,12 @@ def resolve(op, v, dims):
         f = v.func
         return Resolved(v.label, v.spec, v.spec, lambda inputs: f(**inputs))
     try:
-        cfg = op.pick(dims) if v.base == "@table" else op.parse(v.base)
+        cfg = op.pick(problem) if v.base == "@table" else op.parse(v.base)
     except ValueError as e:  # no tuned config for the problem
         return str(e)
     cfg = {**cfg, **v.overrides}
     try:
-        cached = op.meta(cfg, "cached_loads", dims)
+        cached = op.meta(cfg, "cached_loads", problem)
     except KeyError:
         cached = None
     except TypeError as e:  # overrides on a solver without **over
@@ -298,17 +298,17 @@ def _same(a, b):
 
 
 class _Inputs:
-    """inputs(value, seed) -> the interface arguments: ``<op>_test`` on the problem with
+    """inputs(value, seed) -> the interface arguments: ``<op>_problem`` on the problem with
     the bucket set, or the caller's function."""
 
-    def __init__(self, t, c, fn=None):
-        self.op, self.c, self.fn, self.b = t.op, c, fn, t.bucket
+    def __init__(self, t, problem, fn=None):
+        self.op, self.prob, self.fn, self.b = t.op, problem, fn, t.bucket
 
-    def dims(self, v):
-        return dict(self.c, **{self.b: v})
+    def problem(self, v):
+        return dict(self.prob, **{self.b: v})
 
     def __call__(self, v, seed):
-        return self.fn(v, seed) if self.fn else _inputs(self.op, self.dims(v), seed)
+        return self.fn(v, seed) if self.fn else _inputs(self.op, self.problem(v), seed)
 
 
 def _rotated(names, inputs, n):
@@ -350,17 +350,18 @@ def _correctness(op, res, inputs, ref, bitwise):
     return ok, notes, name
 
 
-def ab(t, c, points, specs, *, protocols=("coldrot",), rounds=5, iters=16, samples=1, seed=7,
-       dup=True, allow_biased=False, ref=True, bitwise=False, diff_tol=None, ncopies=NCOPIES,
-       rec=None, inputs=None, annotate=None, alias=None, unit=None, describe=None):
-    """A/B timing of the variants ``specs`` on problem ``c`` of the ``Tuning`` ``t`` (see
+def ab(t, problem, points, specs, *, protocols=("coldrot",), rounds=5, iters=16, samples=1,
+       seed=7, dup=True, allow_biased=False, ref=True, bitwise=False, diff_tol=None,
+       ncopies=NCOPIES, rec=None, inputs=None, annotate=None, alias=None, unit=None,
+       describe=None):
+    """A/B timing of the variants ``specs`` on ``problem`` of the ``Tuning`` ``t`` (see
     the module docstring). Hooks: ``inputs(value, seed)`` -> interface arguments
-    (default ``<op>_test``); ``annotate(inputs, resolved)`` -> (heading text, record
+    (default ``<op>_problem``); ``annotate(inputs, resolved)`` -> (heading text, record
     fields) of a sample; ``alias`` for base names; ``unit``: the bucket's name in
     headings."""
     op = t.op
     rec = rec or Recorder(None, None, run_meta("ab"))
-    gen = _Inputs(t, c, inputs)
+    gen = _Inputs(t, problem, inputs)
     unit = unit or gen.b
     variants = [parse_variant(op, s, alias) for s in specs]
     labels = [v.label for v in variants]
@@ -371,14 +372,14 @@ def ab(t, c, points, specs, *, protocols=("coldrot",), rounds=5, iters=16, sampl
     if dup:
         dup_label = base_label + "#2"
         variants.insert(1, dataclasses.replace(variants[0], label=dup_label))
-    plan = {T: [resolve(op, v, gen.dims(T)) for v in variants] for T in points}
+    plan = {T: [resolve(op, v, gen.problem(T)) for v in variants] for T in points}
     for T, res in plan.items():  # before any timing: fail fast
         if isinstance(res[0], str):
             raise SystemExit(f"the base at {unit} {T}: {res[0]}")
         check_protocols([r for r in res if not isinstance(r, str)], protocols, ncopies,
                         allow_biased)
     rot = [p for p in protocols if p in ("coldrot", "rotate")]
-    rec.text((describe or f"{op.name} {c}") + f"\n\nprotocol {', '.join(protocols)}"
+    rec.text((describe or f"{op.name} {problem}") + f"\n\nprotocol {', '.join(protocols)}"
              + (f" ({ncopies} copies of {list(t.rotate)})" if rot else "")
              + f", {rounds} rounds x {iters} calls; us = median of the round medians; "
              f"verdict only beyond the noise band (max(|{dup_label or 'copy'} delta|, half the "
@@ -497,23 +498,23 @@ def _graph_replay(op, fn, inputs, replays=5):
     return worst
 
 
-def check(t, c, points, specs, *, seed=7, repeats=5, graph=False, bitwise=False,
+def check(t, problem, points, specs, *, seed=7, repeats=5, graph=False, bitwise=False,
           diff_tol=None, rec=None, inputs=None, alias=None, unit=None, describe=None):
-    """Correctness of the variants ``specs`` on problem ``c`` of the ``Tuning`` ``t`` (see
+    """Correctness of the variants ``specs`` on ``problem`` of the ``Tuning`` ``t`` (see
     the module docstring). Returns the number of failed (value, variant) items."""
     op = t.op
     rec = rec or Recorder(None, None, run_meta("check"))
-    gen = _Inputs(t, c, inputs)
+    gen = _Inputs(t, problem, inputs)
     unit = unit or gen.b
     variants = [parse_variant(op, s, alias) for s in specs]
-    rec.text((describe or f"{op.name} {c}") + "\n")
+    rec.text((describe or f"{op.name} {problem}") + "\n")
     rows, bad, m = [], 0, None
     for T in points:
         inp = gen(T, seed + T)
         expected = op.ref(**inp)
         base = None
         for v in variants:
-            r = resolve(op, v, gen.dims(T))
+            r = resolve(op, v, gen.problem(T))
             if isinstance(r, str):
                 rows.append([T, v.label, "-", "n/a", "", "", "", "", r])
                 continue
@@ -604,14 +605,14 @@ def main(argv=None, prog="python -m pyhip.kit"):
     from . import _guess
 
     t = resolve_tuning(a.spec)
-    c = t.problem(a.problem, a.set)
+    prob = t.problem(a.problem, a.set)
     pts = [_guess(v) for v in a.points]
     rec = Recorder(a.out, a.name or a.cmd, run_meta(a.cmd, a, prog))
-    desc = f"{t.op.name} problem {a.problem}: {({k: v for k, v in c.items() if v is not None})}"
+    desc = f"{t.op.name} problem {a.problem}: {({k: v for k, v in prob.items() if v is not None})}"
     if a.cmd == "ab":
-        return ab(t, c, pts, a.variants, protocols=a.protocol, rounds=a.rounds, iters=a.iters,
+        return ab(t, prob, pts, a.variants, protocols=a.protocol, rounds=a.rounds, iters=a.iters,
                   samples=a.samples, seed=a.seed, dup=not a.no_dup, allow_biased=a.allow_biased,
                   ref=not a.no_ref, bitwise=a.bitwise, diff_tol=a.diff_tol, ncopies=a.copies,
                   rec=rec, describe=desc)
-    return 1 if check(t, c, pts, a.variants, seed=a.seed, repeats=a.repeats, graph=a.graph,
+    return 1 if check(t, prob, pts, a.variants, seed=a.seed, repeats=a.repeats, graph=a.graph,
                       bitwise=a.bitwise, diff_tol=a.diff_tol, rec=rec, describe=desc) else 0

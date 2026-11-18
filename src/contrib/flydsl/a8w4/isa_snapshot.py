@@ -11,9 +11,9 @@ isa-snapshot runs a fixed matrix of jobs (``--list`` prints them), several worke
 processes per GPU, each with an empty FlyDSL cache (a cached kernel is not compiled, so
 not seen) and the compile hooks below. Matrix:
 
-  moe:<case>:<act>:<family>  ``MOE.run`` of every tuned config of the family at the
+  moe:<case>:<act>:<solver>  ``MOE.run`` of every tuned config of the solver at the
                              tuned point of each token count (what the dispatch can
-                             pick; ep3k: also the presets outside the grid): every
+                             pick; ep3k: also the presets outside its @knob): every
                              tuned token count plus the counts where a compile-time
                              choice flips (tp_prep unroll / route range, ep_prep
                              multi-WG)
@@ -54,7 +54,7 @@ from pathlib import Path
 PKG = __package__
 ACTS = ("silu", "situv2")
 CASE_KEYS = ("tp8", "tp4", "ep8")  # ref.SHAPES, expert_offset 0
-FAMILIES = ("tp2k", "tp1k", "tp1kq", "ep3k", "ep1k")
+SOLVERS = ("tp2k", "tp1k", "tp1kq", "ep3k", "ep1k")
 DYN_X = ("bf16", "fp8g128", "fp8tok")
 DYN_CAPS = (256, 4096)  # ep_prep: single-WG (M * topk <= 2048) / multi-WG
 MEGA_MAX_TOKENS = 4096
@@ -84,16 +84,16 @@ def _case(name):
     return (H, I, E, EGl, K), 0
 
 
-def _tuned(shape, act, t, family):
-    """The tuned configs of ``family`` at the point of ``t`` tokens (ep3k: plus the
+def _tuned(shape, act, t, solver):
+    """The tuned configs of ``solver`` at the point of ``t`` tokens (ep3k: plus the
     presets the tuner skips, e.g. l128_v1)."""
     from . import moe
     from .kernels import ep_gemm as EG
 
-    cfgs = [c for c in moe.MOE.tuned(moe.shape_dims(shape, t, act)) if c["kind"] == family]
-    if family == "ep3k" and cfgs:
+    cfgs = [c for c in moe.MOE.tuned(moe.shape_problem(shape, t, act)) if c["solver"] == solver]
+    if solver == "ep3k" and cfgs:
         have = {c["cfg"] for c in cfgs}
-        cfgs += [dict(kind="ep3k", cfg=p) for p in EG.CFGS if p not in have]
+        cfgs += [dict(solver="ep3k", cfg=p) for p in EG.CFGS if p not in have]
     return cfgs
 
 
@@ -103,9 +103,9 @@ def jobs():
     for case in CASE_KEYS:
         shape, _ = _case(case)
         for act in ACTS:
-            for fam in FAMILIES:
-                if any(_tuned(shape, act, t, fam) for t in isa_tokens()):
-                    out[f"moe:{case}:{act}:{fam}"] = ("moe", (case, act, fam))
+            for solver in SOLVERS:
+                if any(_tuned(shape, act, t, solver) for t in isa_tokens()):
+                    out[f"moe:{case}:{act}:{solver}"] = ("moe", (case, act, solver))
     for act in ACTS:
         for xf in DYN_X:
             out[f"dyn:{act}:{xf}"] = ("dyn", (act, xf))
@@ -120,7 +120,7 @@ def _situ(act):
     return R.SITU if act == "situv2" else None
 
 
-def _moe_items(case, act, fam, tokens):
+def _moe_items(case, act, solver, tokens):
     from . import moe
     from . import ref as R
 
@@ -130,7 +130,7 @@ def _moe_items(case, act, fam, tokens):
     yield "make_weights", lambda: st.update(W=R.make_weights(E, H, I)[0])
     for t in tokens:
         x, tw, ti = R.make_routing(t, H, EGl, K)
-        for c in _tuned(shape, act, t, fam):
+        for c in _tuned(shape, act, t, solver):
             yield (f"t={t} {moe.MOE.name_of(c)}",
                    lambda c=c, x=x, tw=tw, ti=ti: moe.MOE.run(
                        c, x, st["W"], tw, ti, expert_offset=e0, num_experts=EGl,
@@ -159,7 +159,7 @@ def _dyn_items(act, xf):
             xs = x.float().abs().amax(-1).clamp(min=1e-30) / 240.0
             x = (x.float() / xs[:, None]).to(torch.float8_e4m3fnuz)
         for p in EG.CFGS:
-            c = dict(kind="ep3k", cfg=p)
+            c = dict(solver="ep3k", cfg=p)
             yield (f"cap={cap} {moe.MOE.name_of(c)}",
                    lambda c=c, x=x, xs=xs, tw=tw, ti=ti, m_valid=m_valid: moe.a8w4_moe_dyn(
                        x, st["W"], tw, ti, m_valid, x_scale=xs, expert_offset=e0,

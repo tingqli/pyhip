@@ -23,7 +23,7 @@ from collections import defaultdict
 
 from pyhip.kit import table
 
-from .moe import DEFAULT_CSV, MOE, shape_dims
+from .moe import DEFAULT_CSV, MOE, shape_problem
 
 README = os.path.join(os.path.dirname(os.path.abspath(__file__)), "README.md")
 H, TOPK = 4096, 8
@@ -234,7 +234,7 @@ def stats(table=DEFAULT_CSV):
         for t, a, b, g in gain:
             print(f"  {t:6d}: silu {a:28s} situv2 {b:28s} situv2 gain {g:+.2f}%")
         for tok in (4096,):
-            a, b = (MOE.pick(shape_dims(shape, tok, act), capturing=True, table=table)
+            a, b = (MOE.pick(shape_problem(shape, tok, act), capturing=True, table=table)
                     for act in ("silu", "situv2"))
             print(f"  capture {tok}: silu {MOE.name_of(a)} | situv2 {MOE.name_of(b)}")
 

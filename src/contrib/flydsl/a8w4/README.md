@@ -92,15 +92,15 @@ E 是 `W` 中的本地专家数，e0 = `expert_offset`。
 | `weight_shape(W)` | 返回 (E, H, I) |
 | `ops`、`DEFAULT_CSV` | 算子注册表（`ops.moe`、`ops.moe_dyn`，`pyhip.kit.Op`）和默认调优表的路径 |
 | `ops.moe(x, W, tw, ti, ..., config=, table=, routing=)` | 同 `a8w4_moe`，但不处理 M == 0 |
-| `ops.moe.pick(dims, table=, capturing=)` | 查表得到配置（6.2 节）；`dims` 是 dim 值的 dict，可用 `moe.shape_dims(shape, tokens, act, routing)` 由 `shape = (H, I, E, E_global, topk)` 构造；表里没有该 key 时抛 `ValueError` |
-| `ops.moe_dyn.pick(dims, ...)` | `a8w4_moe_dyn` 用的配置（只有 ep3k）；表里该 key 没有 ep3k 的行（例如 TP8 shape）时抛 `ValueError` |
-| `ops.moe.tuned(dims, table=)` | 该 problem 所在调优点的全部配置（从快到慢），即 `pick` 的候选，也是生成的测试覆盖的配置 |
+| `ops.moe.pick(problem, table=, capturing=)` | 查表得到配置（6.2 节）；`problem` 是 dim 值的 dict，可用 `moe.shape_problem(shape, tokens, act, routing)` 由 `shape = (H, I, E, E_global, topk)` 构造；表里没有该 key 时抛 `ValueError` |
+| `ops.moe_dyn.pick(problem, ...)` | `a8w4_moe_dyn` 用的配置（只有 ep3k）；表里该 key 没有 ep3k 的行（例如 TP8 shape）时抛 `ValueError` |
+| `ops.moe.tuned(problem, table=)` | 该 problem 所在调优点的全部配置（从快到慢），`pick` 从中选，也是生成的测试覆盖的配置 |
 | `ops.moe.capturable(cfg)` | 该配置能否在 CUDA graph capture 中运行（`@no_capture` 标记的 solver 不能，即 tp1kq） |
-| `ops.moe.configs(dims)` | 各 solver 的完整网格（tune 的候选）；其中 kernel 跑不了的，运行时抛异常 |
+| `ops.moe.configs(problem)` | 各 solver 的全部配置（tune 要跑的）；其中 kernel 跑不了的，运行时抛异常 |
 | `ops.moe.run(cfg, x, W, tw, ti, ...)` | 跑指定配置，不查表、不检查输入 |
 | `ops.moe.name_of` / `ops.moe.parse` | 配置 dict ↔ 名字 |
-| `ops.moe.points(dims, table=)` | 调优表里该 key 的全部点和候选 |
-| `ops.moe.problems(...)` | 由 `moe_test` 的 `@dim`（shape、act、routing）组合出 problem，测试和调优用 |
+| `ops.moe.points(problem, table=)` | 调优表里该 key 的全部点和各点的配置 |
+| `ops.moe.problems(...)` | 由 `moe_problem` 的 `@dim`（shape、act、routing）组合出 problem，测试和调优用 |
 
 ### 2.3 使用约定
 
@@ -153,17 +153,17 @@ out = a8w4_moe_dyn(x, W, topk_weights, topk_ids, m_valid, x_scale=None,
 a8w4/
   __init__.py                  公开接口；另导出 ops（算子注册表，ops.moe / ops.moe_dyn）和 DEFAULT_CSV
   _ops.py                      本包的算子注册表 ops = pyhip.kit.Registry("a8w4", table=DEFAULT_CSV) 和装饰器 op_register；ref.py 注册问题定义，moe.py 注册 solver
-  moe.py                       a8w4_moe / a8w4_moe_dyn（只处理 M == 0，其余交给算子）；各族的 solver 函数 moe_<kind>（@op_register 注册；@knob 网格、@meta，tp1kq 另有 @no_capture；限制由 kernel 的 assert 检查），算子 MOE = ops.moe、MOE_DYN = ops.moe_dyn（9.3 节）；shape_dims（工具用：由 shape 元组构造 dim 值）
+  moe.py                       a8w4_moe / a8w4_moe_dyn（只处理 M == 0，其余交给算子）；各 solver 函数 moe_<solver>（@op_register 注册；@knob 取值、@meta，tp1kq 另有 @no_capture；限制由 kernel 的 assert 检查），算子 MOE = ops.moe、MOE_DYN = ops.moe_dyn（9.3 节）；shape_problem（工具用：由 shape 元组构造 problem）
   weights.py                   prepare_weights（fd2 权重）、shuffle_mxfp4、weight_shape
-  tune.py                      调优：TOKENS 和 TUNING（pyhip.kit.tune.Tuning：problem、分桶维、调优点、key、轮换的权重，6.3 节）；CLI `python -m a8w4.tune <cmd>` 就是 `python -m pyhip.kit <cmd> a8w4.tune:TUNING`（problems / candidates / tune / merge / show / verify / tune-all），另有 a8w4 的报告 compare / readme / stats；表的读、写、合并、比较在 `pyhip.kit.table`（分派和 tune 共用）
+  tune.py                      调优：TOKENS 和 TUNING（pyhip.kit.tune.Tuning：problem、分桶维、调优点、key、轮换的权重，6.3 节）；CLI `python -m a8w4.tune <cmd>` 就是 `python -m pyhip.kit <cmd> a8w4.tune:TUNING`（problems / configs / tune / merge / show / verify / tune-all），另有 a8w4 的报告 compare / readme / stats；表的读、写、合并、比较在 `pyhip.kit.table`（分派和 tune 共用）
   tables.py                    调优表报告：compare（`kit.table.compare`，按 shape / act / tokens 列出两张表逐点的 winner）、readme（重新生成 / 检查 README 7.2–7.4）、stats（situv2 与 silu）
-  ref.py                       测试与调优用：算子的问题定义（moe_ref 参考实现、moe_test 由 problem 生成输入（@dim shape / act / routing）、moe_check 判定、moe_dims 由输入读出 dim 并检查；moe_dyn_* 同理）、随机权重和路由、模拟 fp8 量化的 fp32 参考、冷 cache 计时
+  ref.py                       测试与调优用：算子的问题定义（moe_ref 参考实现、moe_problem 由 problem 生成输入（@dim shape / act / routing）、moe_check 判定、moe_dims 由输入读出 dim 并检查；moe_dyn_* 同理）、随机权重和路由、模拟 fp8 量化的 fp32 参考、冷 cache 计时
   megamoe.py                   MegaMoeEpA8W4：EP8 整层（dispatch + 专家 + combine）的单 persistent kernel 封装，用于大 batch
   bench/                       实验工具 python -m a8w4.bench：ab（A/B 计时）、breakdown（每个 kernel 的耗时）、check（正确性）、dist（megamoe 8 卡变体）；core.py 是 a8w4 的用例、输入和变体别名（变体解析、A/B 和 check 的引擎、运行记录在 `pyhip.kit.bench`，计时协议、ABBA、噪声带在 `pyhip.kit.timing`），dist.py 也是 8 卡测试共用的 helper
   prof.py                      python -m a8w4.prof：counters（rocprofv3 计数器汇总）、isa（VGPR / spill / LDS）
   exp.py                       python a8w4/exp.py：实验登记 experiments/index.csv 的 grep / ls / add / new / lint / clean
   experiments/                 历次实验：index.csv（一行一个实验）、log_YYYYMMDD.md、各实验目录；_launch.py 是旧实验脚本用的 _run_compiled
-  configs/a8w4_moe_tuned.csv   调优表（每个点保存全部候选的耗时）
+  configs/a8w4_moe_tuned.csv   调优表（每个点保存全部配置的耗时）
   configs/README.md            调优表的内容与生成命令
   tests/test_a8w4_ops.py       pytest：每个 solver 的每个调优过的配置对参考实现，由算子生成（op_tests(MOE, MOE.problems(...))，要测的 problem 写在这个文件里）
   tests/test_a8w4_moe.py       pytest：参考实现、查表、CUDA graph 等其余性质
@@ -424,7 +424,7 @@ ARB 是每个 K-tile 每行 A 的字节数，默认 256。`t16` 的 gemm2 用窄
 
 列：`model_dim, inter_dim, experts, experts_global, topk, routing, act, ~num_tokens, config, us, cos`。`~` 标出分桶列（非精确匹配，6.2 节），它前面那些是精确匹配的 key。
 
-**每个点保存全部候选的耗时**，而不是只存最快的那个，这样运行时才能按上下文过滤（capture 时排除 tp1kq，超过 512 tokens 时排除 ep1k）。现有内容：
+**每个点保存全部配置的耗时**，而不是只存最快的那个，这样运行时才能按上下文过滤（capture 时排除 tp1kq，超过 512 tokens 时排除 ep1k）。现有内容：
 
 - 3 个 shape（TP8 4096/256/256/256/8、TP4 4096/512/256/256/8、EP8 4096/2048/32/256/8），routing 都是 uniform；
 - act：3 个 shape 都有 silu 和 situv2 行（TP4 的 situv2 是 20261118 补调的，此前借用 silu 的行）；
@@ -438,32 +438,32 @@ ARB 是每个 K-tile 每行 A 的字节数，默认 256。`t16` 的 gemm2 用窄
 
 规则在 `pyhip.kit`（`Op.pick`），a8w4 只说明表在哪里（`_ops.py` 的 `Registry("a8w4", table=DEFAULT_CSV)`）；key 和分桶列由表头说明。只保证表里有的 key：
 
-1. key 是表头里是 dim 名的列：(H, I, E, E_global, topk, routing, act)，精确匹配。dim 值为 None 的 key（例如没传 `routing`）按 `ref.moe_test` 的默认值匹配（`"uniform"`）。没有 act 列的表里 act 不是 key。
+1. key 是表头里是 dim 名的列：(H, I, E, E_global, topk, routing, act)，精确匹配。dim 值为 None 的 key（例如没传 `routing`）按 `ref.moe_problem` 的默认值匹配（`"uniform"`）。没有 act 列的表里 act 不是 key。
 2. 分桶列 `~num_tokens`：取第一个 ≥ M 的点；M 超过最大点时取最大点。
-3. 该点的候选（`ops.moe.tuned(dims)`）按耗时从小到大，返回第一个；capture 期间跳过 `@no_capture` 的 solver（tp1kq）。表里的行都是 tune 时在这个 key、这个点上跑过并通过检查的配置；现有的 token 限制都是上限（ep1k ≤ 512、EP < 65536），所以在点上能跑，在点以下也能跑。以后的 kernel 不要引入 token 数的下限。
+3. 该点的配置（`ops.moe.tuned(problem)`）按耗时从小到大，返回第一个；capture 期间跳过 `@no_capture` 的 solver（tp1kq）。表里的行都是 tune 时在这个 key、这个点上跑过并通过检查的配置；现有的 token 限制都是上限（ep1k ≤ 512、EP < 65536），所以在点上能跑，在点以下也能跑。以后的 kernel 不要引入 token 数的下限。
 4. 表里没有该 key（没调过的 shape、routing、act 等）时抛 `ValueError`：先 tune，或者用 `config=` 指定配置。超过最大调优点（32768）时仍取最大点，kernel 跑不了就抛它的异常（例如 EP8 ≥ 65536 tokens 时 ep3k 在 `ep_prep` 里报 `M >= 65536`）；要支持就把调优点加上去。
-5. `ops.moe_dyn.pick`（`a8w4_moe_dyn` 用）：同样按 `num_tokens`（= `est_tokens`）取点，但 `moe_dyn` 只有 ep3k solver，表里其他族的行被跳过；该 key 没有 ep3k 的行（例如 TP8 shape）时抛 `ValueError`。容量 ≥ 65536 由 `ep_prep` 的 assert 拒绝。
+5. `ops.moe_dyn.pick`（`a8w4_moe_dyn` 用）：同样按 `num_tokens`（= `est_tokens`）取点，但 `moe_dyn` 只有 ep3k solver，表里其他 solver 的行被跳过；该 key 没有 ep3k 的行（例如 TP8 shape）时抛 `ValueError`。容量 ≥ 65536 由 `ep_prep` 的 assert 拒绝。
 
 表按文件路径和 mtime 缓存，mtime 每张表最多一秒读一次：文件更新后一秒内重新读取。`ops.moe(...)` 的选择按（表、mtime、capture 状态、`moe_dims` 的值）缓存。
 
 ### 6.3 tuner（`pyhip.kit.tune`，`python -m a8w4.tune`）
 
-调优是通用的（`pyhip.kit.tune`），a8w4 的全部调优设置在 `tune.py` 的 `TUNING` 里：problem 是 `ref.moe_test` 的 `@dim` shape × act（`tp8-silu`、`tp8-situv2`、`tp4-silu`、`tp4-situv2`、`ep8-silu`、`ep8-situv2`，EP8 用 rank 3 的 expert_offset 96），分桶维 `num_tokens` 取 `TOKENS` 的 35 个点，表的 key 是 (H, I, E, E_global, topk, routing, act)（`expert_offset` 只是给 expert 改编号，不进表），计时时轮换权重 `W`。`--set name=value` 改 problem 的 dim（新 shape、routing）。表头由 `TUNING` 写出：key 列、`~num_tokens`、`config`、`us`、`moe_check` 返回的 `cos`。
+调优是通用的（`pyhip.kit.tune`），a8w4 的全部调优设置在 `tune.py` 的 `TUNING` 里：problem 是 `ref.moe_problem` 的 `@dim` shape × act（`tp8-silu`、`tp8-situv2`、`tp4-silu`、`tp4-situv2`、`ep8-silu`、`ep8-situv2`，EP8 用 rank 3 的 expert_offset 96），分桶维 `num_tokens` 取 `TOKENS` 的 35 个点，表的 key 是 (H, I, E, E_global, topk, routing, act)（`expert_offset` 只是给 expert 改编号，不进表），计时时轮换权重 `W`。`--set name=value` 改 problem 的 dim（新 shape、routing）。表头由 `TUNING` 写出：key 列、`~num_tokens`、`config`、`us`、`moe_check` 返回的 `cos`。
 
-- **候选**（`candidates <problem>`，即 `MOE.configs`：各 solver 的完整网格。kernel 跑不了的配置运行时抛异常，记为 n/a，不进表）：
+- **配置**（`configs <problem>`，即 `MOE.configs`：各 solver 的全部配置。kernel 跑不了的配置运行时抛异常，记为 n/a，不进表）：
   - tp2k：bm × g1bcm × g2，共 8 个；
   - tp1k：bcm × ksplit，ksplit 取每个 CTA 256 / 384 / 512 列对应的值；
   - tp1kq；
   - ep3k 的 6 个配置（`moe.EP_CFGS`）；
   - ep1k。
   
-  网格共 20 个配置；能跑的 TP8 有 11 个，TP4 有 8 个，EP8 有 15 个（ep1k 只到 512 tokens）。
-- **流程**：每个 token 数跑 `--rounds`（默认 3）轮，每轮重新抽一次路由。小 batch 时本卡的工作量取决于抽到的路由，例如 EP8 1 token 时约 1/3 的抽样没有本地专家。每轮的输入由 `ref.moe_test` 生成（`seed` = 101 × token 数 + 轮次），参考结果由 `moe_ref` 算出。每轮对每个候选：
+  共 20 个配置；能跑的 TP8 有 11 个，TP4 有 8 个，EP8 有 15 个（ep1k 只到 512 tokens）。
+- **流程**：每个 token 数跑 `--rounds`（默认 3）轮，每轮重新抽一次路由。小 batch 时本卡的工作量取决于抽到的路由，例如 EP8 1 token 时约 1/3 的抽样没有本地专家。每轮的输入由 `ref.moe_problem` 生成（`seed` = 101 × token 数 + 轮次），参考结果由 `moe_ref` 算出。每轮对每个配置：
   - 先 `MOE.run` 跑一次，抛异常的记为 n/a（kernel 不支持，日志只记个数和异常类型）；再用 `moe_check` 检查（bf16、shape、cos 差 < 5e-3），不通过的判为 BAD。两者都不进表；
   - 再计时（冷 cache，`--iters` 次取中位数）；
-  - 同一轮内各候选交错执行，时钟和功耗的漂移会均匀落到每个候选上。
+  - 同一轮内各配置交错执行，时钟和功耗的漂移会均匀落到每个配置上。
   
-  每个候选最终取各轮的中位数。每测完一个 token 数就写一次文件（同 key 的行覆盖）。
+  每个配置最终取各轮的中位数。每测完一个 token 数就写一次文件（同 key 的行覆盖）。
 - **计时**（`pyhip.kit.timing.time_cold`，`ref.time_cold` 是同一个函数）：
   - 每次迭代前读一遍 512 MB，用干净行挤掉 L2。用读而不是读改写，是为了不留下 dirty 行，否则写回会抢 HBM 带宽；
   - 刷 cache 挤不掉 MALL 里每次调用都读的权重（读 2 GB 也一样），所以每次调用换一份权重：`kit.timing.copies` 复制 8 份（`--copies`，EP8 / TP8 约 3.3 GB），轮流使用，和模型里相邻各层读不同的权重一样。只用一份权重时，W 走 cache 的配置会显得快 5–13%（10 节第 15 条）；
@@ -473,7 +473,7 @@ ARB 是每个 K-tile 每行 A 的字节数，默认 256。`t16` 的 gemm2 用窄
 ```bash
 cd <包含 a8w4/ 的目录>
 python -m a8w4.tune problems                       # 调优的 problem
-python -m a8w4.tune candidates ep8-silu
+python -m a8w4.tune configs ep8-silu
 # 整表：8 张空闲卡，每个 problem 用 4 张卡、各跑 1/4 的 token 数；先查 GPU 空闲并加
 # /tmp/gpu-N.lock，结束时汇总 BAD 并合并成 <out>/a8w4_moe_tuned.new.csv
 python -m a8w4.tune tune-all --gpus 0-7 --out /tmp/a8w4_tune
@@ -496,7 +496,7 @@ python -m a8w4.tune tune tp8-silu --set model_dim=6144 experts=384 experts_globa
 - **situv2**：`<shape>-situv2` 这些 problem 按 situv2 计时，结果写成单独的一组行，调用时按 act 查（6.2 节；act 精确匹配，没有调过的 act 抛 `ValueError`）。
   - 参数取 `ref.SITU`。β / clamp 是 launch 参数，不影响耗时，所以这组行对任意 SiTUv2 参数都适用。
   - TP8、TP4、EP8 都已按 situv2 调优。同一配置、同一点上，situv2 / silu 的中位数 TP8、EP8 都是 1.016，p5–p95 为 1.001–1.037（TP8）和 1.001–1.032（EP8）；TP4 是 1.014，p5–p95 0.967–1.054（两组行不是同一次调优的）。
-  - 35 个点里，TP8 有 11 个点（4、8、12、32、128、320、384、448、1024、1280、16384）、EP8 有 4 个点（8、128、256、2048）、TP4 有 4 个点（2、1536、6144、32768）选中的配置与 silu 不同，都是候选之间本来就相差很小的点（tp2k 的 bm32 / bm64、g2base / nt4，t16 / s16，tp1k 的 ks1 / ks2 等）。按 situv2 实测，新的选择比沿用 silu 的选择只快 0.1–0.8%，在测量误差以内。
+  - 35 个点里，TP8 有 11 个点（4、8、12、32、128、320、384、448、1024、1280、16384）、EP8 有 4 个点（8、128、256、2048）、TP4 有 4 个点（2、1536、6144、32768）选中的配置与 silu 不同，都是配置之间本来就相差很小的点（tp2k 的 bm32 / bm64、g2base / nt4，t16 / s16，tp1k 的 ks1 / ks2 等）。按 situv2 实测，新的选择比沿用 silu 的选择只快 0.1–0.8%，在测量误差以内。
   - capture 时，TP8 4096 tokens 的选择从 `tp1k bcm1 ks1` 变成 `tp2k bm64 g1bcm1 g2nt4`（situv2 下快 1.0%，silu 下慢 1.8%）。
 
 ## 7. 性能
@@ -660,7 +660,7 @@ profile 中的 kernel 名：
 - **`tests/test_a8w4_ops.py`**：由算子生成（`op_tests(MOE, MOE.problems(...))`，`pyhip.kit.testing`），要测的 problem 就写在这个文件里。每个 problem × 它在调优表里那个点的全部配置（`ops.moe.tuned`，即分派可能选到的配置）跑一项：`MOE.run(cfg, **inputs)` 对 `moe_ref` / `moe_dyn_ref`，用 `moe_check` / `moe_dyn_check` 判（bf16、shape、cos 差 < 5e-3）。本机 360 项（含每个 problem 的 dims 项），全部通过，首次约 3 分钟（编译），之后约 20 秒。
   - `test_moe`：tp8 / tp4 / ep8 三个 shape（EP 用 rank 3、全局专家 id）× tokens 1 / 77 / 600 × silu / situv2；
   - `test_moe_dyn`：EP8 接收缓冲区，容量 512 时有效行数 0 / 1 / 37 / 300，容量 2048 时 1500（TR epilogue）；无效行填 NaN 和随机 id；× bf16 / fp8 分组 scale 输入 × silu / situv2，表里该点的 ep3k 预设；
-  - 每个用例另有一项 `...-dims`：`moe_dims(**inputs)` 与用例一致；
+  - 每个 problem 另有一项 `...-dims`：`moe_dims(**inputs)` 与 problem 一致；
   - 没调过的配置不测：只保证调优表里的配置（kernel 不支持的组合会在 tune 时抛异常，不进表）；
   - 用 `-k` 挑子集：`-k "ep8 and ep3k"`、`-k tp1k`、`-k situv2`。
 - **`tests/test_a8w4_moe.py`**：本机 31 passed。覆盖生成的测试之外的性质：
@@ -821,10 +821,10 @@ python a8w4/tests/test_a8w4_mori_tp8.py --allreduce aiter --act silu situv2 \
 ### 9.3 加一个新 kernel 或新配置
 
 1. 在 `kernels/` 加 device 代码。host 封装用 `pyhip.contrib.flydsl.host_launch` 的 `@flydsl_kernel`，不再手写 `functools.cache` + `_run_compiled`：builder 的关键字参数是编译 key，op 直接传 tensor（`kern(x, out, n, H=...)`），常驻对象在构造时绑定 `kern.get(**key)`；写法见 skill `flydsl-host-launch`。
-2. 在 `moe.py` 写一个 solver 函数 `moe_<kind>`，最外层加 `@op_register`（`_ops.py`）：它按名字前缀把函数加进算子 `ops.moe`（`MOE`），并当场检查下面的写法，出错时报在这个函数上。`moe_dyn_<kind>` 加进 `ops.moe_dyn`（`MOE_DYN`），`a8w4_moe_dyn` 目前只有 ep3k。写法：
+2. 在 `moe.py` 写一个 solver 函数 `moe_<solver>`，最外层加 `@op_register`（`_ops.py`）：它按名字前缀把函数加进算子 `ops.moe`（`MOE`），并当场检查下面的写法，出错时报在这个函数上。`moe_dyn_<solver>` 加进 `ops.moe_dyn`（`MOE_DYN`），`a8w4_moe_dyn` 目前只有 ep3k。写法：
    - 参数先与 `ref.moe_ref` 完全相同，后面是带默认值的 keyword-only knob；
    - 每个 knob 一个 `@knob(name, values, id="bm{}")`：
-     - `values` 是调优网格，也可以是 dim 的函数，如 tp1k 的 `ksplit`；
+     - `values` 是 knob 的取值，也可以是 dim 的函数，如 tp1k 的 `ksplit`；
      - `id` 是它在配置名里的写法。`MOE.name_of` / `MOE.parse` 由此生成，CSV 里存的就是这个名字；
    - 限制不写在 solver 函数上：kernel（builder 或 host 封装）在跑不了的组合上 `assert` 失败，并在消息里写出原因和数值。tune 遇到异常就把该配置记为 n/a；
    - 不能在 CUDA graph capture 中运行的 solver 加 `@no_capture("原因")`，capture 期间分派跳过它；
@@ -842,9 +842,9 @@ python a8w4/tests/test_a8w4_mori_tp8.py --allreduce aiter --act silu situv2 \
        ...                         # tp_fmoe_q_kernel asserts inter_dim == 256
    ```
 
-3. 调优：`tune` 在每个 problem 上跑新 solver 的全部配置，能跑并通过检查的写进表，merge 之后分派就能选到。测试不用另写：`pytest -q a8w4/tests/test_a8w4_ops.py -k <kind>` 会跑表里的这些配置。调优之前可以用 `bench check -v "<配置名>"` 先查正确性；第一次加 `PYHIP_FLYDSL_CHECK=1` 跑。
+3. 调优：`tune` 在每个 problem 上跑新 solver 的全部配置，能跑并通过检查的写进表，merge 之后分派就能选到。测试不用另写：`pytest -q a8w4/tests/test_a8w4_ops.py -k <solver>` 会跑表里的这些配置。调优之前可以用 `bench check -v "<配置名>"` 先查正确性；第一次加 `PYHIP_FLYDSL_CHECK=1` 跑。
 
-按某个激活调优：problem 用 `<shape>-<act>`（例如 `tp8-situv2`），结果写成该 act 的一组行（CSV 的 act 列），命令见 [configs/README.md](configs/README.md)。新的 act 要先加进 `ref.ACTS`（`moe_test` 的 `@dim("act", ...)`），它就会成为 `TUNING` 的 problem。
+按某个激活调优：problem 用 `<shape>-<act>`（例如 `tp8-situv2`），结果写成该 act 的一组行（CSV 的 act 列），命令见 [configs/README.md](configs/README.md)。新的 act 要先加进 `ref.ACTS`（`moe_problem` 的 `@dim("act", ...)`），它就会成为 `TUNING` 的 problem。
 
 ### 9.4 修改 kernel 的流程
 
@@ -923,7 +923,7 @@ TP kernel（`tp_gemm1`、`tp_gemm2`、`tp_fmoe`、`tp_fmoe_q`）里走不到的�
     - 刷 cache 只挤得掉 L2：每次调用都读的权重会留在 256 MB 的 MALL 里，读 512 MB 甚至 2 GB 都挤不掉（MALL 看起来不让一次性扫过的数据替换反复读的行）。W 走 nt 的配置不受影响，W 走 cache 的（bcm 0 / 1）因此显得快 5–13%；rocprof 的 L2 命中率和 HBM 读请求数在两种 cache 策略下完全相同，差别只在 L2 之后。旧调优表因此在 TP 6–128 tokens 选了 `g1bcm1`，实际慢 5–7.7%。计时要让每次调用读一份最近没读过的权重（`ref.weight_copies`，≥8 份；2 份不够）。`python -m a8w4.bench ab` 默认就这样计时，W / A 走 cache 的变体在不轮换权重的协议下会被拒绝；`--protocol coldrot cold` 可以把两种协议并排测出来；
     - 先刷 cache 再写一遍（读改写）也不对：W 走 cache 的读要先把 dirty 行写回才能占位，会显得慢 9–48%；
     - host 的 launch 开销要排除（GPU 先空转，再记开始 event）；
-    - 单次测量有 ±3–5% 的抖动，候选之间要交错测量；
+    - 单次测量有 ±3–5% 的抖动，配置之间要交错测量；
     - 小 batch 的 EP 结果取决于路由抽样，要多抽几次。
 16. **代价模型要与实际 tile 时间一致。** 小 tile 受 W 读取限制，32 行和 64 行的 tile 一样慢；按「固定开销 + 行数」估算代价会切出不均匀的区间。
 

@@ -10,11 +10,11 @@ generates, for every problem (``op.problems(...)``: [(id, problem)]):
 * ``<op>-<problem>-dims``: ``<op>_dims(**inputs)`` agrees with the problem (when the op
   has ``<op>_dims``);
 * ``<op>-<problem>-<config name>`` for every config that should run the problem: ``run``
-  it on the problem's inputs (``<op>_test``) and ``<op>_check`` it against ``<op>_ref``
+  it on the problem's inputs (``<op>_problem``) and ``<op>_check`` it against ``<op>_ref``
   (default: ``torch.testing.assert_close``). With a tuned table (``table=``, default the
   registry's) these are the tuned configs of the problem's key and point (``op.tuned``:
-  what the dispatch can pick; no rows, no items); with ``table=None``, every grid point
-  (all must run).
+  what the dispatch can pick; no rows, no items); with ``table=None``, every config of
+  every solver (all must run).
 
 Select with ``-k``, e.g. ``-k "tp8 and tiled"``. Items run problem by problem; the inputs
 and the reference result of the current problem are computed once and kept until the
@@ -42,14 +42,14 @@ def assert_close(out, expected, /, **_):
 
 def op_tests(op, problems, *, table=_DEFAULT):
     """A pytest test function over every (problem, config) of ``op``; ``problems``:
-    [(id, problem)] (``op.problems(...)``), every dim without an ``<op>_test`` default
+    [(id, problem)] (``op.problems(...)``), every dim without an ``<op>_problem`` default
     set."""
-    if op.test is None:
-        raise TypeError(f"{op.name}: op_tests needs {op.name}_test (problem -> inputs)")
+    if op.problem is None:
+        raise TypeError(f"{op.name}: op_tests needs {op.name}_problem (problem -> inputs)")
     path = op.registry.table if table is _DEFAULT else table
     items = []
     for pid, prob in problems:
-        missing = [n for n in op.dim_names if prob.get(n) is None and n not in op._test_defaults]
+        missing = [n for n in op.dim_names if prob.get(n) is None and n not in op._defaults]
         if missing:
             raise TypeError(f"{op.name} problem {pid!r}: dims {missing} unset")
         pre = f"{op.name}-{pid}" if pid else op.name
@@ -64,12 +64,12 @@ def op_tests(op, problems, *, table=_DEFAULT):
         key = (op.name, pid)
         if key not in current:
             current.clear()  # one problem at a time: inputs can be large
-            inputs = op.test(**prob)
+            inputs = op.problem(**prob)
             try:
                 inspect.signature(op.ref).bind(**inputs)
             except TypeError as e:
-                raise TypeError(f"{op.name}_test{prob} returned arguments {op.name}_ref does "
-                                f"not take: {e}") from None
+                raise TypeError(f"{op.name}_problem{prob} returned arguments {op.name}_ref "
+                                f"does not take: {e}") from None
             current[key] = inputs, op.ref(**inputs)
         return current[key]
 
