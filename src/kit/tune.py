@@ -10,14 +10,14 @@
     python -m pyhip.kit compare    OLD.csv NEW.csv
 
 ``<module>:<op>``: an importable module holding one ``Registry`` and the op's name. The
-registry declares the table, its ``bucket`` and the bucket's tune ``points``, the
-vocabulary names the table does not store (``unkeyed``) and the interface arguments the
-timed calls cycle through copies of (``rotate``).
+registry declares the table, its ``bucket`` and the bucket's tune ``points``, the dims
+the table does not store (``unkeyed``) and the interface arguments the timed calls cycle
+through copies of (``rotate``).
 
 A tune case is a point of ``<op>_test``'s grid without the bucket axis (its id joins the
-other axes' ids, e.g. ``tp8-silu``); ``--set name=value`` overrides vocabulary values
-(another shape, a routing). ``tune``: per point, ``--rounds`` rounds, each with fresh
-inputs (``<op>_test``, seed 101 * point + round); per round every grid config runs once
+other axes' ids, e.g. ``tp8-silu``); ``--set name=value`` overrides dim values (another
+shape, a routing). ``tune``: per point, ``--rounds`` rounds, each with fresh inputs
+(``<op>_test``, seed 101 * point + round); per round every grid config runs once
 (one that raises cannot run the case: n/a), is checked against ``<op>_ref``
 (``<op>_check``: a failure is BAD) and timed cold (``kit.timing.time_cold``, the
 ``rotate`` inputs cycling through ``--copies`` copies), the configs interleaved. Every
@@ -63,8 +63,8 @@ def resolve(spec):
 
 def _bucket(op):
     b = op.registry.bucket
-    if b is None or b not in op.vocab:
-        raise SystemExit(f"{op.name}: tuning needs Registry(bucket=) naming a vocabulary name")
+    if b is None or b not in op.dim_names:
+        raise SystemExit(f"{op.name}: tuning needs Registry(bucket=) naming a dim")
     return b
 
 
@@ -74,7 +74,7 @@ def cases(op):
     b = _bucket(op)
     axes = [p for p in op._axes if b not in p.names]
     if any(b in p.names and len(p.names) > 1 for p in op._axes):
-        raise SystemExit(f"{op.name}_test: the bucket {b!r} shares a @param axis with other "
+        raise SystemExit(f"{op.name}_test: the bucket {b!r} shares a @dim axis with other "
                          "names; tuning replaces that axis")
     out = {}
     for combo in itertools.product(*(p.points() for p in axes)):
@@ -94,16 +94,16 @@ def case(op, cid, sets=()):
     c = dict(all_[cid])
     for s in sets:
         k, eq, v = s.partition("=")
-        if not eq or k not in op.vocab:
-            raise SystemExit(f"--set {s!r}: expected name=value, name in {list(op.vocab)}")
+        if not eq or k not in op.dim_names:
+            raise SystemExit(f"--set {s!r}: expected name=value, name in {list(op.dim_names)}")
         c[k] = _cell(v, op._test_defaults.get(k))
     return c
 
 
 def _keys(op):
-    """The vocabulary names the table stores, in vocabulary order (bucket excluded)."""
+    """The dims the table stores, in dim order (bucket excluded)."""
     reg = op.registry
-    return [n for n in op.vocab if n not in reg.unkeyed and n != reg.bucket]
+    return [n for n in op.dim_names if n not in reg.unkeyed and n != reg.bucket]
 
 
 def fields(op, metrics):
@@ -139,8 +139,8 @@ class _Rotation:
         return {k: f() for k, (_, f) in self.cyc.items()}
 
 
-def _inputs(op, vocab, seed):
-    return op.test(**(dict(vocab, seed=seed) if "seed" in op.vocab else vocab))
+def _inputs(op, dims, seed):
+    return op.test(**dims, seed=seed) if op._seeded else op.test(**dims)
 
 
 def tune(op, c, points, out, *, rounds=3, iters=20, ncopies=NCOPIES, log=print, cid=""):
@@ -151,14 +151,14 @@ def tune(op, c, points, out, *, rounds=3, iters=20, ncopies=NCOPIES, log=print, 
         f"{ncopies} copies of {list(op.registry.rotate)}")
     rot = _Rotation(op, ncopies)
     for p in points:
-        vocab = dict(c, **{b: p})
-        cfgs = op.configs(vocab)
+        dims = dict(c, **{b: p})
+        cfgs = op.configs(dims)
         names = [op.name_of(cfg) for cfg in cfgs]
         times = {n: [] for n in names}
         metrics = {n: {} for n in names}
         bad, na = {}, {}
         for rnd in range(rounds):
-            inputs = _inputs(op, vocab, 101 * p + rnd)
+            inputs = _inputs(op, dims, 101 * p + rnd)
             rot.bind(inputs)
             expected = op.ref(**inputs)
             for cfg, name in zip(cfgs, names):
@@ -167,7 +167,7 @@ def tune(op, c, points, out, *, rounds=3, iters=20, ncopies=NCOPIES, log=print, 
                 run = lambda over, cfg=cfg: op.run(cfg, **{**inputs, **over})  # noqa: E731
                 try:
                     res = run({})
-                except Exception as ex:  # noqa: BLE001 - the implementation cannot run it
+                except Exception as ex:  # noqa: BLE001 - the solver cannot run it
                     na[name] = type(ex).__name__
                     continue
                 try:
@@ -183,7 +183,7 @@ def tune(op, c, points, out, *, rounds=3, iters=20, ncopies=NCOPIES, log=print, 
             if name in bad or name in na:
                 continue
             us = sorted(times[name])[len(times[name]) // 2]
-            rows.append(dict({k: vocab[k] for k in _keys(op)}, **{b: p}, config=name,
+            rows.append(dict({k: dims[k] for k in _keys(op)}, **{b: p}, config=name,
                              us=f"{us:.1f}", **{k: f"{v:.1e}" for k, v in metrics[name].items()}))
         rows.sort(key=lambda r: float(r["us"]))
         if rows:
@@ -206,7 +206,7 @@ def _points(op, c, path):
 
 
 def show(op, c, path=None, out=print):
-    """Markdown, per point: the fastest config, the fastest of each implementation kind
+    """Markdown, per point: the fastest config, the fastest of each solver kind
     and the capture pick when it differs."""
     b, path = _bucket(op), path or op.registry.table
     pts = _points(op, c, path)
@@ -235,12 +235,12 @@ def verify(op, c, points, path=None, *, iters=20, ncopies=NCOPIES, log=print):
     pts = dict(_points(op, c, path))
     rot = _Rotation(op, ncopies)
     for t in points:
-        vocab = dict(c, **{b: t})
-        inputs = _inputs(op, vocab, 7 + t)
+        dims = dict(c, **{b: t})
+        inputs = _inputs(op, dims, 7 + t)
         rot.bind(inputs)
         expected = op.ref(**inputs)
-        cfg = op.pick(vocab, table=path)
-        hints = {k: vocab[k] for k in _keys(op) if k not in op._ref_names}
+        cfg = op.pick(dims, table=path)
+        hints = {k: dims[k] for k in _keys(op) if k not in op._ref_names}
         fn = lambda over: op(**{**inputs, **over}, table=path, **hints)  # noqa: E731
         try:
             m = _check(op, fn({}), expected, inputs)
@@ -388,7 +388,7 @@ def parser(prog="python -m pyhip.kit"):
     p.add_argument("-t", "--points", nargs="+", default=None,
                    help="bucket values (default: the registry's points; verify: a few)")
     p.add_argument("--set", nargs="+", default=[], metavar="NAME=VALUE",
-                   help="override vocabulary values of the case")
+                   help="override dim values of the case")
     p.add_argument("--table", default=None, help="the table (default: the registry's)")
     p.add_argument("--out", default=None, help="tune: output table (default --table); "
                                                "tune-all: output directory")

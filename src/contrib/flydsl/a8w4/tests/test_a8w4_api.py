@@ -5,7 +5,7 @@
     pytest a8w4/tests/test_a8w4_api.py -q          # from the directory holding a8w4/
 
 * names and signatures of the entry points and of the references;
-* the ops registry (``ops.moe`` / ``ops.moe_dyn``, their implementations, the table);
+* the ops registry (``ops.moe`` / ``ops.moe_dyn``, their solvers, the table);
 * dispatch: ``pick`` returns the fastest tuned config, a known kind, for the
   MiMo-V2.6-Flash TP8 / EP8 shapes, never tp1kq (``@no_capture``) under capture;
   ``moe_dyn`` has EP kernels only; an untuned key raises ValueError;
@@ -20,7 +20,7 @@ import pytest
 
 import pyhip.contrib.flydsl.a8w4 as A
 from pyhip.contrib.flydsl.a8w4 import ref
-from pyhip.contrib.flydsl.a8w4.moe import shape_vocab
+from pyhip.contrib.flydsl.a8w4.moe import shape_dims
 
 TP8 = (4096, 256, 256, 256, 8)
 EP8 = (4096, 2048, 32, 256, 8)
@@ -67,25 +67,25 @@ def test_registry():
 @pytest.mark.parametrize("tokens", [1, 77, 4096])
 @pytest.mark.parametrize("act", ["silu", "situv2"])
 def test_pick_kind(shape, tokens, act):
-    vocab = shape_vocab(shape, tokens, act)
-    cfg = MOE.pick(vocab)
-    assert cfg["kind"] in KINDS and cfg == MOE.tuned(vocab)[0]
-    assert MOE.pick(vocab, capturing=True)["kind"] != "tp1kq"  # tp1kq is @no_capture
+    dims = shape_dims(shape, tokens, act)
+    cfg = MOE.pick(dims)
+    assert cfg["kind"] in KINDS and cfg == MOE.tuned(dims)[0]
+    assert MOE.pick(dims, capturing=True)["kind"] != "tp1kq"  # tp1kq is @no_capture
 
 
 def test_dyn_pick():
-    assert MOE_DYN.pick(shape_vocab(EP8, 1, "silu", op=MOE_DYN))["kind"] == "ep3k"
+    assert MOE_DYN.pick(shape_dims(EP8, 1, "silu", op=MOE_DYN))["kind"] == "ep3k"
     with pytest.raises(ValueError):  # the MORI path needs the EP kernels: none tuned
-        MOE_DYN.pick(shape_vocab(TP8, 1, "silu", op=MOE_DYN))
+        MOE_DYN.pick(shape_dims(TP8, 1, "silu", op=MOE_DYN))
 
 
 def test_untuned():
-    for vocab in (shape_vocab((4000, 256, 256, 256, 8), 16, "silu"),  # an untuned shape
-                  shape_vocab(TP8, 16, "silu", "hot")):  # no rows of this routing
+    for dims in (shape_dims((4000, 256, 256, 256, 8), 16, "silu"),  # an untuned shape
+                 shape_dims(TP8, 16, "silu", "hot")):  # no rows of this routing
         with pytest.raises(ValueError, match="no tuned config"):
-            MOE.pick(vocab)
+            MOE.pick(dims)
     with pytest.raises(ValueError, match=r"\(no table\)"):
-        MOE.pick(shape_vocab(TP8, 16, "silu"), table=None)
+        MOE.pick(shape_dims(TP8, 16, "silu"), table=None)
 
 
 def test_table_config_roundtrip():

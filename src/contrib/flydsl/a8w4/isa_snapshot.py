@@ -90,7 +90,7 @@ def _tuned(shape, act, t, family):
     from . import moe
     from .kernels import ep_gemm as EG
 
-    cfgs = [c for c in moe.MOE.tuned(moe.shape_vocab(shape, t, act)) if c["kind"] == family]
+    cfgs = [c for c in moe.MOE.tuned(moe.shape_dims(shape, t, act)) if c["kind"] == family]
     if family == "ep3k" and cfgs:
         have = {c["cfg"] for c in cfgs}
         cfgs += [dict(kind="ep3k", cfg=p) for p in EG.CFGS if p not in have]

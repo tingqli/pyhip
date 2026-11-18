@@ -8,14 +8,14 @@ import textwrap
 import pytest
 
 from pyhip import kit
-from pyhip.kit import Registry, meta, no_capture, param, stack
+from pyhip.kit import Registry, dim, knob, meta, no_capture, stack
 from pyhip.kit.testing import assert_close
 
 pytest_plugins = ["pytester"]
 
 TOY = '''
 import random
-from pyhip.kit import Registry, meta, no_capture, param, stack
+from pyhip.kit import Registry, dim, knob, meta, no_capture, stack
 
 ops = Registry()
 op_register = ops.register
@@ -27,9 +27,9 @@ def axpy_ref(x, y, *, alpha=1.0):
 
 
 @op_register
-@param("n", (4, 6), id="n{}")
-@param("alpha", {"a1": 1.0, "a2": 2.0})
-def axpy_test(n, alpha, seed=0):
+@dim("n", (4, 6), id="n{}")
+@dim("alpha", {"a1": 1.0, "a2": 2.0})
+def axpy_test(n, alpha, *, seed=0):
     rng = random.Random(seed + n)
     return dict(x=[rng.random() for _ in range(n)], y=[rng.random() for _ in range(n)],
                 alpha=alpha)
@@ -53,7 +53,7 @@ def axpy_loop(x, y, *, alpha=1.0):
     return [alpha * a + b for a, b in zip(x, y)]
 
 
-tiles = stack(param("block", (2, 4), id="b{}"))
+tiles = stack(knob("block", (2, 4), id="b{}"))
 
 
 @op_register
@@ -68,7 +68,7 @@ def axpy_tiled(x, y, *, alpha=1.0, block=2, **over):
 
 
 @op_register
-@param("mode", ("fast", "slow"), id="{}")
+@knob("mode", ("fast", "slow"), id="{}")
 @no_capture("not graph-safe")
 @meta(rows=None, graph_safe=False)
 def axpy_queue(x, y, *, alpha=1.0, mode="fast"):
@@ -107,7 +107,7 @@ def _ops(src, **registry):
             out.append("@op_register")
         out.append(line)
     reg = Registry(**registry)
-    exec("\n".join(out), {"op_register": reg.register, "param": param,
+    exec("\n".join(out), {"op_register": reg.register, "dim": dim, "knob": knob,
                           "no_capture": no_capture, "meta": meta, "stack": stack}, {})
     return reg
 
@@ -125,9 +125,9 @@ def test_registration(toy):
     assert (op.ref, op.test, op.check, op.dims) == (toy["axpy_ref"], toy["axpy_test"],
                                                      toy["axpy_check"], toy["axpy_dims"])
     assert list(op.impls) == ["loop", "tiled", "queue"]  # axpy_dyn_* go to the longer prefix
-    assert op.vocab == ("n", "alpha", "seed")
+    assert op.dim_names == ("n", "alpha")  # seed: the data's random seed, not a dim
     dyn = ops["axpy_dyn"]
-    assert list(dyn.impls) == ["loop"] and dyn.test is None and dyn.vocab == ()
+    assert list(dyn.impls) == ["loop"] and dyn.test is None and dyn.dim_names == ()
     assert (toy["axpy_tiled"].kit_op, toy["axpy_dyn_loop"].kit_op) == ("axpy", "axpy_dyn")
     assert repr(op) == "Op('axpy', impls=['loop', 'tiled', 'queue'])"
     assert repr(ops) == "Registry(['axpy', 'axpy_dyn'])"
@@ -145,7 +145,7 @@ def test_registration_rules():
     ref = "def f_ref(x, *, a=1): pass\n"
     _raises("def f_k(x): pass\n" + ref, r"register its <op>_ref first")
     _raises(ref + "def f_k(x, *, a=1): pass\ndef f_test(n=1): pass",
-            "register it before the implementations")
+            "register it before the solvers")
     _raises(ref + "def f_dyn_test(n=1): pass", "register f_dyn_ref first")
     _raises(ref + "def f_dyn_k(x, *, a=1): pass\ndef f_dyn_ref(y): pass",
             "f_dyn_k was registered before it")
@@ -155,7 +155,7 @@ def test_registration_rules():
     _raises("def items_ref(x): pass", r"taken by Registry.items")
     _raises("def _f_ref(x): pass", "private")
     reg = Registry()
-    for bad in (int, len, param("a", (1,)), lambda x: x):
+    for bad in (int, len, knob("a", (1,)), lambda x: x):
         with pytest.raises(TypeError):
             reg.register(bad)
 
@@ -171,16 +171,16 @@ def test_registration_rules():
         def g_k(x):
             pass
     with pytest.raises(TypeError, match="outermost"):
-        stack(param("b", (1,)))(g_ref)
+        stack(knob("b", (1,)))(g_ref)
 
-    def g_bad(x, *, b=1):  # a knob without its @param
+    def g_bad(x, *, b=1):  # a knob without its @knob
         pass
 
-    @param("b", ("x y", "z"), id="{}")
+    @knob("b", ("x y", "z"), id="{}")
     def g_odd(x, *, b="z"):  # a value that cannot appear in a config name
         pass
 
-    for f, match in ((g_bad, "each knob needs exactly one @param"), (g_odd, "cannot parse")):
+    for f, match in ((g_bad, "each knob needs exactly one @knob"), (g_odd, "cannot parse")):
         with pytest.raises(TypeError, match=match):
             reg.register(f)
         assert "kit_op" not in f.__dict__ and list(reg.g.impls) == ["k"]  # left no trace
@@ -194,14 +194,14 @@ DISPATCH = '''
 def f_ref(x, *, dt="a"):
     return ("ref",)
 
-@param("n", (4,))
-def f_test(n, dt="a", mode="s", seed=0):
+@dim("n", (4,))
+def f_test(n, dt="a", mode="s", *, seed=0):
     return dict(x=[0.0] * n, dt=dt)
 
 def f_dims(x, *, dt="a"):
     return dict(n=len(x), dt=dt)
 
-@param("b", (1, 2), id="b{}")
+@knob("b", (1, 2), id="b{}")
 def f_k1(x, *, dt="a", b=1):
     return ("k1", b)
 
@@ -251,15 +251,15 @@ def test_dispatch(tmp_path):
         pick(n=4, dt="a", table=None)
     with pytest.raises(ValueError, match="no tuned config"):
         pick(n=4, dt="a", table=str(tmp_path / "none.csv"))
-    vocab = dict(op._blank, n=4, dt="a")
-    assert op.pick(vocab) is op.pick(dict(vocab))  # memoized
-    assert [op.name_of(c) for c in op.tuned(dict(vocab, n=3))] == ["k1 b2", "k2", "k3"]
-    assert op.tuned(dict(vocab, dt="d")) == [] and op.tuned(vocab, table=None) == []
-    assert [(n, [op.name_of(c) for _, c in cs]) for n, cs in op.points(vocab)] == [
-        (4, ["k1 b2", "k2", "k3"]), (16, ["k3", "k1 b1"])]  # zz: not an implementation
+    dims = dict(op._blank, n=4, dt="a")
+    assert op.pick(dims) is op.pick(dict(dims))  # memoized
+    assert [op.name_of(c) for c in op.tuned(dict(dims, n=3))] == ["k1 b2", "k2", "k3"]
+    assert op.tuned(dict(dims, dt="d")) == [] and op.tuned(dims, table=None) == []
+    assert [(n, [op.name_of(c) for _, c in cs]) for n, cs in op.points(dims)] == [
+        (4, ["k1 b2", "k2", "k3"]), (16, ["k3", "k1 b1"])]  # zz: not a solver
     with pytest.raises(ValueError, match="needs n"):
         op.pick(dict(op._blank, dt="a"))
-    with pytest.raises(TypeError, match="lacks"):
+    with pytest.raises(TypeError, match="lack"):
         op.pick(dict(n=4))
     # a call: dims and hints -> pick -> run
     x3, x4 = [0.0] * 3, [0.0] * 4
@@ -332,8 +332,7 @@ def test_tune(tmp_path, monkeypatch):
     from pyhip.kit import table
     from pyhip.kit import tune as kt
 
-    src = TOY.replace("ops = Registry()", "ops = Registry(table=TABLE, bucket='n', points=(4, 6), "
-                                          "unkeyed=('seed',))")
+    src = TOY.replace("ops = Registry()", "ops = Registry(table=TABLE, bucket='n', points=(4, 6))")
     mod = types.ModuleType("kit_toy_tune")
     mod.TABLE = str(tmp_path / "tuned.csv")
     exec(compile(src, "toy.py", "exec"), mod.__dict__)
@@ -345,8 +344,10 @@ def test_tune(tmp_path, monkeypatch):
     with pytest.raises(SystemExit, match="expected <module>:<op>"):
         kt.resolve("axpy")
     cases = kt.cases(op)  # the n axis (the bucket) is dropped
-    assert list(cases) == ["a1", "a2"] and cases["a2"] == dict(n=None, alpha=2.0, seed=0)
-    assert kt.case(op, "a1", ["alpha=3", "seed=5"]) == dict(n=None, alpha=3, seed=5)
+    assert list(cases) == ["a1", "a2"] and cases["a2"] == dict(n=None, alpha=2.0)
+    assert kt.case(op, "a1", ["alpha=3"]) == dict(n=None, alpha=3)
+    with pytest.raises(SystemExit, match="name in \\['n', 'alpha'\\]"):
+        kt.case(op, "a1", ["seed=5"])  # not a dim
     with pytest.raises(SystemExit, match="no tune case"):
         kt.case(op, "a3")
     assert kt.fields(op, ["err"]) == ["alpha", "n", "config", "us", "err"]
@@ -373,15 +374,14 @@ def test_bench(tmp_path, monkeypatch):
 
     from pyhip.kit import bench as kb
 
-    src = TOY.replace("ops = Registry()", "ops = Registry(table=TABLE, bucket='n', points=(4, 6), "
-                                          "unkeyed=('seed',))")
+    src = TOY.replace("ops = Registry()", "ops = Registry(table=TABLE, bucket='n', points=(4, 6))")
     mod = types.ModuleType("kit_toy_bench")
     mod.TABLE = str(tmp_path / "tuned.csv")
     with open(mod.TABLE, "w") as f:
         f.write("alpha,n,config,us,err\n1.0,4,loop,2.0,0\n1.0,4,tiled b4,1.0,0\n")
     exec(compile(src, "toy.py", "exec"), mod.__dict__)
     op = mod.ops.axpy
-    case = dict(n=None, alpha=1.0, seed=0)
+    case = dict(n=None, alpha=1.0)
 
     # variants: [label=]base[:k=v,...] and py:<file>:<func>
     v = kb.parse_variant(op, "t=tiled b2:block=4,mode=x/1")
@@ -453,7 +453,7 @@ def test_bench(tmp_path, monkeypatch):
 
 
 def test_marks_return_the_function_in_written_order():
-    a, b, c = param("p", (1,)), no_capture("r"), meta(k=1)
+    a, b, c = knob("p", (1,)), no_capture("r"), meta(k=1)
 
     def f():
         pass
@@ -475,33 +475,34 @@ def test_marks_return_the_function_in_written_order():
 def test_cases(toy):
     cases = toy["ops"]["axpy"].cases()
     assert [cid for cid, _ in cases] == ["n4-a1", "n4-a2", "n6-a1", "n6-a2"]
-    assert cases[1][1] == dict(n=4, alpha=2.0, seed=0)
+    assert cases[1][1] == dict(n=4, alpha=2.0)
     assert toy["ops"]["axpy_dyn"].cases() == []
 
 
-def test_param_forms():
-    p = param("tokens, valid", {"v0": (512, 0), "v37": (512, 37)})
+def test_axis_forms():
+    p = dim("tokens, valid", {"v0": (512, 0), "v37": (512, 37)})
     assert p.points() == [("v0", dict(tokens=512, valid=0)), ("v37", dict(tokens=512, valid=37))]
     assert p.token(dict(tokens=512, valid=37)) == "v37"
-    q = param("split", lambda dim: [s for s in (1, 2, 4) if dim % s == 0], id="ks{}")
+    q = knob("split", lambda dim: [s for s in (1, 2, 4) if dim % s == 0], id="ks{}")
     assert q.points(dict(dim=6)) == [("ks1", dict(split=1)), ("ks2", dict(split=2))]
-    for bad in (lambda: param("a, b", (1, 2)), lambda: param("a", {"x": 1}, id="{}"),
-                lambda: param("a", (1,), id="a"), lambda: param("a a", (1,)),
-                lambda: param("a, b", {"x": (1, 2, 3)}), lambda: param("a", "xy")):
+    for bad in (lambda: knob("a, b", (1, 2)), lambda: knob("a", {"x": 1}, id="{}"),
+                lambda: knob("a", (1,), id="a"), lambda: knob("a a", (1,)),
+                lambda: dim("a, b", {"x": (1, 2, 3)}), lambda: dim("a", "xy"),
+                lambda: dim("a", lambda: (1,))):
         with pytest.raises(TypeError):
             bad()
 
 
 def test_configs_and_capture(toy):
     op = toy["ops"]["axpy"]
-    cfgs = op.configs(dict(n=6, alpha=1.0, seed=0))
+    cfgs = op.configs(dict(n=6, alpha=1.0))
     assert [op.name_of(c) for c in cfgs] == ["loop", "tiled b2", "tiled b4", "queue fast",
                                              "queue slow"]
     assert [op.capturable(c) for c in cfgs] == [True, True, True, False, False]
     assert op.capturable(dict(kind="tiled", block=4, extra=1))
     with pytest.raises(AssertionError, match="n=6 % block 4"):  # limits: the impl raises
         op.run(dict(kind="tiled", block=4), [0.0] * 6, [0.0] * 6)
-    with pytest.raises(KeyError, match="no implementation 'nope'"):
+    with pytest.raises(KeyError, match="no solver 'nope'"):
         op.capturable(dict(kind="nope"))
     with pytest.raises(TypeError, match="unknown knob"):
         op.capturable(dict(kind="queue", mode="fast", extra=1))
@@ -509,7 +510,7 @@ def test_configs_and_capture(toy):
 
 def test_names(toy):
     op = toy["ops"]["axpy"]
-    for cfg in op.configs(dict(n=4, alpha=1.0, seed=0)):
+    for cfg in op.configs(dict(n=4, alpha=1.0)):
         assert op.parse(op.name_of(cfg)) == cfg
     cfg = dict(kind="tiled", block=4, arb=128, tag="x1", f=0.5)
     assert op.name_of(cfg) == "tiled b4:arb=128,tag=x1,f=0.5"
@@ -534,31 +535,34 @@ def test_meta_and_run(toy):
 def test_convention_errors():
     ref = "def f_ref(x, *, a=1): pass\n"
     _raises(ref + "def f_k(x, *, a=2, b=1): pass", "must start with exactly")
-    _raises(ref + "def f_k(x, *, a=1, b=1): pass", "each knob needs exactly one @param")
-    _raises(ref + "@param('b', (1,))\n@param('c', (1,))\ndef f_k(x, *, a=1, b=1): pass",
-            "each knob needs exactly one @param")
-    _raises(ref + "@param('b', (1,))\ndef f_k(x, b, *, a=1): pass", "must start with exactly")
-    _raises(ref + "@param('b', (1,))\ndef f_k(x, *, a=1, b): pass", "keyword-only knob")
-    _raises(ref + "def f_test(n=1): pass\n@param('n', (1,))\ndef f_k(x, *, a=1, n=1): pass",
-            r"clash with the vocabulary")
-    _raises(ref + "@param('b', (1,))\n@meta(m=lambda q: q)\ndef f_k(x, *, a=1, b=1): pass",
+    _raises(ref + "def f_k(x, *, a=1, b=1): pass", "each knob needs exactly one @knob")
+    _raises(ref + "@knob('b', (1,))\n@knob('c', (1,))\ndef f_k(x, *, a=1, b=1): pass",
+            "each knob needs exactly one @knob")
+    _raises(ref + "@knob('b', (1,))\ndef f_k(x, b, *, a=1): pass", "must start with exactly")
+    _raises(ref + "@knob('b', (1,))\ndef f_k(x, *, a=1, b): pass", "keyword-only knob")
+    _raises(ref + "def f_test(n=1): pass\n@knob('n', (1,))\ndef f_k(x, *, a=1, n=1): pass",
+            r"clash with the dims")
+    _raises(ref + "@knob('b', (1,))\n@meta(m=lambda q: q)\ndef f_k(x, *, a=1, b=1): pass",
             r"meta 'm' uses unknown")
-    _raises(ref + "@param('b', lambda q: (1,))\ndef f_k(x, *, a=1, b=1): pass",
-            "outside the vocabulary")
-    _raises(ref + "def f_test(n, m=1): pass", r"\['n'\] need a default or a @param")
-    _raises(ref + "@param('q', (1,))\ndef f_test(n=1): pass", "must be distinct parameters")
-    _raises(ref + "@param('n', lambda: (1,))\ndef f_test(n): pass", "a sequence or a dict")
-    _raises(ref + "@no_capture('r')\ndef f_test(n=1): pass", "only @param marks")
+    _raises(ref + "@knob('b', lambda q: (1,))\ndef f_k(x, *, a=1, b=1): pass",
+            "outside the dims")
+    _raises(ref + "@dim('b', (1,))\ndef f_k(x, *, a=1, b=1): pass", "@dim describes the problem")
+    _raises(ref + "def f_test(n, m=1): pass", r"\['n'\] need a default or a @dim")
+    _raises(ref + "@dim('q', (1,))\ndef f_test(n=1): pass", "must be distinct dims")
+    _raises(ref + "@dim('n', lambda: (1,))\ndef f_test(n): pass", "a sequence or a dict")
+    _raises(ref + "@no_capture('r')\ndef f_test(n=1): pass", "only @dim marks")
+    _raises(ref + "@knob('n', (1,))\ndef f_test(n=1): pass", "only @dim marks")
+    _raises(ref + "def f_test(n=1, seed=0): pass", "seed .* must be keyword-only")
     _raises(ref + "def f_test(*a): pass", "named parameters only")
     _raises(ref + "def f_check(out): pass", "does not take the arguments")
     _raises("def f_ref(x, *, out=None): pass\ndef f_check(out, expected, **_): pass",
             "multiple values for argument 'out'")
     _raises(ref + "def f_dims(y): pass", "does not take the arguments")
     _raises("def f_ref(x, *a): pass", "named parameters only")
-    _raises("@meta(k=1)\ndef f_ref(x): pass", "only implementations")
-    _raises(ref + "@param('b', ('x y', 'z'), id='{}')\ndef f_k(x, *, a=1, b='z'): pass",
+    _raises("@meta(k=1)\ndef f_ref(x): pass", "only solvers")
+    _raises(ref + "@knob('b', ('x y', 'z'), id='{}')\ndef f_k(x, *, a=1, b='z'): pass",
             "cannot parse")
-    _raises(ref + "@param('b', ('1', '2'), id='{}')\ndef f_k(x, *, a=1, b=0): pass",
+    _raises(ref + "@knob('b', ('1', '2'), id='{}')\ndef f_k(x, *, a=1, b=0): pass",
             "reads back")
     ok = _ops(ref + "def f_check(out, expected, **inputs): pass\ndef f_dims(x, *, a=1): pass\n")
     assert list(ok["f"].impls) == [] and ok.f.check is not None and ok.f.dims is not None

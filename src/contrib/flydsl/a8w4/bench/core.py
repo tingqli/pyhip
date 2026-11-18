@@ -30,7 +30,7 @@ from pyhip.kit.timing import (  # noqa: F401 - re-exported for the bench tools
 
 from .. import ref as R
 from ..kernels import ep_gemm as EG
-from ..moe import MOE, shape_vocab
+from ..moe import MOE, shape_dims
 from ..ref import COS_TOL, SHAPES  # noqa: F401 - COS_TOL: re-exported for the tools
 
 PKG_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -87,10 +87,9 @@ class Case:
         x, tw, ti = self.inputs(tokens, seed, local)
         return dict(x=x, W=R._weights(E, H, I), topk_weights=tw, topk_ids=ti, **self.kwargs())
 
-    def vocab(self, tokens=None):
-        """The ``ops.moe`` vocabulary of the case at ``tokens``."""
-        return dict(shape_vocab(self.shape, tokens, self.act, self.routing), expert_offset=self.e0,
-                    seed=0)
+    def dims(self, tokens=None):
+        """The ``ops.moe`` dims of the case at ``tokens``."""
+        return dict(shape_dims(self.shape, tokens, self.act, self.routing), expert_offset=self.e0)
 
     def describe(self):
         H, I, E, EGl, K = self.shape
@@ -218,14 +217,14 @@ class Resolved:
     config: str
     run: object
     cfg: object = None  # the config dict, overrides included (None: py variant)
-    bm: object = None  # the implementation's @meta tile_m (rows per block; None: none)
+    bm: object = None  # the solver's @meta tile_m (rows per block; None: none)
     cached: object = None  # @meta cached_loads: reads W / A with cached loads (None: unknown)
 
 
 def resolve(v, case, tokens):
     """``kit.bench.resolve`` on the case -> Resolved with ``run(x, W, tw, ti)``, or a str
     (no tuned config for ``@table``)."""
-    r = kb.resolve(MOE, v, case.vocab(tokens))
+    r = kb.resolve(MOE, v, case.dims(tokens))
     if isinstance(r, str):
         return r
     kw = case.kwargs()

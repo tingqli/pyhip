@@ -8,38 +8,38 @@
         return alpha * x + y
 
     @op_register
-    @param("n", (64, 1000))
-    def axpy_test(n, seed=0):                         # test inputs; vocabulary: n, seed
+    @dim("n", (64, 1000))
+    def axpy_test(n, *, seed=0):                      # problem -> data; dims: n
         g = torch.Generator().manual_seed(seed)
         return dict(x=torch.randn(n, generator=g), y=torch.randn(n, generator=g))
 
     @op_register
-    def axpy_dims(x, y, *, alpha=1.0):                # vocabulary values of a real call
+    def axpy_dims(x, y, *, alpha=1.0):                # data -> the dims of a real call
         return dict(n=x.numel())
 
     @op_register                                      # outermost, above the kit marks
-    @param("block", (16, 64), id="b{}")
-    def axpy_tiled(x, y, *, alpha=1.0, block=16):     # implementation "tiled", knob block
+    @knob("block", (16, 64), id="b{}")
+    def axpy_tiled(x, y, *, alpha=1.0, block=16):     # solver "tiled", knob block
         assert x.numel() % block == 0, f"n={x.numel()} % block {block}"  # a limit: raise
         ...
 
-    ops.axpy.configs(dict(n=64, seed=0))              # [{"kind": "tiled", "block": 16}, ...]
+    ops.axpy.configs(dict(n=64))                      # [{"kind": "tiled", "block": 16}, ...]
 
-The vocabulary names are defined by the op's ``<op>_test`` function and describe a
-concrete problem instance (for example ``n`` and ``seed`` in ``axpy_test``). Knobs are
-defined by an implementation function such as ``<op>_<kind>`` and are the tuning
-choices of that implementation (for example ``block`` in ``axpy_tiled``). In other
-words, vocabulary answers "what problem am I solving?" and knobs answer "how is this
-implementation configured?".
+A problem is a dict of dim values. The dims are the parameters of ``<op>_test`` but
+``seed`` (the random seed of the data, a keyword-only parameter): they describe the
+problem (``n`` in ``axpy_test``). The knobs are the keyword-only parameters of a solver
+``<op>_<kind>``, each with its ``@knob`` values: the tuning choices of that solver
+(``block`` in ``axpy_tiled``). Dims answer "which problem?", knobs "how is this solver
+set?".
 
-The vocabulary is used by ``<op>_dims`` and ``@meta`` logic when a real call or a test
-case is evaluated, and keys the tuned table. The knobs are used by the implementation's
-``@param`` grid, config naming/parsing, and runtime dispatch.
+``<op>_dims`` and ``@meta`` read the dims of a call or a test problem; the tuned table is
+keyed by dims. The knobs make the solver's ``@knob`` grid, the config names and what the
+dispatch runs.
 
-Limits are not declared: an implementation raises (an ``assert`` is enough) when it
+Limits are not declared: a solver raises (an ``assert`` is enough) when it
 cannot run a call. The tuner runs every grid point and keeps the configs that ran and
 passed ``<op>_check``; ``op(...)`` only picks those, so a call is guaranteed for a
-tuned key only. ``@no_capture(reason)`` marks an implementation that cannot run under
+tuned key only. ``@no_capture(reason)`` marks a solver that cannot run under
 CUDA-graph capture: the dispatch skips it while the current stream captures.
 
 Registration: ``Registry.register`` (``@op_register``) adds one function to its op and
@@ -50,9 +50,8 @@ returns it unchanged, after checking it against the conventions below:
 * The name gives the role. ``<op>_ref`` defines op ``<op>`` and is registered first.
   Any other ``<op>_<suffix>`` joins the registered op with the longest such prefix
   (``moe_dyn_ep3k`` belongs to ``moe_dyn`` once ``moe_dyn_ref`` is registered): suffix
-  ``test`` / ``check`` / ``dims`` is that role, any other suffix an implementation.
-  ``<op>_test`` comes before the implementations (they are checked against its
-  vocabulary).
+  ``test`` / ``check`` / ``dims`` is that role, any other suffix a solver.
+  ``<op>_test`` comes before the solvers (they are checked against its dims).
 * One registry per package (a small module holding ``ops = Registry()``, imported by
   the modules that register): a package imported under two names keeps two registries.
 
@@ -60,45 +59,46 @@ Conventions:
 
 * ``<op>_ref`` defines op ``<op>``: its parameters are the interface (named parameters
   only), its result the expected answer.
-* ``<op>_<kind>`` is implementation ``kind``; the longest op prefix wins (``moe_dyn_ep3k``
+* ``<op>_<kind>`` is solver ``kind``; the longest op prefix wins (``moe_dyn_ep3k``
   belongs to ``moe_dyn`` when ``moe`` and ``moe_dyn`` both exist). Parameters: exactly
-  the ref's, then keyword-only knobs with defaults, each with a ``@param``, then
+  the ref's, then keyword-only knobs with defaults, each with a ``@knob``, then
   optionally ``**over`` (free overrides, e.g. for experiments).
 * ``<op>_test(...)`` returns the interface arguments (a dict) of one problem. Its
-  parameter names are the op's vocabulary, the names ``meta`` / ``dims`` and the tuned
-  table speak; its ``@param`` grid gives the test cases.
+  parameter names but ``seed`` are the op's dims, the names ``meta`` / ``dims`` and the
+  tuned table speak; its ``@dim`` grid gives the test cases. ``seed``, when present, is
+  keyword-only with a default.
 * ``<op>_check(out, expected, **inputs)`` raises when ``out`` is wrong; it may return a
   dict of error metrics. Default: ``torch.testing.assert_close``. The first two
   arguments come by position: name them apart from the interface's parameters.
-* ``<op>_dims(...)`` takes the ref's parameters and returns vocabulary values.
+* ``<op>_dims(...)`` takes the ref's parameters and returns dim values.
   ``op(...)`` calls it on every call (``config=`` too): the place to check the
   arguments.
-* Suffixes ``ref``, ``test``, ``check``, ``dims`` are reserved; an implementation name
+* Suffixes ``ref``, ``test``, ``check``, ``dims`` are reserved; a solver name
   does not end in ``_test`` / ``_check`` / ``_dims`` either. Names starting with ``_``
   are not registered.
 
 A config is a dict ``{"kind": kind, knob: value, ...}``. Its name joins the kind and the
-``@param`` ids with spaces (``"tiled b64"``), overrides appended as ``":k=v,k=v"``.
+``@knob`` ids with spaces (``"tiled b64"``), overrides appended as ``":k=v,k=v"``.
 
 Dispatch: ``Registry(name, table=path, bucket=name, relax={name: value})`` declares a
-tuned table for its ops. ``op(*args, **kwargs)`` reads the vocabulary of the call
-(``<op>_dims``, plus keyword arguments that are vocabulary names: hints such as
-``routing=``), picks a config (``op.pick``) and runs it; ``config=`` forces one,
-``table=`` another table (None: none). ``op.pick(vocab, table=, capturing=)``:
+tuned table for its ops. ``op(*args, **kwargs)`` reads the dims of the call
+(``<op>_dims``, plus keyword arguments that are dim names: hints such as ``routing=``),
+picks a config (``op.pick``) and runs it; ``config=`` forces one, ``table=`` another
+table (None: none). ``op.pick(dims, table=, capturing=)``:
 
-* The table is a CSV. Columns that are vocabulary names are keys, except the bucket
-  column; ``config`` holds a config name, ``us`` its time; other columns are ignored.
-  Rows of kinds that are not implementations of the op are skipped. A key that is None
-  in ``vocab`` matches the ``<op>_test`` default.
-* The rows of ``vocab``'s key (if none: the key with ``relax`` substituted), at the first
-  tuned point of the bucket >= ``vocab[bucket]`` (the largest point beyond): these are
-  ``op.tuned(vocab)``, fastest first. ``pick`` returns the first, skipping
-  ``@no_capture`` implementations when ``capturing``; no rows: ValueError (tune the key
-  or pass ``config=``).
-* Memoized per (table, its mtime, vocabulary values, capturing): the returned dict is
-  shared, do not modify it; ``op(...)`` memoizes its pick per (table, its mtime,
-  capturing, the ``<op>_dims`` values and hints of the call). The mtime is read at
-  most once a second per table: an edited table is used within a second.
+* The table is a CSV. Columns that are dim names are keys, except the bucket column;
+  ``config`` holds a config name, ``us`` its time; other columns are ignored. Rows of
+  kinds that are not solvers of the op are skipped. A key that is None in ``dims``
+  matches the ``<op>_test`` default.
+* The rows of the key of ``dims`` (if none: the key with ``relax`` substituted), at the
+  first tuned point of the bucket >= ``dims[bucket]`` (the largest point beyond): these
+  are ``op.tuned(dims)``, fastest first. ``pick`` returns the first, skipping
+  ``@no_capture`` solvers when ``capturing``; no rows: ValueError (tune the key or pass
+  ``config=``).
+* Memoized per (table, its mtime, dim values, capturing): the returned dict is shared,
+  do not modify it; ``op(...)`` memoizes its pick per (table, its mtime, capturing, the
+  ``<op>_dims`` values and hints of the call). The mtime is read at most once a second
+  per table: an edited table is used within a second.
 
 The decorators only record themselves in ``f.kit_marks`` (in written order) and return
 ``f`` unchanged. ``pyhip.kit.testing`` turns the ops into pytest tests.
@@ -117,7 +117,7 @@ from collections.abc import Mapping
 
 from . import table as _table
 
-__all__ = ["param", "no_capture", "meta", "stack", "Registry", "Op"]
+__all__ = ["dim", "knob", "no_capture", "meta", "stack", "Registry", "Op"]
 
 ROLES = ("ref", "test", "check", "dims")
 _FIELD = re.compile(r"\{[^{}]*\}")
@@ -251,16 +251,15 @@ def _capturing():
     return _cuda.is_current_stream_capturing()
 
 
-class param(_Mark):
-    """One axis of a grid; stacked ``@param``s form their Cartesian product, the first
-    written outermost.
+class _Axis(_Mark):
+    """One axis of a grid (``dim`` / ``knob``); stacked axes form their Cartesian
+    product, the first written outermost.
 
-        @param("bm", (32, 64), id="bm{}")             # a sequence of values
-        @param("act", ("silu", "gelu"), id="{}")
-        @param("fp8", {"bf16": False, "fp8": True})   # a dict: the keys are the ids
-        @param("tokens, valid", {"v0": (512, 0), "v37": (512, 37)})   # several names
-        @param("split", lambda dim: (1, 2, 4))        # a function of vocabulary names
-                                                      # (implementation knobs only)
+        @knob("bm", (32, 64), id="bm{}")              # a sequence of values
+        @dim("act", ("silu", "gelu"), id="{}")
+        @knob("fp8", {"bf16": False, "fp8": True})    # a dict: the keys are the ids
+        @dim("tokens, valid", {"v0": (512, 0), "v37": (512, 37)})   # several names
+        @knob("split", lambda dim: (1, 2, 4))         # a function of dims (knobs only)
 
     ``id`` is a format string with one ``{}`` field (default ``name + "{}"``): the
     axis' part of config names and test ids. Config names must read back, so a
@@ -268,39 +267,40 @@ class param(_Mark):
     """
 
     def __init__(self, names, values, id=None):
+        what = f"{type(self).__name__} {names!r}"
         self.names = tuple(n.strip() for n in names.split(","))
         if not all(n.isidentifier() for n in self.names) or len(set(self.names)) < len(self.names):
-            raise TypeError(f"param: bad names {names!r}")
+            raise TypeError(f"{type(self).__name__}: bad names {names!r}")
         self.fmt = self.table = self.values = None
         if isinstance(values, str):
-            raise TypeError(f"param {names!r}: values {values!r} is a string, not a sequence")
+            raise TypeError(f"{what}: values {values!r} is a string, not a sequence")
         if isinstance(values, dict):
             if id is not None:
-                raise TypeError(f"param {names!r}: a dict's keys are the ids; drop id=")
+                raise TypeError(f"{what}: a dict's keys are the ids; drop id=")
             self.table = {}
             for k, v in values.items():
                 v = tuple(v) if len(self.names) > 1 else (v,)
                 if len(v) != len(self.names):
-                    raise TypeError(f"param {names!r}: {k!r} has {len(v)} values")
+                    raise TypeError(f"{what}: {k!r} has {len(v)} values")
                 self.table[str(k)] = dict(zip(self.names, v))
         elif len(self.names) > 1:
-            raise TypeError(f"param {names!r}: several names take a dict {{id: values}}")
+            raise TypeError(f"{what}: several names take a dict {{id: values}}")
         else:
             self.fmt = self.names[0] + "{}" if id is None else id
             if len(_FIELD.findall(self.fmt)) != 1:
-                raise TypeError(f"param {names!r}: id {self.fmt!r} needs exactly one {{}} field")
+                raise TypeError(f"{what}: id {self.fmt!r} needs exactly one {{}} field")
             self.values = _Call(values) if callable(values) else tuple(values)
 
     def __repr__(self):
-        return f"param({', '.join(self.names)!r})"
+        return f"{type(self).__name__}({', '.join(self.names)!r})"
 
-    def points(self, vocab=None):
-        """[(id, {name: value})] of the axis (``vocab`` feeds a values function)."""
+    def points(self, dims=None):
+        """[(id, {name: value})] of the axis (``dims`` feeds a values function)."""
         if self.table is not None:
             return [(k, dict(d)) for k, d in self.table.items()]
         vals = self.values
         if isinstance(vals, _Call):
-            vals = vals([vocab[n] for n in vals.names], {})
+            vals = vals([dims[n] for n in vals.names], {})
         return [(self.fmt.format(v), {self.names[0]: v}) for v in vals]
 
     def token(self, knobs):
@@ -328,8 +328,23 @@ class param(_Mark):
         return {self.names[0]: _convert(text, defaults[self.names[0]])}
 
 
+class dim(_Axis):
+    """Values of problem dims, on ``<op>_test``: ``@dim("act", ("silu", "gelu"),
+    id="{}")``. A sequence or a dict of values (see ``_Axis``)."""
+
+    def __init__(self, names, values, id=None):
+        if callable(values):
+            raise TypeError(f"dim {names!r}: values must be a sequence or a dict")
+        super().__init__(names, values, id)
+
+
+class knob(_Axis):
+    """Values of a solver knob, on ``<op>_<kind>``: ``@knob("block", (16, 64),
+    id="b{}")``. A sequence, a dict, or a function of dims (see ``_Axis``)."""
+
+
 class no_capture(_Mark):
-    """The implementation cannot run under CUDA-graph capture (e.g. it passes a host
+    """The solver cannot run under CUDA-graph capture (e.g. it passes a host
     counter by launch argument): ``op(...)`` / ``pick`` skip it while the current
     stream captures. ``@no_capture("host launch epoch")``."""
 
@@ -341,15 +356,15 @@ class no_capture(_Mark):
 
 
 class meta(_Mark):
-    """Metadata for tools, read with ``Op.meta``: constants, or functions of vocabulary
-    names and knobs. ``@meta(tile_m=64, cached=lambda bcm: bcm != 2)``."""
+    """Metadata for tools, read with ``Op.meta``: constants, or functions of dims and
+    knobs. ``@meta(tile_m=64, cached=lambda bcm: bcm != 2)``."""
 
     def __init__(self, **items):
         self.items = {k: _Call(v) if callable(v) else v for k, v in items.items()}
 
 
 class stack(_Mark):
-    """Several marks as one, e.g. a configuration space shared by implementations:
+    """Several marks as one, e.g. a configuration space shared by solvers:
     ``@stack(a, b)`` is ``@a`` followed by ``@b``."""
 
     def __init__(self, *marks):
@@ -369,15 +384,18 @@ def _sig(op, role, f):
 
 
 class _Impl:
-    """An implementation as its op sees it."""
+    """A solver as its op sees it."""
 
     __slots__ = ("kind", "f", "params", "no_capture", "meta", "defaults", "knobs", "keys",
                  "varkw", "regex")
 
-    def __init__(self, op, kind, f, ref_params, vocab):
+    def __init__(self, op, kind, f, ref_params, dims):
         where = f"{op}_{kind}"
         if not kind.isidentifier() or kind in ROLES:
-            raise TypeError(f"{where}: bad implementation name {kind!r}")
+            raise TypeError(f"{where}: bad solver name {kind!r}")
+        if _marks(f, dim):
+            raise TypeError(f"{where}: @dim describes the problem; it goes on {op}_test "
+                            "(a solver's options are @knob)")
         ps = list(inspect.signature(f).parameters.values())
         if ([(p.name, p.kind, p.default) for p in ps[:len(ref_params)]]
                 != [(p.name, p.kind, p.default) for p in ref_params]):
@@ -393,15 +411,15 @@ class _Impl:
                 raise TypeError(f"{where}: parameter '{p}' after the {op}_ref ones must be a "
                                 "keyword-only knob with a default, or **over")
         knobs = list(self.defaults)
-        clash = [k for k in knobs if k in vocab or k == "kind"]
+        clash = [k for k in knobs if k in dims or k == "kind"]
         if clash:
-            raise TypeError(f"{where}: knob(s) {clash} clash with the vocabulary of {op} "
-                            f"{list(vocab)} or with 'kind'")
-        self.params = tuple(_marks(f, param))
+            raise TypeError(f"{where}: knob(s) {clash} clash with the dims of {op} "
+                            f"{list(dims)} or with 'kind'")
+        self.params = tuple(_marks(f, knob))
         names = [n for p in self.params for n in p.names]
         if len(set(names)) < len(names) or set(names) != set(knobs):
-            raise TypeError(f"{where}: each knob needs exactly one @param; knobs {knobs}, "
-                            f"@param names {names}")
+            raise TypeError(f"{where}: each knob needs exactly one @knob; knobs {knobs}, "
+                            f"@knob names {names}")
         self.knobs = frozenset(knobs)
         self.keys = self.knobs | {"kind"}
         caps = _marks(f, no_capture)
@@ -409,17 +427,17 @@ class _Impl:
         self.meta = {}
         for m in _marks(f, meta):
             self.meta.update(m.items)
-        known = (*vocab, *knobs)
+        known = (*dims, *knobs)
         for k, v in self.meta.items():
             bad = _unknown(v.names, known) if isinstance(v, _Call) else ()
             if bad:
                 raise TypeError(f"{where}: meta {k!r} uses unknown name(s) {bad}; known: "
                                 f"{list(known)}")
         for p in self.params:
-            bad = _unknown(p.values.names, vocab) if isinstance(p.values, _Call) else ()
+            bad = _unknown(p.values.names, dims) if isinstance(p.values, _Call) else ()
             if bad:
                 raise TypeError(f"{where}: the values of {p!r} use name(s) {bad} outside the "
-                                f"vocabulary {list(vocab)}")
+                                f"dims {list(dims)}")
         rx = re.escape(kind) + "".join(" " + p.pattern(f"_p{i}") for i, p in enumerate(self.params))
         self.regex = re.compile(rx + ("(?::(?P<_over>.+))?" if self.varkw else "") + r"\Z")
 
@@ -429,14 +447,14 @@ class Op:
     one function at a time; read-only otherwise.
 
     Attributes: ``name``, ``ref``, ``test``, ``check``, ``dims`` (None when absent),
-    ``impls`` ({kind: function}), ``vocab`` (the ``<op>_test`` parameter names). A
-    ``vocab`` argument is a dict {name: value} holding every vocabulary name (None:
+    ``impls`` ({kind: function}), ``dim_names`` (the ``<op>_test`` parameter names but
+    ``seed``). A ``dims`` argument is a dict {name: value} holding every dim name (None:
     unknown).
     """
 
-    __slots__ = ("name", "ref", "test", "check", "dims", "impls", "vocab", "_imp", "_fns",
-                 "_axes", "_test_defaults", "_ref_params", "_ref_names", "_registry", "_vget",
-                 "_blank", "_tables", "_memo", "_calls")
+    __slots__ = ("name", "ref", "test", "check", "dims", "impls", "dim_names", "_imp", "_fns",
+                 "_axes", "_test_defaults", "_seeded", "_ref_params", "_ref_names", "_registry",
+                 "_dget", "_blank", "_tables", "_memo", "_calls")
 
     def __init__(self, name, ref, registry=None):
         ref_params = list(inspect.signature(ref).parameters.values())
@@ -444,23 +462,23 @@ class Op:
             raise TypeError(f"{_sig(name, 'ref', ref)}: the interface takes named parameters "
                             "only (no '/', *args, **kwargs)")
         if _marks(ref):
-            raise TypeError(f"{name}_ref: only implementations and {name}_test take kit marks")
+            raise TypeError(f"{name}_ref: only solvers and {name}_test take kit marks")
         taken = [p.name for p in ref_params if p.name in ("config", "table")]
         if taken:
             raise TypeError(f"{_sig(name, 'ref', ref)}: {taken} are reserved (op(...) takes "
                             "config= and table=)")
         fns = {}
         for k, v in dict(name=name, ref=ref, test=None, check=None, dims=None,
-                         impls=types.MappingProxyType(fns), vocab=(), _imp={}, _fns=fns,
-                         _axes=(), _test_defaults={}, _ref_params=ref_params,
+                         impls=types.MappingProxyType(fns), dim_names=(), _imp={}, _fns=fns,
+                         _axes=(), _test_defaults={}, _seeded=False, _ref_params=ref_params,
                          _ref_names=frozenset(p.name for p in ref_params),
                          _registry=registry if registry is not None else Registry(),
-                         _vget=_getter(()), _blank={}, _tables={}, _memo={},
+                         _dget=_getter(()), _blank={}, _tables={}, _memo={},
                          _calls={}).items():
             object.__setattr__(self, k, v)
 
     def _add(self, suffix, f):
-        """Add ``f`` as role ``suffix`` (test / check / dims) or as implementation
+        """Add ``f`` as role ``suffix`` (test / check / dims) or as solver
         ``suffix``; the op is unchanged when ``f`` breaks a convention."""
         if suffix in ROLES and getattr(self, suffix) is not None:
             raise TypeError(f"{self.name}_{suffix} is already registered")
@@ -474,34 +492,38 @@ class Op:
     def _add_test(self, test):
         name = self.name
         if self._imp:
-            raise TypeError(f"{name}_test: register it before the implementations "
-                            f"{list(self._imp)} (they use its vocabulary)")
+            raise TypeError(f"{name}_test: register it before the solvers "
+                            f"{list(self._imp)} (they use its dims)")
         tps = list(inspect.signature(test).parameters.values())
         if not all(p.kind in _NAMED for p in tps):
             raise TypeError(f"{_sig(name, 'test', test)}: named parameters only (their "
-                            "names are the vocabulary)")
-        if any(not isinstance(m, param) for m in _marks(test)):
-            raise TypeError(f"{name}_test: only @param marks")
-        vocab = tuple(p.name for p in tps)
-        axes = tuple(_marks(test, param))
+                            "names are the dims)")
+        seed = next((p for p in tps if p.name == "seed"), None)
+        if seed is not None and (seed.kind is not seed.KEYWORD_ONLY or seed.default is seed.empty):
+            raise TypeError(f"{_sig(name, 'test', test)}: seed (the random seed of the data, not "
+                            "a dim) must be keyword-only with a default: *, seed=0")
+        if any(not isinstance(m, dim) for m in _marks(test)):
+            raise TypeError(f"{name}_test: only @dim marks (a solver's options are @knob)")
+        tps = [p for p in tps if p is not seed]
+        dims = tuple(p.name for p in tps)
+        axes = tuple(_marks(test, dim))
         grid = [n for p in axes for n in p.names]
-        if _unknown(grid, vocab) or len(set(grid)) < len(grid):
-            raise TypeError(f"{name}_test: the @param names {grid} must be distinct "
-                            f"parameters of {_sig(name, 'test', test)}")
-        if any(isinstance(p.values, _Call) for p in axes):
-            raise TypeError(f"{name}_test: @param values must be a sequence or a dict")
+        if _unknown(grid, dims) or len(set(grid)) < len(grid):
+            raise TypeError(f"{name}_test: the @dim names {grid} must be distinct dims of "
+                            f"{_sig(name, 'test', test)}")
         missing = [p.name for p in tps if p.default is p.empty and p.name not in grid]
         if missing:
-            raise TypeError(f"{name}_test: parameter(s) {missing} need a default or a @param")
+            raise TypeError(f"{name}_test: parameter(s) {missing} need a default or a @dim")
         defaults = {p.name: p.default for p in tps if p.default is not p.empty}
-        for k, v in dict(test=test, vocab=vocab, _axes=axes, _test_defaults=defaults,
-                         _vget=_getter(vocab), _blank=dict.fromkeys(vocab)).items():
+        for k, v in dict(test=test, dim_names=dims, _axes=axes, _test_defaults=defaults,
+                         _seeded=seed is not None, _dget=_getter(dims),
+                         _blank=dict.fromkeys(dims)).items():
             object.__setattr__(self, k, v)
 
     def _add_helper(self, role, f):
         """``<op>_check`` / ``<op>_dims``: no marks; they take the ref's arguments."""
         if _marks(f):
-            raise TypeError(f"{self.name}_{role}: only implementations and {self.name}_test "
+            raise TypeError(f"{self.name}_{role}: only solvers and {self.name}_test "
                             "take kit marks")
         inputs = {p.name: None for p in self._ref_params}
         try:
@@ -514,7 +536,7 @@ class Op:
     def _add_impl(self, kind, f):
         if kind in self._imp:
             raise TypeError(f"{self.name}_{kind} is already registered")
-        imp = _Impl(self.name, kind, f, self._ref_params, self.vocab)
+        imp = _Impl(self.name, kind, f, self._ref_params, self.dim_names)
         self._imp[kind], self._fns[kind] = imp, f
         try:
             self._check_names(imp)
@@ -564,31 +586,31 @@ class Op:
         return out
 
     def _split(self, cfg):
-        """cfg -> (implementation, knobs with defaults filled in, overrides)."""
+        """cfg -> (solver, knobs with defaults filled in, overrides)."""
         knobs = dict(cfg)
         kind = knobs.pop("kind", None)
         imp = self._imp.get(kind)
         if imp is None:
-            raise KeyError(f"{self.name}: no implementation {kind!r}; have {list(self._imp)}")
+            raise KeyError(f"{self.name}: no solver {kind!r}; have {list(self._imp)}")
         extras = {k: v for k, v in knobs.items() if k not in imp.knobs}
         if extras and not imp.varkw:
             raise TypeError(f"{self.name}_{kind}: unknown knob(s) {sorted(extras)}")
         return imp, {**imp.defaults, **{k: v for k, v in knobs.items() if k in imp.knobs}}, extras
 
     def capturable(self, cfg):
-        """Whether ``cfg``'s implementation may run under CUDA-graph capture (no
+        """Whether ``cfg``'s solver may run under CUDA-graph capture (no
         ``@no_capture``)."""
         return self._split(cfg)[0].no_capture is None
 
-    def configs(self, vocab):
-        """Every grid point of every implementation, in definition order (``vocab`` feeds
-        the ``@param`` values functions). Whether one runs on ``vocab``: run it."""
+    def configs(self, dims):
+        """Every grid point of every solver, in definition order (``dims`` feeds the
+        ``@knob`` values functions). Whether one runs on ``dims``: run it."""
         out = []
         for imp in self._imp.values():
             try:
-                axes = [p.points(vocab) for p in imp.params]
+                axes = [p.points(dims) for p in imp.params]
             except KeyError as e:
-                raise TypeError(f"{self.name}_{imp.kind}: the vocabulary passed lacks "
+                raise TypeError(f"{self.name}_{imp.kind}: the dims passed lack "
                                 f"{e}") from None
             for combo in itertools.product(*axes):
                 cfg = dict(kind=imp.kind)
@@ -627,13 +649,13 @@ class Op:
         return cfg
 
     def run(self, cfg, *args, **kwargs):
-        """Call the implementation of ``cfg`` with its knobs (and overrides)."""
+        """Call the solver of ``cfg`` with its knobs (and overrides)."""
         knobs = dict(cfg)
         return self._fns[knobs.pop("kind")](*args, **kwargs, **knobs)
 
-    def meta(self, cfg, key, vocab=None):
-        """``@meta`` item ``key`` of ``cfg``'s implementation; a function is evaluated on
-        ``vocab``, the knobs and the overrides."""
+    def meta(self, cfg, key, dims=None):
+        """``@meta`` item ``key`` of ``cfg``'s solver; a function is evaluated on
+        ``dims``, the knobs and the overrides."""
         imp, knobs, extras = self._split(cfg)
         try:
             v = imp.meta[key]
@@ -642,7 +664,7 @@ class Op:
                            f"{sorted(imp.meta)}") from None
         if not isinstance(v, _Call):
             return v
-        ns = {**(vocab or {}), **knobs}
+        ns = {**(dims or {}), **knobs}
         try:
             vals = [ns[n] for n in v.names]
         except KeyError:
@@ -654,15 +676,15 @@ class Op:
 
     def __call__(self, *args, config=None, table=_DEFAULT, **kwargs):
         """Run the op on the interface arguments: ``config`` (a dict or a name) if given,
-        else ``pick`` on the vocabulary of the call (``<op>_dims`` and the keyword
-        arguments that are vocabulary names, e.g. ``routing=``)."""
+        else ``pick`` on the dims of the call (``<op>_dims`` and the keyword arguments
+        that are dim names, e.g. ``routing=``)."""
         hints = None
         if not kwargs.keys() <= self._ref_names:
             hints = {k: kwargs.pop(k) for k in [k for k in kwargs if k not in self._ref_names]}
-            bad = _unknown(hints, self.vocab)
+            bad = _unknown(hints, self.dim_names)
             if bad:
                 raise TypeError(f"{self.name}: unknown argument(s) {bad}: neither parameters "
-                                f"of {self.name}_ref nor vocabulary names {list(self.vocab)}")
+                                f"of {self.name}_ref nor dims {list(self.dim_names)}")
         dims = self.dims
         if config is not None:
             if dims is not None:
@@ -677,7 +699,7 @@ class Op:
         got = dims(*args, **kwargs)
         path = self._registry.table if table is _DEFAULT else table
         capturing = _capturing()
-        # memo of the call: (implementation, knobs) per vocabulary of the call
+        # memo of the call: (solver, knobs) per dims of the call
         key = (path, _version(path), capturing, tuple(got.items()),
                tuple(hints.items()) if hints else None)
         hit = self._calls.get(key)
@@ -690,37 +712,37 @@ class Op:
         fn, knobs = hit
         return fn(*args, **kwargs, **knobs)
 
-    def pick(self, vocab, *, table=_DEFAULT, capturing=False):
-        """The config ``op(...)`` runs for ``vocab`` (see the module docstring): the
-        fastest of ``tuned(vocab, table=)`` (``table``: a path, None for none; default the
+    def pick(self, dims, *, table=_DEFAULT, capturing=False):
+        """The config ``op(...)`` runs for ``dims`` (see the module docstring): the
+        fastest of ``tuned(dims, table=)`` (``table``: a path, None for none; default the
         registry's) that may run in the capture state; ValueError when there is none."""
         path = self._registry.table if table is _DEFAULT else table
         version = _version(path)
         try:
-            key = (path, version, bool(capturing), self._vget(vocab))
+            key = (path, version, bool(capturing), self._dget(dims))
         except KeyError:
-            raise TypeError(f"{self.name}: the vocabulary passed lacks "
-                            f"{_unknown(self.vocab, vocab)}") from None
+            raise TypeError(f"{self.name}: the dims passed lack "
+                            f"{_unknown(self.dim_names, dims)}") from None
         cfg = self._memo.get(key)
         if cfg is None:
             if len(self._memo) >= _MEMO_MAX:
                 self._memo.clear()
-            cfg = self._memo[key] = self._pick(vocab, path, version, bool(capturing))
+            cfg = self._memo[key] = self._pick(dims, path, version, bool(capturing))
         return cfg
 
-    def points(self, vocab, *, table=_DEFAULT):
+    def points(self, dims, *, table=_DEFAULT):
         """[(bucket value, [(us, cfg), ...] fastest first)] of the table rows of
-        ``vocab``'s key (no relax; [] without rows)."""
+        the key of ``dims`` (no relax; [] without rows)."""
         path = self._registry.table if table is _DEFAULT else table
         version = _version(path)
         if version is None:
             return []
         cols, _, index = self._index(path, version)
-        return index.get(self._key(cols, vocab), [])
+        return index.get(self._key(cols, dims), [])
 
-    def _key(self, cols, vocab):
+    def _key(self, cols, dims):
         d = self._test_defaults
-        return tuple(d.get(c) if vocab[c] is None else vocab[c] for c in cols)
+        return tuple(d.get(c) if dims[c] is None else dims[c] for c in cols)
 
     def _index(self, path, version):
         """(key columns, bucket column or None, {key: [(bucket value, [(us, cfg), ...]
@@ -733,13 +755,13 @@ class Op:
             raise ValueError(f"{path}: a tuned table has the columns config and us; this one "
                              f"has {list(header)}")
         reg, d = self._registry, self._test_defaults
-        bucket = reg.bucket if reg.bucket in header and reg.bucket in self.vocab else None
-        cols = tuple(n for n in self.vocab if n in header and n != bucket)
+        bucket = reg.bucket if reg.bucket in header and reg.bucket in self.dim_names else None
+        cols = tuple(n for n in self.dim_names if n in header and n != bucket)
         pts = {}
         for i, r in enumerate(rows, 2):
             name = r["config"]
             if re.match(r"[^\s:]*", name)[0] not in self._imp:
-                continue  # another op's implementation
+                continue  # another op's solver
             try:
                 cfg = self.parse(name)
             except ValueError as e:
@@ -754,12 +776,12 @@ class Op:
         got = self._tables[path, version] = (cols, bucket, index)
         return got
 
-    def _table_configs(self, vocab, path, version):
-        """The candidates of the tuned point for ``vocab``, fastest first."""
+    def _table_configs(self, dims, path, version):
+        """The candidates of the tuned point for ``dims``, fastest first."""
         if version is None:
             return []
         cols, bucket, index = self._index(path, version)
-        key = self._key(cols, vocab)
+        key = self._key(cols, dims)
         pts = index.get(key)
         relax = self._registry.relax
         if not pts and relax:
@@ -767,24 +789,24 @@ class Op:
         if not pts:
             return []
         if bucket is not None:
-            n = vocab[bucket]
+            n = dims[bucket]
             if n is None:
                 raise ValueError(f"{self.name}: picking from {path} needs {bucket}")
             pts = [next((p for p in pts if p[0] >= n), pts[-1])]
         return [cfg for _, cfg in pts[0][1]]
 
-    def tuned(self, vocab, *, table=_DEFAULT):
-        """The configs of the tuned point for ``vocab`` (``pick``'s candidates), fastest
+    def tuned(self, dims, *, table=_DEFAULT):
+        """The configs of the tuned point for ``dims`` (``pick``'s candidates), fastest
         first; [] when the table has no rows for its key."""
         path = self._registry.table if table is _DEFAULT else table
-        return list(self._table_configs(vocab, path, _version(path)))
+        return list(self._table_configs(dims, path, _version(path)))
 
-    def _pick(self, vocab, path, version, capturing):
-        cfgs = self._table_configs(vocab, path, version)
+    def _pick(self, dims, path, version, capturing):
+        cfgs = self._table_configs(dims, path, version)
         for cfg in cfgs:
             if not capturing or self._imp[cfg["kind"]].no_capture is None:
                 return cfg
-        known = {k: v for k, v in vocab.items() if v is not None}
+        known = {k: v for k, v in dims.items() if v is not None}
         if not cfgs:
             raise ValueError(f"{self.name}: no tuned config for {known} "
                              + (f"in {path}" if path else "(no table)")
@@ -802,9 +824,9 @@ class Registry(Mapping):
     to it.
 
     ``name``: for reports. ``table`` / ``bucket`` / ``relax``: the tuned table of the
-    ops, its bucketed vocabulary name and the key substitutions tried when a key has no
+    ops, its bucketed dim and the key substitutions tried when a key has no
     rows (dispatch, see the module docstring). For ``kit.tune``: ``points``, the bucket
-    values to tune; ``unkeyed``, vocabulary names the table does not store (they do
+    values to tune; ``unkeyed``, dims the table does not store (they do
     not change which config is fastest, e.g. a seed); ``rotate``, the interface
     arguments the timed calls cycle through copies of (``kit.timing.copies``)."""
 
@@ -870,7 +892,7 @@ class Registry(Mapping):
         head, _, role = name[len(op) + 1:].rpartition("_")
         if head and role in ROLES:
             raise TypeError(f"{name}: no op {op}_{head} is registered; register "
-                            f"{op}_{head}_ref first (implementation names do not end in "
+                            f"{op}_{head}_ref first (solver names do not end in "
                             f"_{role})")
         return op
 

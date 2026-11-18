@@ -68,7 +68,7 @@ def op_tests(ops):
         inputs, expected = prepared(op, cid, case)
         if cfg is None:
             got = op.dims(**inputs)
-            bad = {k: (v, case.get(k, "<not in the vocabulary>")) for k, v in got.items()
+            bad = {k: (v, case.get(k, "<not a dim>")) for k, v in got.items()
                    if k not in case or case[k] != v}
             assert not bad, f"{op.name}_dims disagrees with the case, {{name: (dims, case)}}: {bad}"
             return

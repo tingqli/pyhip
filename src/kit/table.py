@@ -1,7 +1,7 @@
 """Tuned tables: CSV files of measured configs. ``kit.tune`` writes them, the dispatch
 (``Op.pick``) reads them.
 
-A row holds the key columns (vocabulary names), the bucket column, ``config``, then the
+A row holds the key columns (dims), the bucket column, ``config``, then the
 measurements: ``us`` and any metrics (e.g. ``cos``), i.e. every column after
 ``config``. The columns up to ``config`` are the row's identity: writing a row replaces
 the row with the same identity. Rows are kept sorted by their identity without the

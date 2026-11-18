@@ -41,7 +41,7 @@ from pyhip.kit import tune as kit_tune  # noqa: E402
 from ._ops import DEFAULT_CSV, TOKENS  # noqa: E402,F401 - TOKENS: re-exported
 from .moe import MOE  # noqa: E402
 
-# the table's columns: the vocabulary names that key it (ops.moe reads them), the bucket
+# the table's columns: the dims that key it (ops.moe reads them), the bucket
 # num_tokens, the config name and its time, moe_check's metric
 FIELDS = kit_tune.fields(MOE, ["cos"])
 # the cases of the shipped table (configs/README.md): tune-all's default

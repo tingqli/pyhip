@@ -6,11 +6,11 @@
 ``moe_dims``, ``moe_dyn_*``), ``moe.py`` the kernel families (``moe_<kind>``), each
 with ``@op_register`` as its outermost decorator.
 
-Dispatch (``ops.moe(...)``, ``ops.moe.pick(vocab)``): the tuned table ``DEFAULT_CSV``
+Dispatch (``ops.moe(...)``, ``ops.moe.pick(dims)``): the tuned table ``DEFAULT_CSV``
 (written by ``pyhip.kit.tune``), bucketed by ``num_tokens`` (the first tuned point >= the
 call's token count); an activation without rows of its own uses the SiLU rows (the configs
 rank alike, README 7.8). A key without rows raises ValueError: tune it first. Tuning:
-the ``TOKENS`` points; ``expert_offset`` / ``seed`` are not table keys; the timed calls
+the ``TOKENS`` points; ``expert_offset`` is not a table key; the timed calls
 cycle through copies of the weights ``W``.
 """
 
@@ -24,5 +24,5 @@ TOKENS = (1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 320, 384,
           640, 768, 1024, 1280, 1536, 2048, 2560, 3072, 4096, 6144, 8192, 12288, 16384, 24576,
           32768)
 ops = Registry("a8w4", table=DEFAULT_CSV, bucket="num_tokens", relax={"act": "silu"},
-               points=TOKENS, unkeyed=("expert_offset", "seed"), rotate=("W",))
+               points=TOKENS, unkeyed=("expert_offset",), rotate=("W",))
 op_register = ops.register

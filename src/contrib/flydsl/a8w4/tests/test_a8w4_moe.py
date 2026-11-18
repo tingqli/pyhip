@@ -27,7 +27,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from a8w4 import a8w4_moe, a8w4_moe_dyn, prepare_weights, shuffle_mxfp4  # noqa: E402
 from a8w4 import ref as R  # noqa: E402
-from a8w4.moe import MOE, MOE_DYN, shape_vocab  # noqa: E402
+from a8w4.moe import MOE, MOE_DYN, shape_dims  # noqa: E402
 from a8w4.ref import COS_TOL  # noqa: E402
 from a8w4.tune import FIELDS  # noqa: E402
 
@@ -155,7 +155,7 @@ def test_tp_prep_vs_aiter(tokens, bm):
 def test_cuda_graph(case, tokens):
     H, I, E, EGl, K, e0 = SHAPES[case]
     W, x, tw, ti, ref = data(case, tokens, seed=5)
-    cfg = MOE.pick(shape_vocab((H, I, E, EGl, K), tokens, "silu"), capturing=True)
+    cfg = MOE.pick(shape_dims((H, I, E, EGl, K), tokens, "silu"), capturing=True)
     assert cfg["kind"] != "tp1kq"
     # eager, the config the capture picks (a8w4_moe may pick another: tp8 4096 = tp1kq);
     # warm-up: compiles it, allocates the kernels' workspaces
@@ -177,7 +177,7 @@ def test_situv2_dispatch(case, tokens):
     """SiTUv2 calls pick from the table's situv2 rows (EP shape: an EP kernel)."""
     H, I, E, EGl, K, e0 = SHAPES[case]
     shape = (H, I, E, EGl, K)
-    kind = MOE.pick(shape_vocab(shape, tokens, "situv2"))["kind"]
+    kind = MOE.pick(shape_dims(shape, tokens, "situv2"))["kind"]
     assert kind.startswith("ep" if case == "ep8" else "tp"), kind
     W, x, tw, ti, ref = data(case, tokens, act="situv2", situ=R.SITU, seed=7)
     raw = weights(case)[1]
@@ -210,7 +210,7 @@ def test_table_act(tmp_path):
         return str(path)
 
     def pick(op, act, path):
-        return op.pick(shape_vocab(shape, 64, act, op=op), table=path)
+        return op.pick(shape_dims(shape, 64, act, op=op), table=path)
 
     both = write(tmp_path / "both.csv", FIELDS, rows)
     for op in (MOE, MOE_DYN):
@@ -251,11 +251,11 @@ def test_dyn_cuda_graph():
 def test_dyn_pick():
     H, I, E, EGl, K, e0 = SHAPES["ep8"]
     for tokens in (1, 300, 3000, 40000):
-        vocab = shape_vocab((H, I, E, EGl, K), tokens, "silu", op=MOE_DYN)
-        cfg = MOE_DYN.pick(vocab)
-        assert cfg["kind"] == "ep3k" and cfg == MOE_DYN.tuned(vocab)[0]
+        dims = shape_dims((H, I, E, EGl, K), tokens, "silu", op=MOE_DYN)
+        cfg = MOE_DYN.pick(dims)
+        assert cfg["kind"] == "ep3k" and cfg == MOE_DYN.tuned(dims)[0]
     with pytest.raises(ValueError):  # TP8 shape: 256 local experts, no EP kernels tuned
-        MOE_DYN.pick(shape_vocab(SHAPES["tp8"][:5], 16, "silu", op=MOE_DYN))
+        MOE_DYN.pick(shape_dims(SHAPES["tp8"][:5], 16, "silu", op=MOE_DYN))
 
 
 if __name__ == "__main__":

@@ -12,7 +12,7 @@ inputs (``kit.timing``).
 variant spec: [label=]<base>[:<k>=<v>,...]  or  [label=]py:<module | file.py>:<func>
   base      a config name (``python -m pyhip.kit candidates <op> <case>``) or "@table" (the
             tuned table's pick at each bucket value)
-  k=v       overrides passed to an implementation with ``**over`` (v: int, float, true /
+  k=v       overrides passed to a solver with ``**over`` (v: int, float, true /
             false, none, a/b/c a tuple, "-", anything else a string)
   py        func(**the interface arguments) -> the output: any pipeline, e.g. an
             experiment's kernel copy
@@ -28,7 +28,7 @@ the cache) are refused unless a protocol rotates >= MIN_COPIES copies.
 
 check: per bucket value, every variant vs ``<op>_ref``, vs the base, the worst of
 ``--repeats`` further calls vs the first, bit equality with the base (``--bitwise``) and
-CUDA-graph capture + replays vs eager (``--graph``; ``@no_capture`` implementations:
+CUDA-graph capture + replays vs eager (``--graph``; ``@no_capture`` solvers:
 n/a). ``--diff-tol``: the largest metric vs the base / repeat / graph that passes.
 """
 
@@ -143,24 +143,24 @@ def parse_variant(op, text, alias=None):
     return v
 
 
-def resolve(op, v, vocab):
-    """-> Resolved, or a str: why ``v`` has no config for ``vocab`` (an untuned key for
-    ``@table``). The overrides become config entries (``**over`` of the implementation;
-    its ``@meta`` sees them). A config the implementation cannot run raises at its first
+def resolve(op, v, dims):
+    """-> Resolved, or a str: why ``v`` has no config for ``dims`` (an untuned key for
+    ``@table``). The overrides become config entries (``**over`` of the solver; its
+    ``@meta`` sees them). A config the solver cannot run raises at its first
     run."""
     if v.func is not None:
         f = v.func
         return Resolved(v.label, v.spec, v.spec, lambda inputs: f(**inputs))
     try:
-        cfg = op.pick(vocab) if v.base == "@table" else op.parse(v.base)
+        cfg = op.pick(dims) if v.base == "@table" else op.parse(v.base)
     except ValueError as e:  # no tuned config for the case
         return str(e)
     cfg = {**cfg, **v.overrides}
     try:
-        cached = op.meta(cfg, "cached_loads", vocab)
+        cached = op.meta(cfg, "cached_loads", dims)
     except KeyError:
         cached = None
-    except TypeError as e:  # overrides on an implementation without **over
+    except TypeError as e:  # overrides on a solver without **over
         return str(e)
     return Resolved(v.label, v.spec, op.name_of(cfg),
                     lambda inputs, cfg=cfg: op.run(cfg, **inputs), cfg=cfg, cached=cached)
@@ -304,11 +304,11 @@ class _Inputs:
     def __init__(self, op, c, fn=None):
         self.op, self.c, self.fn, self.b = op, c, fn, _bucket(op)
 
-    def vocab(self, t):
+    def dims(self, t):
         return dict(self.c, **{self.b: t})
 
     def __call__(self, t, seed):
-        return self.fn(t, seed) if self.fn else _inputs(self.op, self.vocab(t), seed)
+        return self.fn(t, seed) if self.fn else _inputs(self.op, self.dims(t), seed)
 
 
 def _rotated(op, inputs, n):
@@ -370,7 +370,7 @@ def ab(op, c, points, specs, *, protocols=("coldrot",), rounds=5, iters=16, samp
     if dup:
         dup_label = base_label + "#2"
         variants.insert(1, dataclasses.replace(variants[0], label=dup_label))
-    plan = {T: [resolve(op, v, gen.vocab(T)) for v in variants] for T in points}
+    plan = {T: [resolve(op, v, gen.dims(T)) for v in variants] for T in points}
     for T, res in plan.items():  # before any timing: fail fast
         if isinstance(res[0], str):
             raise SystemExit(f"the base at {unit} {T}: {res[0]}")
@@ -511,7 +511,7 @@ def check(op, c, points, specs, *, seed=7, repeats=5, graph=False, bitwise=False
         expected = op.ref(**inp)
         base = None
         for v in variants:
-            r = resolve(op, v, gen.vocab(T))
+            r = resolve(op, v, gen.dims(T))
             if isinstance(r, str):
                 rows.append([T, v.label, "-", "n/a", "", "", "", "", r])
                 continue

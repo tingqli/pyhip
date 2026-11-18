@@ -9,7 +9,7 @@
     out = a8w4_moe_dyn(x, W, topk_weights, topk_ids, m_valid, x_scale=..., ...)
 
 ``ops.moe`` / ``ops.moe_dyn``: the ops (``pyhip.kit``) behind them: ``ops.moe(...)``
-runs the config the tuned table picks (``ops.moe.pick(vocab)``), ``ops.moe.run(cfg, ...)``
+runs the config the tuned table picks (``ops.moe.pick(dims)``), ``ops.moe.run(cfg, ...)``
 a given one; tests, tune and bench use them. See README.md.
 """
 

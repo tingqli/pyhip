@@ -21,8 +21,8 @@ Kernel families = the functions ``moe_<kind>`` below (all consume the same ``W``
 README.md). ``@op_register`` adds them, after the reference / test functions of
 ``ref.py``, to the package's ops (``_ops.py``): ``MOE`` = ``ops.moe``, ``MOE_DYN`` =
 ``ops.moe_dyn``. A config is ``{"kind": kind, knob: value, ...}``, its knobs' grid is
-the ``@param``s; a config that cannot run a call raises (the kernels' asserts).
-``MOE(...)`` / ``MOE.pick(vocab)`` pick one from the tuned table (``pyhip.kit``
+the ``@knob``s; a config that cannot run a call raises (the kernels' asserts).
+``MOE(...)`` / ``MOE.pick(dims)`` pick one from the tuned table (``pyhip.kit``
 dispatch): only tuned keys are guaranteed, an untuned one raises ValueError.
   tp2k   prep -> gemm1 (q8s epilogue) -> gemm2 (atomic scatter)
   tp1k   prep -> one fused gemm1 + gemm2 kernel (BM 64)
@@ -38,7 +38,7 @@ import copy
 
 import torch
 
-from pyhip.kit import meta, no_capture, param, stack
+from pyhip.kit import knob, meta, no_capture, stack
 
 from . import ref as _ref  # noqa: F401 - registers the ops' ref / test / check / dims first
 from ._ops import DEFAULT_CSV, op_register, ops  # noqa: F401 - DEFAULT_CSV re-exported
@@ -80,7 +80,7 @@ def _ep_cached(preset):
 
 
 ep3k_space = stack(  # moe_ep3k and moe_dyn_ep3k
-    param("cfg", EP_CFGS, id="{}"),
+    knob("cfg", EP_CFGS, id="{}"),
     meta(tile_m=lambda cfg, **over: ep_preset(cfg, over)["bm"],
          cached_loads=lambda cfg, **over: _ep_cached(ep_preset(cfg, over))))
 
@@ -130,9 +130,9 @@ def _shape(W, topk_ids, num_experts):
 
 
 @op_register
-@param("block_m", (32, 64), id="bm{}")
-@param("g1_bcm", (1, 2), id="g1bcm{}")
-@param("g2", ("base", "nt4"), id="g2{}")
+@knob("block_m", (32, 64), id="bm{}")
+@knob("g1_bcm", (1, 2), id="g1bcm{}")
+@knob("g2", ("base", "nt4"), id="g2{}")
 @meta(tile_m=lambda block_m: block_m, cached_loads=lambda g1_bcm: g1_bcm != 2)
 def moe_tp2k(x, W, topk_weights, topk_ids, *, expert_offset=0, num_experts=None, act="silu",
              situ=None, block_m=32, g1_bcm=1, g2="base"):
@@ -160,8 +160,8 @@ def moe_tp2k(x, W, topk_weights, topk_ids, *, expert_offset=0, num_experts=None,
 # each CTA takes 256 / 384 / 512 inter columns (256: 2 waves/SIMD, best for small/medium
 # batches; 384-512: 1 wave/SIMD, best for large batches at large inter_dim)
 @op_register
-@param("bcm", (1, 2))
-@param("ksplit", lambda inter_dim: sorted({inter_dim // c for c in (256, 384, 512)
+@knob("bcm", (1, 2))
+@knob("ksplit", lambda inter_dim: sorted({inter_dim // c for c in (256, 384, 512)
                                            if inter_dim % c == 0}), id="ks{}")
 @meta(tile_m=F.BM, cached_loads=lambda bcm: bcm != 2)
 def moe_tp1k(x, W, topk_weights, topk_ids, *, expert_offset=0, num_experts=None, act="silu",
@@ -176,7 +176,7 @@ def moe_tp1k(x, W, topk_weights, topk_ids, *, expert_offset=0, num_experts=None,
 
 
 @op_register
-@param("bcm", (1,))
+@knob("bcm", (1,))
 @no_capture("tp1kq passes its work-queue epoch as a host launch argument")
 @meta(tile_m=Q.BM, cached_loads=lambda bcm: bcm != 2)
 def moe_tp1kq(x, W, topk_weights, topk_ids, *, expert_offset=0, num_experts=None, act="silu",
@@ -200,7 +200,7 @@ def moe_ep3k(x, W, topk_weights, topk_ids, *, expert_offset=0, num_experts=None,
 
 
 @op_register
-@param("maxm", (EP_SMALL_MAXM,), id="m{}")
+@knob("maxm", (EP_SMALL_MAXM,), id="m{}")
 @meta(tile_m=None, cached_loads=False)
 def moe_ep1k(x, W, topk_weights, topk_ids, *, expert_offset=0, num_experts=None, act="silu",
              situ=None, maxm=EP_SMALL_MAXM):
@@ -227,12 +227,12 @@ def moe_dyn_ep3k(x, W, topk_weights, topk_ids, m_valid, *, x_scale=None, expert_
 MOE, MOE_DYN = ops.moe, ops.moe_dyn
 
 
-def shape_vocab(shape, tokens=None, act=None, routing=None, op=MOE):
-    """The vocabulary of ``op`` for ``shape`` = (H, I, E local, E global, topk), ``tokens``
-    rows (``num_tokens``), ``act`` and ``routing``; the other names None (unknown). For
+def shape_dims(shape, tokens=None, act=None, routing=None, op=MOE):
+    """The dims of ``op`` for ``shape`` = (H, I, E local, E global, topk), ``tokens``
+    rows (``num_tokens``), ``act`` and ``routing``; the other dims None (unknown). For
     the tools that work on shape tuples."""
     H, I, E, EGl, topk = shape
-    return dict(dict.fromkeys(op.vocab), model_dim=H, inter_dim=I, experts=E,
+    return dict(dict.fromkeys(op.dim_names), model_dim=H, inter_dim=I, experts=E,
                 experts_global=EGl, topk=topk, num_tokens=tokens, act=act, routing=routing)
 
 
@@ -253,7 +253,7 @@ def a8w4_moe(x, W, topk_weights, topk_ids, *, expert_offset=0, num_experts=None,
 
     ``MOE(...)`` (``ops.moe``; ``moe_dims`` checks the inputs). ``dispatch`` goes to it:
     ``config=`` (a config dict or name to force, e.g. ``"tp1k bcm1 ks1"``), ``table=``
-    (another tuned table), vocabulary hints (``routing=``). Only tuned keys are
+    (another tuned table), dim hints (``routing=``). Only tuned keys are
     guaranteed: an untuned one raises ValueError, a forced config the kernels cannot
     run raises their AssertionError.
     Under CUDA-graph capture only graph-safe configs are picked. M == 0 returns an
