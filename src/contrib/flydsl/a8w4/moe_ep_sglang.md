@@ -17,46 +17,53 @@
 - **eager 下总数能在 host 上精确拿到，不需要 GPU 同步**：sglang 调度器每一步都 all_gather 了各 DP rank 的 token 数。难点有两处：这个列表在几个地方被丢掉或改写（第 4 节）；CUDA graph（第 5 节）。
 - **host 上的 `tokens` 只决定 solver 族和 knob**：
   - `tokens` 是 dispatch 之前的总数，host 上可知；dispatch 之后本 rank 实际收到多少行，只在 device 上。
-  - kernel 按 device 上的真实计数工作：mega 的 ep_prep 交换了全局每个专家的计数，mori 的 ep3k 读 MORI 的 total_recv。
-  - 所以只要各 rank 一致，`tokens` 估得不准只影响速度，不影响结果。
+  - kernel 按 device 上的真实计数工作：mega 的 ep_prep 交换了全局每个专家的计数，mega_small 读本卡每个专家的槽位计数，mori 的 ep3k 读 MORI 的 total_recv。
+  - 所以只要各 rank 一致，`tokens` 估高只影响速度，不影响结果。估低时 mega_small 可能算错（第 6 节），所以 `tokens` 要取真实值或上界。
 
 ## 2. 各 rank 选得不一致为什么会 hang
 
-- **`mega` 和 `mori` / `mori_eager` 是两套协议**：
+- **`mega`、`mega_small` 和 `mori` / `mori_eager` 是三套协议**：
   - mega 的 ep_prep 等其他 rank 往 mega 自己的 symmetric buffer 里写计数 flag；
+  - mega_small 等其他 rank 的 producer 往它自己的 symmetric buffer 里加完成计数（`done`），最后等各 rank 的 combine flag；
   - mori 等 MORI dispatch 的信号；
-  - 有的 rank 选 mega、有的选 mori，两边互相等。
+  - 有的 rank 选这一族、有的选另一族，两边互相等。
 - **族内 knob 不一致**：
   - `mori` / `mori_eager`：共用 `EpComm` 里同一个 MORI op，`cfg` 只影响本卡的 ep3k，可以混用。
   - `mega`：接收端只等 `arrived[b]` 达到该块应收的路由数（[kernels/ep_mega.py](kernels/ep_mega.py) 文档），与发送端有几个 producer 无关。从协议看，producers / lag / bcm 可以混用。**未验证**。
-- **mega 的第一次调用也是集合操作**：`EpComm.mega()` 在第一次调用时构造 `MegaMoeEpA8W4`，其中分配 symmetric buffer 并调用 `shmem_barrier_all`。所有 rank 要在同一次调用里第一次选中 mega。
+  - `mega_small`：`bm` 只决定本卡的 m-tile 大小，跨卡的计数和 flag 与它无关（每次调用每个源卡在 `done` 上加的总量固定为 64，与 producer 数也无关）。从协议看可以混用。**未验证**。
+- **mega / mega_small 的第一次调用也是集合操作**：`EpComm.mega()` / `EpComm.small()` 在第一次调用时构造 `MegaMoeEpA8W4` / `MegaMoeSmallEpA8W4`，其中分配 symmetric buffer 并调用 `shmem_barrier_all`。所有 rank 要在同一次调用里第一次选中它。
 - **运行中改表**：kernelkit 每个 rank 每秒最多读一次表的 mtime。服务运行时改了表，各 rank 换用新表的时刻不同，可能短暂不一致。上线时表要冻结。
 
-## 3. 表里两个族的交界
+## 3. 表里各族的交界
 
-[a8w4_moe_ep_tuned.csv](configs/a8w4_moe_ep_tuned.csv) 每个点上各 solver 最快配置的耗时。
+[a8w4_moe_ep_tuned.csv](configs/a8w4_moe_ep_tuned.csv) 每个点上最快的配置，以及 mega、mori 两族的最快配置与它的耗时之比。
 
 - **测量条件**：EP8，4096 / 2048，256 个专家，topk 8，uniform 路由，token 均分到各 rank。
 - **耗时**：单位 us，取各 rank 对齐后最慢的那个 rank。
+- **situv2 的最快配置**：除 64 tokens 是 bm64（与 bm32 相差 0.4%）外，与 silu 相同。
 
-| tokens（总数） | mega（silu） | mori（silu） | mori / mega（silu） | mori / mega（situv2） |
-|---:|---:|---:|---:|---:|
-| 64 | 176.1 | 169.0 | 0.960 | 0.965 |
-| 128 | 192.9 | 183.5 | 0.951 | 0.944 |
-| 256 | 200.5 | 189.1 | 0.943 | 0.926 |
-| 512 | 211.4 | 218.5 | 1.034 | 1.037 |
-| 1024 | 242.3 | 272.8 | 1.126 | 1.125 |
-| 2048 | 365.8 | 537.1 | 1.468 | 1.382 |
-| 4096 | 528.9 | 779.6 | 1.474 | 1.344 |
-| 8192 | 898.8 | 1113.3 | 1.239 | 1.229 |
-| 16384 | 1646.9 | 2013.6 | 1.223 | 1.240 |
-| 32768 | 3159.9 | 3794.6 | 1.201 | 1.239 |
+| tokens（总数） | 最快（silu） | us | mega / 最快（silu） | mori / 最快（silu） | mega / 最快（situv2） | mori / 最快（situv2） |
+|---:|---|---:|---:|---:|---:|---:|
+| 64 | mega_small bm32 | 142.5 | 1.234 | 1.182 | 1.234 | 1.183 |
+| 128 | mega_small bm64 | 154.3 | 1.255 | 1.206 | 1.264 | 1.193 |
+| 256 | mega_small bm64 | 158.8 | 1.264 | 1.188 | 1.277 | 1.184 |
+| 512 | mega_small bm64 | 173.6 | 1.214 | 1.255 | 1.234 | 1.266 |
+| 1024 | mega_small bm64 | 228.4 | 1.062 | 1.197 | 1.063 | 1.198 |
+| 2048 | mega p16 l2 bcm22 | 364.8 | 1 | 1.201 | 1 | 1.200 |
+| 4096 | mega p16 l4 bcm01 | 531.3 | 1 | 1.336 | 1 | 1.339 |
+| 8192 | mega p16 l4 bcm01 | 897.7 | 1 | 1.266 | 1 | 1.233 |
+| 16384 | mega p16 l4 bcm01 | 1637.4 | 1 | 1.231 | 1 | 1.248 |
+| 32768 | mega p32 l4 bcm01 | 3158.9 | 1 | 1.231 | 1 | 1.181 |
 
-- **交界在 256 和 512 之间，正好是 decode 的常见范围**：每 rank 32–64 个请求 × 8 = 256–512。
-- **估高比估低便宜，拿不准时取上界**：
-  - 估高（真实 ≤ 256，却选了 mega）：慢 4–8%。
-  - 估低（真实 ≥ 512，却选了 mori）：慢 3–47%，2048–4096 tokens 时最多。
-- **`mori_eager` 不会被选中**：它的耗时是 mori 的 1.02–2.3 倍，在每个点都不是最快。
+- **交界在 1024 和 2048 之间，就是 mega_small 的容量上限**：
+  - ≤ 1024 选 mega_small，≥ 2048 选 mega；
+  - `tokens` > 1024（`EpComm.small_tmax`）时 mega_small 的 solver 报错，表里 2048 起没有它；
+  - decode 的常见范围（每 rank 32–64 个请求 × 8 = 256–512）都选 mega_small。
+- **`mori` / `mori_eager` 不会被选中**：mori 的耗时是最快配置的 1.18–1.34 倍，mori_eager 是 mori 的 1.02–2.8 倍。
+- **估高比估低安全，`tokens` 只能取真实值或上界**：
+  - 真实值和估计值都 ≤ 1024：都选 mega_small，最多换一个 bm。≤ 512 tokens 时 bm32 与 bm64 相差不到 1%；1024 tokens 时 bm32 慢 14%（只有估低才会在这里选到 bm32）。
+  - 估高越过 1024（真实 ≤ 1024，却选了 mega）：慢 6–28%。
+  - 估低越过 1024（真实 > 1024，却选了 mega_small）：可能算错，不只是慢（第 6 节）。
 
 ## 4. sglang 里各场景能拿到的 token 数
 
@@ -94,13 +101,14 @@
 - **选择在 capture 时定死，`tokens` 只能取上界**：
   - solver 和 knob 都在 capture 时确定；
   - `tokens` 只能取这张 graph 的上界：graph bs × num_tokens_per_bs × dp_size；
-  - replay 时的真实总数 ≤ 这个上界。按第 3 节，取上界的代价可以接受。
+  - replay 时的真实总数 ≤ 这个上界。按第 3 节，上界 ≤ 1024 时取上界几乎没有代价；上界 > 1024、真实总数 ≤ 1024 时选到 mega，慢 6–28%。
 - **硬性前提**：所有 rank replay 同一 bs 的 graph，或者所有 graph 都用同一个族。
   - `require_mlp_tp_gather=True` 时满足：`DecodeCudaGraphRunner.can_run` / `replay_prepare` 按 `max(global_num_tokens_cpu)` 选 bucket，各 rank 相同。
   - `require_mlp_tp_gather=False` 时不满足：按本 rank 的 `batch_size` 选 bucket。
 - **例子**：rank 0 有 64 个请求，其余 rank 各 1 个，真实总数 71。
-  - `require_mlp_tp_gather=True`：所有 rank replay bs=64 的 graph，按 512 选中 mega。按真实的 71（落在 128 那个点）本该选 mori，所以慢 5–6%。
-  - `require_mlp_tp_gather=False`：rank 0 replay bs=64 的 graph（512 → mega），其余 rank replay bs=1 的 graph（8 → 64 那个点 → mori），结果 hang。
+  - `require_mlp_tp_gather=True`：所有 rank replay bs=64 的 graph，按 512 选中 mega_small bm64。真实的 71 落在 128 那个点，那里最快的也是 mega_small bm64，没有损失。
+  - `require_mlp_tp_gather=False`：rank 0 replay bs=64 的 graph（512 → mega_small bm64），其余 rank replay bs=1 的 graph（8 → 64 那个点 → silu 下是 mega_small bm32）。同一族、只有 bm 不同，从协议看能运行（第 2 节，**未验证**）。
+  - 同上，但 rank 0 有 256 个请求：rank 0 按 2048 选中 mega，其余 rank 选 mega_small，结果 hang。
 
 ## 6. 总数之外
 
@@ -113,6 +121,10 @@
   - 所有 rank 的 token 总数 ≤ 2·tcap 时不可能溢出；
   - 总数更大时，只要某个 rank 收到的路由超过 2·tcap·topk 就会溢出。每 rank 都满载 tcap 时，这相当于均匀路由均值的 2 倍；
   - 大的 prefill chunk 遇上热点专家时可能发生。
+- **mega_small 的固定槽位按 `tokens` 的上限设计**：
+  - 每个本地专家 `EpComm.small_tmax`（1024）行；`tokens` > 1024 时 solver 直接报错（各 rank 一致，不会 hang），调优表在 2048 起也就没有它；
+  - 所有 rank 的真实 token 总数 ≤ 1024 时不可能溢出（一个 token 到同一个专家最多一路）；
+  - 如果传入的 `tokens` 比真实总数小、而真实总数又超过 1024，超出槽位的路由被丢掉，combine 读到该槽位的旧数据（结果错误）。所以 `tokens` 只能取真实值或上界。
 - **`EpComm.max_tokens` 不在表的 key 里，却会改变 kernel**：它决定 token_shift、`s_cap` 和 grid。
   - mega 要求 `s_cap < 2^18`：topk 8 时 tcap ≤ 8192。
   - p8 配置另要求 tcap·topk ≤ 8·8·1024，同样是 tcap ≤ 8192。
@@ -130,15 +142,17 @@
      - 没开 DP attention：`x.shape[0] × world`。
 2. **decode graph：各 rank replay 同一 bs**：
    - 用了 `moe_ep` 时，`require_mlp_tp_gather=False` 下 `can_run` / `replay_prepare` 也按 all_gather 得到的 max 选 bucket。
-   - 不想改 graph 的选择逻辑的话，所有 decode graph 固定用一个族：例如用 `op.tuned(problem)` 筛出 mega 的配置，通过 `config=` 传入。代价是 ≤ 256 tokens 时慢 4–8%。族内 knob 仍按 graph bs 选。
+   - 不想改 graph 的选择逻辑的话，所有 decode graph 固定用一个族（用 `op.tuned(problem)` 筛出该族的配置，通过 `config=` 传入；族内 knob 仍按 graph bs 选）：
+     - 所有 decode graph 的上界都 ≤ 1024（dp 8、每个请求 1 个 token 时 bs ≤ 128）：固定 mega_small，没有损失；
+     - 否则固定 mega，代价是 ≤ 1024 tokens 时慢 6–28%。
 3. **拿不到全局值时报错或固定族**，不要按本地值外推。
 4. **idle rank 也要调用 `moe_ep`**（0 行）：
    - `Mxfp4AiterA16W4MoEMethod.apply` 在 a2a=none 路径上有 `if x.shape[0] == 0: return`；那里通信在外面，所以没问题；
    - `moe_ep` 路径不能有这种提前返回。
 5. **其他路径同样处理**：EAGLE draft、draft-extend 的 graph runner，以及 TBO 的两个子 batch，各自有自己的 `global_num_tokens`。
 6. **symmetric buffer 在 capture 之前分配**：
-   - `EpComm` 第一次用到 mega / mori 时才构造它们；mega 的构造含 `torch.cuda.synchronize` 和 `shmem_barrier_all`，不能放在 capture 里；
-   - 初始化时让各 rank 一起调用 `comm.mega(W, topk)` / `comm.mori(W, topk)`，或者在 capture 之前 eager 跑一次。
+   - `EpComm` 第一次用到 mega / mega_small / mori 时才构造它们；mega 和 mega_small 的构造含 `torch.cuda.synchronize` 和 `shmem_barrier_all`，不能放在 capture 里；
+   - 初始化时让各 rank 一起调用 `comm.mega(W, topk)` / `comm.small(W, topk)` / `comm.mori(W, topk)`，或者在 capture 之前 eager 跑一次。
 7. **防 hang**：
    - warmup 之后（或在 debug 开关下）all_gather 一次各 rank 为每个 graph 选出的 solver 名，不一致就报错；
    - 上线时冻结调优表。
@@ -147,7 +161,7 @@
 
 ## 8. 待验证
 
-- mega 的 producers / lag / bcm 在各 rank 上取不同值时能否正常运行（8 卡，每个 rank 用不同的 `config=`）。
+- mega 的 producers / lag / bcm、mega_small 的 bm 在各 rank 上取不同值时能否正常运行（8 卡，每个 rank 用不同的 `config=`）。
 - 没开 DP attention 的 EP 下，各 rank 的 MoE 输入行数是否相同。
-- DP 不均衡、路由倾斜对 mega / mori 交界的影响。
+- DP 不均衡、路由倾斜对各族交界（mega_small / mega）的影响。
 - sglang 现在的 MORI 路径怎么处理每 rank 超过 4096 token 的 extend。

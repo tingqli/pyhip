@@ -1,0 +1,105 @@
+114c114
+<                          ACT="silu", BCM1=2, BCM2=2, SCM=P2P, TL=0):
+---
+>                          ACT="silu", BCM1=2, BCM2=2):
+119,121c119
+<     CU; ``BCM1`` / ``BCM2``: gemm1 / gemm2 W load cache modifier (2 = nt). ``TL`` 1: every
+<     workgroup writes ``s_memrealtime`` at its phase ends into ``ctl[SC_TL + 16 bid ..]``
+<     (``TL_PHASES``; analysis only)."""
+---
+>     CU; ``BCM1`` / ``BCM2``: gemm1 / gemm2 W load cache modifier (2 = nt)."""
+163,167c161
+<              + ("" if SCM == P2P else f"_scm{SCM}")
+<              + ("" if ACT == "silu" else f"_{ACT}") + ("_tl" if TL else ""))
+<     SC_TL = SC_TILE + 16 * max(small_max_tiles(TOPK, TMAX, bm) for bm in (16, 32, 64))
+<     TLW = 128  # TL: i32 per workgroup (i64 slots: phases 0-5, unit k < 8: 8 + 3k start,
+<     #            9 + 3k after its wait, 10 + 3k end, 32 + k its id: gemm2 << 20 | unit)
+---
+>              + ("" if ACT == "silu" else f"_{ACT}"))
+200,212d193
+<         def stamp(slot, value=None):
+<             """TL: thread 0 writes the realtime clock (100 MHz), or ``value``, into i64 slot
+<             ``slot`` of this workgroup's timeline (a masked store: no branch)."""
+<             if const_expr(TL):
+<                 if value is None:
+<                     value = fx.Int64(llvm.inline_asm(
+<                         T.i64, [], "s_memrealtime $0\ns_waitcnt lgkmcnt(0)", "=s",
+<                         has_side_effects=True))
+<                 tl_rs = _rsrc(ctl_at(fx.Int32(SC_TL) + bid * fx.Int32(TLW)), TLW * 4)
+<                 buffer_store(Vec.from_elements([fx.Int64(value)], fx.Int64).bitcast(fx.Int32),
+<                              tl_rs, fx.Int32(slot) * fx.Int32(2), mask=tx0 == fx.Int32(0))
+< 
+<         stamp(0)
+330,332d310
+<                 if const_expr(TL):
+<                     rocdl.s_waitcnt(vmcnt=0)
+<                     stamp(6)  # the slots are known (last token of wave 0)
+341c319
+<                                          cache_modifier=SCM)
+---
+>                                          cache_modifier=P2P)
+344c322
+<                                      lane, mask=lane < fx.Int32(G1N), cache_modifier=SCM)
+---
+>                                      lane, mask=lane < fx.Int32(G1N), cache_modifier=P2P)
+348c326
+<                                      fx.Int32(0), mask=lane == fx.Int32(0), cache_modifier=SCM)
+---
+>                                      fx.Int32(0), mask=lane == fx.Int32(0), cache_modifier=P2P)
+350c328
+<                                      fx.Int32(0), mask=lane == fx.Int32(0), cache_modifier=SCM)
+---
+>                                      fx.Int32(0), mask=lane == fx.Int32(0), cache_modifier=P2P)
+419c397
+<         def gemm1_unit(a, u, tx, lane, wave, k):
+---
+>         def gemm1_unit(a, u, tx, lane, wave):
+527d504
+<                     stamp(fx.Int32(9) + fx.Int32(3) * k)
+539c516
+<         def gemm2_unit(a, v, tx, lane, wave, k):
+---
+>         def gemm2_unit(a, v, tx, lane, wave):
+615c592
+<                                  lane * fx.Int32(VW), cache_modifier=SCM)
+---
+>                                  lane * fx.Int32(VW), cache_modifier=P2P)
+654d630
+<                     stamp(fx.Int32(9) + fx.Int32(3) * k)
+666c642
+<         def run_unit(a, i, n1, b1, b2, k):
+---
+>         def run_unit(a, i, n1, b1, b2):
+669c645
+<                 gemm1_unit(a, b1 + i, tx, lane, wave, k)
+---
+>                 gemm1_unit(a, b1 + i, tx, lane, wave)
+671c647
+<                 gemm2_unit(a, b2 + i - n1, tx, lane, wave, k)
+---
+>                 gemm2_unit(a, b2 + i - n1, tx, lane, wave)
+679d654
+<                 stamp(7)
+741d715
+<         stamp(1)
+744d717
+<         stamp(2)
+754d726
+<         k = fx.Int32(0)  # units this workgroup ran (TL: its slot, the last 8 share one)
+771,775c743
+<                 ks = fx.min(k, fx.Int32(7))
+<                 stamp(fx.Int32(8) + fx.Int32(3) * ks)
+<                 stamp(fx.Int32(32) + ks, fx.Int64((i >= n1).select(
+<                     fx.Int32(1 << 20) + b2 + i - n1, b1 + i)))
+<                 run_unit(reload(), i, n1, b1, b2, ks)
+---
+>                 run_unit(reload(), i, n1, b1, b2)
+777,778d744
+<                 stamp(fx.Int32(10) + fx.Int32(3) * ks)
+<                 k = k + fx.Int32(1)
+783d748
+<         stamp(3)
+786d750
+<         stamp(4)
+788d751
+<         stamp(5)

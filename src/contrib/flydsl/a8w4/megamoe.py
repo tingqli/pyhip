@@ -25,14 +25,30 @@ with the captured token count, so pad the batch to it with topk_ids -1 (as sglan
 ``num_token_non_padded`` mask does): negative ids are no routes, their output rows stay 0.
 The cross-rank flags carry a device-side call counter, so replays, eager calls and several
 graphs mix freely as long as every rank makes the same calls in the same order.
+
+``MegaMoeSmallEpA8W4``: the same layer for decode-sized batches (<= ``tmax`` tokens over
+all ranks, 1024 by default) as ONE kernel per call (``kernels/ep_mega_small.py``: x quant
+and dispatch into fixed per-expert slots, gemm1 / gemm2, the combine), same contract.
 """
 
 import torch
 
 from .kernels._act import situ_args
-from .kernels._protocol import ARRIVED, BLOCK_M, E_LOCAL, NPES, QUEUES, ROW_BITS, SCHED_EXPECTED
+from .kernels._protocol import (
+    ARRIVED,
+    BLOCK_M,
+    E_LOCAL,
+    NPES,
+    QUEUES,
+    ROW_BITS,
+    SC_TILE,
+    SCHED_EXPECTED,
+    small_max_tiles,
+    small_sym_layout,
+)
 from .kernels import ep_mega as K
 from .kernels import ep_mega_comm as C
+from .kernels import ep_mega_small as KS
 
 
 class MegaMoeEpA8W4:
@@ -166,3 +182,72 @@ class MegaMoeEpA8W4:
     def rows_needed(self):
         """Rows the last call needed on this rank (> s_cap: routes were dropped)."""
         return int(self.status[1].item())
+
+
+# kernel keys of MegaMoeSmallEpA8W4's knobs: m-tile rows, gemm2 cols per unit, A bytes per
+# K tile, W prefetch depth, producer workgroups, workgroups per CU, gemm1 / gemm2 W cache
+# modifier (experiments/20261118_mega_small: only bm changes the time beyond +-2%)
+SMALL_KNOBS = dict(bm=64, no=256, arb=256, pf=2, producers=16, wpc=1, bcm1=2, bcm2=2)
+SMALL_KEYS = dict(bm="BM", no="NO", arb="ARB", pf="PF", producers="P", wpc="WPC", bcm1="BCM1",
+                  bcm2="BCM2")
+
+
+class MegaMoeSmallEpA8W4:
+    """One rank's EP8 MoE layer for decode-sized batches: ONE kernel per call
+    (``kernels/ep_mega_small.py``, after aiter's MegaMoEV2 small-input kernel): x quant and
+    dispatch straight into fixed per-expert slots on the destination, gemm1 / gemm2, and the
+    combine (each rank sums its tokens' rows).
+
+    ``W``: ``prepare_weights`` of the rank's 32 experts (global experts [32 rank, 32 rank +
+    32)), for the shape; ``tmax``: the most tokens a call brings over ALL ranks (each local
+    expert has tmax rows of slots, the combine tmax x topk rows: ~196 MB of the MORI heap
+    at tmax 1024, H 4096, top-8). Same contract as ``MegaMoeEpA8W4`` otherwise: every rank
+    makes the same calls, negative topk ids are no routes (their rows stay 0), CUDA graph
+    capture after one eager call."""
+
+    def __init__(self, W, *, rank, tmax=1024, topk=8, world=8):
+        import mori.shmem as ms
+        from mori.shmem import mori_shmem_create_tensor
+
+        E, N2, _ = W["w1"].shape
+        assert world == NPES and E == E_LOCAL, "EP8 x 32 local experts"
+        self.W, self.rank, self.topk, self.tmax = W, rank, topk, tmax
+        self.H, self.I = W["w2"].shape[1], N2 // 2
+        dev = torch.device("cuda", torch.cuda.current_device())
+        self.sym = mori_shmem_create_tensor((small_sym_layout(self.H, topk, tmax)[1],),
+                                            torch.uint8)
+        self.sym.zero_()
+        torch.cuda.synchronize()
+        ms.shmem_barrier_all()
+        self.stab = torch.tensor([ms.shmem_ptr_p2p(self.sym.data_ptr(), rank, p)
+                                  for p in range(world)], dtype=torch.int64, device=dev)
+        bms = (16, 32, 64)  # a2 rows / tile counters for every m-tile size
+        rows = max(small_max_tiles(topk, tmax, bm) * bm for bm in bms)
+        tiles = max(small_max_tiles(topk, tmax, bm) for bm in bms)
+        self.ctl = torch.zeros(SC_TILE + 16 * tiles, dtype=torch.int32, device=dev)
+        self.a2 = torch.empty((rows, self.I), dtype=torch.uint8, device=dev)
+        self.a2s = torch.empty((rows, self.I // 128), dtype=torch.float32, device=dev)
+        self.out = torch.empty((tmax, self.H), dtype=torch.bfloat16, device=dev)
+
+    def kernel(self, act="silu", **knobs):
+        """The kernel specialization of ``knobs`` (``SMALL_KNOBS`` names)."""
+        k = dict(SMALL_KNOBS, **knobs)
+        return KS.ep_mega_small_kernel.get(H=self.H, I=self.I, TOPK=self.topk, TMAX=self.tmax,
+                                           ACT=act, **{SMALL_KEYS[n]: v for n, v in k.items()})
+
+    def __call__(self, x, topk_ids, topk_weights, W=None, act="silu", situ=None, **knobs):
+        """x bf16 [T, H] (this rank's tokens), topk_ids int32 [T, topk] (global ids;
+        negative: no route), topk_weights f32 [T, topk]; ``W``: the call's experts (default:
+        the constructor's). Returns bf16 [T, H], a view of this object's output buffer
+        (valid until the next call)."""
+        T, H = x.shape
+        assert T <= self.tmax and H == self.H, (T, self.tmax, H)
+        assert x.dtype == torch.bfloat16 and topk_ids.dtype == torch.int32
+        assert topk_weights.dtype == torch.float32 and topk_ids.shape == (T, self.topk)
+        W = self.W if W is None else W
+        x, topk_ids, topk_weights = x.contiguous(), topk_ids.contiguous(), topk_weights.contiguous()
+        self.kernel(act, **knobs)(
+            x, topk_ids, topk_weights, self.out, self.sym, self.stab, self.ctl, self.a2,
+            self.a2s, W["w1"], W["w1_scale"], W["w1_exp"], W["w2"], W["w2_scale"], W["w2_exp"],
+            T, self.rank, *situ_args(**(situ or {})))
+        return self.out[:T]

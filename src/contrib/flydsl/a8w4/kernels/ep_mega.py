@@ -44,6 +44,7 @@ from flydsl.expr.typing import Vector as Vec
 from pyhip.contrib.flydsl.host_launch import flydsl_kernel
 
 from ._act import gate_up_act, situ_params
+from ._atomic import _atomic_add_at, _atomic_load_at, _inv_l1, _xcc_id
 from ._cvt import _channel_factor, _fp8x4_pack
 from ._hw import CM_NT, CM_SC1, CM_SYS, LDS_BYTES_MAX, _opaque_tx, _u
 from ._kloop import _dispatch_rows, _make_core
@@ -70,29 +71,6 @@ CHUNK = 8  # routes per producer wave between two signals
 P2P_AUX = CM_SYS | CM_NT  # stores written through to the destination (vmcnt covers visibility)
 WT_AUX = CM_SC1  # a2 written through (read by gemm2 tasks on any XCD)
 ARB = 128  # A bytes per row per K tile (one 128-K group)
-
-
-def _atomic_add(addr, value, scope):
-    """Monotonic i32 fetch-add at an i64 address ("agent-one-as": device, "one-as": system)."""
-    return fx.Int32(llvm.AtomicRMWOp(
-        llvm.AtomicBinOp.add, _global_base_ptr1(addr), _raw(fx.Int32(value)),
-        llvm.AtomicOrdering.monotonic, syncscope=scope, alignment=4).result)
-
-
-def _atomic_load(addr, scope):
-    """Monotonic i32 load at an i64 address, coherent at ``scope`` (polling)."""
-    return fx.Int32(llvm.LoadOp(T.i32, _global_base_ptr1(addr), alignment=4,
-                                ordering=llvm.AtomicOrdering.monotonic, syncscope=scope).result)
-
-
-def _asm_i32(asm):
-    return fx.Int32(llvm.inline_asm(T.i32, [], asm, "=s", has_side_effects=True))
-
-
-def _inv_l1():
-    """Invalidate the CU's L1: data in local memory written through (or by peers into the
-    uncached MORI heap) before the flag a task waited for; local L2 lines stay coherent."""
-    llvm.inline_asm(None, [], "buffer_inv sc0", "", has_side_effects=True)
 
 
 @flydsl_kernel
@@ -181,7 +159,7 @@ def ep_mega_kernel(*, H, I, TOPK, token_shift, producers=16, lag=2, ROWV=(32, 64
             if lane0 == fx.Int32(0):
                 zero = fx.Int32(llvm.inline_asm(T.i32, [], "v_mov_b32 $0, 0", "=v",
                                                 has_side_effects=True))
-                taken = _atomic_add(fx.Int64(addr) + fx.Int64(zero), value, "agent-one-as")
+                taken = _atomic_add_at(fx.Int64(addr) + fx.Int64(zero), value, "agent-one-as")
             return taken
 
         def take_ticket(after_task):
@@ -191,10 +169,10 @@ def ep_mega_kernel(*, H, I, TOPK, token_shift, producers=16, lag=2, ROWV=(32, 64
             if const_expr(after_task):
                 gpu.barrier()  # the previous task's LDS reads are done
             if wave0 == fx.Int32(0):
-                home = _asm_i32("s_getreg_b32 $0, hwreg(HW_REG_XCC_ID)") & fx.Int32(QUEUES - 1)
+                home = _xcc_id()
                 open_mask = fx.Int32(0)
                 for q in range_constexpr(QUEUES):
-                    seen = _u(_atomic_load(sched0 + fx.Int64(q * QSTRIDE * 4), "agent-one-as"))
+                    seen = _u(_atomic_load_at(sched0 + fx.Int64(q * QSTRIDE * 4), "agent-one-as"))
                     open_mask = open_mask | (seen < queue_tasks(fx.Int32(q))).select(
                         fx.Int32(1 << q), fx.Int32(0))
                 got = fx.Int32(-1)
@@ -237,10 +215,10 @@ def ep_mega_kernel(*, H, I, TOPK, token_shift, producers=16, lag=2, ROWV=(32, 64
 
         def spin_ge(addr, target, scope):
             """wave 0: poll until the i32 at addr >= target, then invalidate the L1."""
-            seen = _atomic_load(addr, scope)
+            seen = _atomic_load_at(addr, scope)
             while seen < target:
                 rocdl.s_sleep(2)
-                seen = _atomic_load(addr, scope)
+                seen = _atomic_load_at(addr, scope)
             _inv_l1()
 
         # ------------------------------------------------------------------ producer
@@ -323,7 +301,7 @@ def ep_mega_kernel(*, H, I, TOPK, token_shift, producers=16, lag=2, ROWV=(32, 64
                 arrived = fx.Int64((fx.Uint64(ws_hi) << fx.Uint64(32)) | fx.Uint64(ws_lo)) \
                     + fx.Int64((fx.Int32(ARRIVED) + blk) * fx.Int32(4))
                 if send:
-                    _atomic_add(arrived, 1, "one-as")
+                    _atomic_add_at(arrived, 1, "one-as")
                 nxt = nxt + fx.Int32(CHUNK)
 
         # ------------------------------------------------------------------ gemm1

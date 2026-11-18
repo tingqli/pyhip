@@ -25,9 +25,9 @@ token counts, the table's keys and the rotated weights. SiTUv2 runs with
 ``ref.SITU`` (its betas / clamp are launch arguments: no effect on the time). See
 configs/README.md for the commands that produced the shipped table.
 
-The EP MoE layer (``moe_ep.py``: solvers mega, mori, mori_eager on ``world`` GPUs per call)
-is ``EP_TUNING``, with the generic command line; every command that runs it starts the
-ranks itself:
+The EP MoE layer (``moe_ep.py``: solvers mega, mega_small, mori, mori_eager on ``world``
+GPUs per call) is ``EP_TUNING``, with the generic command line; every command that runs it
+starts the ranks itself:
 
     python -m kernelkit tune a8w4.tune:EP_TUNING mimo-flash2.6-ep8-silu -t 4096
     python -m kernelkit tune-all a8w4.tune:EP_TUNING --gpus 0-7 --out /tmp/a8w4_ep

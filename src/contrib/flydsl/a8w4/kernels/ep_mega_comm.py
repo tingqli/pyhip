@@ -24,18 +24,16 @@ SCHED_EXPECTED + s_cap / BLOCK_M + b. ``plan`` (local, int32): ep_prep -> ep_pla
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir.dialects import llvm
 from flydsl.expr import gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
 from pyhip.contrib.flydsl.host_launch import flydsl_kernel
 
-from ._atomic import _latomic_add
+from ._atomic import _latomic_add, _sys_load_at, _sys_store_at
 from ._cvt import _fp8x4_pack
 from ._hw import _u
 from ._mem import (
-    _global_base_ptr1,
     _ld,
     _raw,
     _rsrc,
@@ -73,22 +71,9 @@ SLICE_PER_THREAD = 4  # ep_plan: routes per thread (slices of up to 1024 routes)
 PLAN_THREADS = 256
 
 
-def _sys_store(addr, value):
-    """System-scope relaxed atomic store (sc0 sc1: written through) of an i32 at an i64
-    address."""
-    llvm.StoreOp(_raw(fx.Int32(value)), _global_base_ptr1(addr), alignment=4,
-                 ordering=llvm.AtomicOrdering.monotonic)
-
-
-def _sys_load(addr):
-    """System-scope relaxed atomic load (sc0 sc1) of an i32 at an i64 address."""
-    return fx.Int32(llvm.LoadOp(T.i32, _global_base_ptr1(addr), alignment=4,
-                                ordering=llvm.AtomicOrdering.monotonic).result)
-
-
 @flyc.jit
 def _flag_wait(addr, epoch):
-    while _sys_load(addr) != epoch:
+    while _sys_load_at(addr) != epoch:
         rocdl.s_sleep(1)
 
 
@@ -204,7 +189,7 @@ def mega_prep_kernel():
         if tid < fx.Int32(E_GLOBAL):
             _store(lds, fx.Int32(L_HIST) + tid, fx.Int32(0))
         for b in range(tid, blocks_cap, NT):
-            _sys_store(fx.Int64(ws) + fx.Int64((fx.Int32(ARRIVED) + b) * fx.Int32(4)), fx.Int32(0))
+            _sys_store_at(fx.Int64(ws) + fx.Int64((fx.Int32(ARRIVED) + b) * fx.Int32(4)), fx.Int32(0))
         gpu.barrier()
         ids_rs = _rsrc(topk_ids, fx.Int64(num_routes) * fx.Int64(4))
         for r0 in range(fx.Int32(0), num_routes, ROUTE_BATCH * NT):
@@ -220,17 +205,17 @@ def mega_prep_kernel():
             i = tid + fx.Int32(k * NT)
             peer = i // fx.Int32(E_GLOBAL)
             e = i % fx.Int32(E_GLOBAL)
-            _sys_store(fx.Int64(tab[peer]) + fx.Int64((me * fx.Int32(E_GLOBAL) + e) * fx.Int32(4)),
+            _sys_store_at(fx.Int64(tab[peer]) + fx.Int64((me * fx.Int32(E_GLOBAL) + e) * fx.Int32(4)),
                        lds[fx.Int32(L_HIST) + e])
         rocdl.s_waitcnt(vmcnt=0)  # this thread's count row stores and arrived zeroing landed
         gpu.barrier()
         if tid < fx.Int32(NPES):
-            _sys_store(fx.Int64(tab[tid]) + fx.Int64((fx.Int32(CFLAG) + me) * fx.Int32(4)), epoch)
+            _sys_store_at(fx.Int64(tab[tid]) + fx.Int64((fx.Int32(CFLAG) + me) * fx.Int32(4)), epoch)
             _flag_wait(fx.Int64(ws) + fx.Int64((fx.Int32(CFLAG) + tid) * fx.Int32(4)), epoch)
         gpu.barrier()
         for k in range_constexpr(NPES * E_GLOBAL // NT):
             i = tid + fx.Int32(k * NT)
-            c = _sys_load(fx.Int64(ws) + fx.Int64(i * fx.Int32(4)))
+            c = _sys_load_at(fx.Int64(ws) + fx.Int64(i * fx.Int32(4)))
             _store(lds, fx.Int32(L_CNT) + i, c)
             _store(plan_p, fx.Int32(PLAN_COUNTS) + i, c)
         gpu.barrier()
@@ -424,7 +409,7 @@ def mega_finish_kernel():
         epoch = status_p[fx.Int32(STATUS_EPOCH)] + fx.Int32(1)
         if tid < fx.Int32(NPES):
             tab = global_typed_ptr(ws_tab, T.i64, align=8)
-            _sys_store(fx.Int64(tab[tid]) + fx.Int64((fx.Int32(FFLAG) + me) * fx.Int32(4)), epoch)
+            _sys_store_at(fx.Int64(tab[tid]) + fx.Int64((fx.Int32(FFLAG) + me) * fx.Int32(4)), epoch)
             _flag_wait(fx.Int64(ws) + fx.Int64((fx.Int32(FFLAG) + tid) * fx.Int32(4)), epoch)
         if tid == fx.Int32(0):  # one wave: every lane's wait is over
             _store(status_p, fx.Int32(STATUS_EPOCH), epoch)

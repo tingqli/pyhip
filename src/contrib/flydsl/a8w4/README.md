@@ -158,20 +158,20 @@ a8w4/
   tune.py                      调优：TOKENS 和 TUNING（kernelkit.tune.Tuning：problem、分桶维、调优点、key、轮换的权重，6.3 节）；CLI `python -m a8w4.tune <cmd>` 就是 `python -m kernelkit <cmd> a8w4.tune:TUNING`（problems / configs / tune / merge / show / verify / tune-all），另有 a8w4 的报告 compare / readme / stats；表的读、写、合并、比较在 `kernelkit.table`（分派和 tune 共用）；EP 整层：EP_TOKENS 和 EP_TUNING（`python -m kernelkit <cmd> a8w4.tune:EP_TUNING`，自动起 8 个 rank）
   tables.py                    调优表报告：compare（`kernelkit.table.compare`，按 shape / act / tokens 列出两张表逐点的 winner）、readme（重新生成 / 检查 README 7.2–7.4）、stats（situv2 与 silu）
   ref.py                       测试与调优用：算子的问题定义（moe_ref 参考实现、moe_problem 由 problem 生成输入（@dim shape / act / routing）、moe_check 判定、moe_dims 由输入读出 dim 并检查；moe_dyn_* 同理）、随机权重和路由、模拟 fp8 量化的 fp32 参考、冷 cache 计时
-  megamoe.py                   MegaMoeEpA8W4：EP8 整层（dispatch + 专家 + combine）的单 persistent kernel 封装，用于大 batch；可以 CUDA graph capture / 回放（跨卡 flag 的 epoch 是 device 计数器），topk_ids 为负（padding）的路由不发送
-  moe_ep.py                    EP 整层算子 moe_ep（每个 rank 调用一次）：EpComm（rank、world 和各 solver 的通信缓冲）、问题定义（moe_ep_ref / _problem / _check / _dims）和 3 个 solver：mega（MegaMoeEpA8W4）、mori（MORI dispatch → ep3k → MORI combine，可以 CUDA graph capture）、mori_eager（host 读收到的行数），都是 @multi_gpu("world")
+  megamoe.py                   MegaMoeEpA8W4：EP8 整层（dispatch + 专家 + combine）的单 persistent kernel 封装，用于大 batch；可以 CUDA graph capture / 回放（跨卡 flag 的 epoch 是 device 计数器），topk_ids 为负（padding）的路由不发送。MegaMoeSmallEpA8W4：小 batch（所有 rank 合计 ≤ tmax = 1024 tokens）的整层，每次调用只有 1 个 kernel（kernels/ep_mega_small.py），同样的 graph / padding 约定
+  moe_ep.py                    EP 整层算子 moe_ep（每个 rank 调用一次）：EpComm（rank、world 和各 solver 的通信缓冲）、问题定义（moe_ep_ref / _problem / _check / _dims）和 4 个 solver：mega（MegaMoeEpA8W4）、mega_small（MegaMoeSmallEpA8W4，knob bm）、mori（MORI dispatch → ep3k → MORI combine，可以 CUDA graph capture）、mori_eager（host 读收到的行数），都是 @multi_gpu("world")
   bench/                       实验工具 python -m a8w4.bench：ab（A/B 计时）、breakdown（每个 kernel 的耗时）、check（正确性）、dist（megamoe 8 卡变体）；core.py 是 a8w4 的用例、输入和变体别名（变体解析、A/B 和 check 的引擎、运行记录在 `kernelkit.bench`，冷 cache 计时、ABBA、噪声带在 `kernelkit.timing`），dist.py 也是 8 卡测试共用的 helper
   prof.py                      python -m a8w4.prof：counters（rocprofv3 计数器汇总）、isa（VGPR / spill / LDS）
   exp.py                       python a8w4/exp.py：实验登记 experiments/index.csv 的 grep / ls / add / new / lint / clean
   experiments/                 历次实验：index.csv（一行一个实验）、log_YYYYMMDD.md、各实验目录；_launch.py 是旧实验脚本用的 _run_compiled
   configs/a8w4_moe_tuned.csv   调优表（每个点保存全部配置的耗时）
-  configs/a8w4_moe_ep_tuned.csv  EP 整层 moe_ep 的调优表（mega / mori / mori_eager 的全部配置）
+  configs/a8w4_moe_ep_tuned.csv  EP 整层 moe_ep 的调优表（mega / mega_small / mori / mori_eager 的全部配置）
   configs/README.md            调优表的内容与生成命令
   tests/test_a8w4_ops.py       pytest：每个 solver 的每个调优过的配置对参考实现，由算子生成（op_tests：moe 测 tune.TUNING 的每个 problem，moe_dyn 的 problem 写在这个文件里）
   tests/test_a8w4_moe.py       pytest：参考实现、查表、CUDA graph 等其余性质
   tests/test_a8w4_mori_ep8.py  8 卡 EP8 整层（MORI dispatch → a8w4_moe_dyn → MORI combine）：pytest 查正确性，命令行测性能（8.1 节）
   tests/test_a8w4_mori_tp8.py  8 卡 TP8 整层（a8w4_moe → all-reduce），EP8 脚本的 TP 对照：pytest 查正确性，命令行测性能（8.2 节）
-  tests/test_a8w4_megamoe_ep8.py  8 卡 megamoe 整层：pytest 查正确性（eager，以及带 -1 padding 的 CUDA graph 连续回放），命令行与 MORI 路径比性能
+  tests/test_a8w4_megamoe_ep8.py  8 卡 megamoe 整层：pytest 查正确性（eager，以及带 -1 padding 的 CUDA graph 连续回放；MegaMoeEpA8W4 和 MegaMoeSmallEpA8W4 各两个测试），命令行与 MORI 路径比性能
   kernels/                     FlyDSL device 代码
     row_quant.py               x 按行 fp8 量化（行数是运行时参数）
     tp_prep.py                 TP 族的 prep：全部专家的路由排序 + x 量化 + out 清零，1 次 launch
@@ -184,14 +184,15 @@ a8w4/
     ep_small.py                ep1k：单 launch 的小 batch 融合
     ep_mega.py                 megamoe：dispatch + gemm1 / gemm2 + combine 的单个 persistent kernel
     ep_mega_comm.py            megamoe 的通信 kernel：x 量化 + out 清零、路由计划（各卡计数交换）、完成屏障
+    ep_mega_small.py           megamoe small（参考 aiter `mega_moe_small_m.py`）：小 batch 的整层单 kernel，x 量化 + 直接写进目的卡每个专家的固定槽位的 dispatch、gemm1 / gemm2（按 XCD 分片的工作计数器）、各 rank 汇总自己 token 的 combine
     _hw.py                     MI300X 硬件常量（NUM_CU、NUM_XCD、LDS_BYTES_MAX、cache 策略位 CM_*）和 readfirstlane 等 wave / XCD 相关 helper
     _mem.py                    共享 device helper：IR 值转换、整数除法、global / LDS 指针、buffer 读写（_rsrc、_ld、_store）、i32 buffer 视图
-    _atomic.py                 WG 间的原子操作（global / LDS、bf16x4 atomic add），以及轮询它们写的值用的 coherent load
+    _atomic.py                 WG 间的原子操作（global / LDS、bf16x4 atomic add），以及轮询它们写的值用的 coherent load；按 i64 地址的 atomic、系统一致的 load / store、L1 失效、XCD 号（megamoe 的 kernel 共用）
     _act.py                    gemm1 epilogue 的激活（silu、situv2）
     _cvt.py                    数值格式转换：f32 → fp8 / bf16 打包，mxfp4 权重 fd2 解码成 fp8 和它的每通道系数
     _mma.py                    MFMA 操作数（寄存器里的 fp8 片段）和一步 fp8 MFMA
-    _kloop.py                  EP GEMM tile 的 K 循环 _make_core（ep_gemm、ep_small、ep_mega 共用）和行数变体的分派 _dispatch_rows
-    _protocol.py               一个 kernel 写、另一个 kernel 读的 buffer 格式（EP 调度表；megamoe 的 flag / 队列布局）
+    _kloop.py                  EP GEMM tile 的 K 循环 _make_core（ep_gemm、ep_small、ep_mega、ep_mega_small 共用）和行数变体的分派 _dispatch_rows
+    _protocol.py               一个 kernel 写、另一个 kernel 读的 buffer 格式（EP 调度表；megamoe 的 flag / 队列布局；megamoe small 的 symmetric buffer 布局和控制块）
     channel_exp.py             W 每行（输出通道）最大的 e8m0 scale 指数，prepare_weights 用
 ```
 
@@ -960,12 +961,20 @@ TP kernel（`tp_gemm1`、`tp_gemm2`、`tp_fmoe`、`tp_fmoe_q`）里走不到的�
     - 第一块直接传计数张量，kernel 会截到块大小；
     - 后面的块传 clamp(total − 起点, 0, 块大小)，全程在 device 上算。
 
+**megamoe small（`ep_mega_small`，`experiments/20261118_mega_small`）**
+
+26. **远端 store 不要集中在一个 CU 上。** 小 batch 时按 `t = 8·bid + wave` 分 token，8 个 token 全落在 producer 0，256 KB 的远端 store 由一个 CU 发出，dispatch 要 11 us；按 `t = bid + P·wave` 先在 producer 之间分散，降到 8 us。
+27. **每个 GEMM unit 开头约 5 us 是 W 预取的填充，不是空等。** 把 scale 表的读提前到 W 预取之后（`_make_core` 的 `pre_a` / `post_a`）没有改变这段时间：gfx942 的 vmcnt 按发出顺序计数，等任何后发的 load 都要先等前面的 W 预取。每个 WG 约 3 个 unit，这部分加上尾部是 GEMM 阶段（64 tokens 约 115 us）与 W 读取下限（84 us）的主要差距。
+28. **uncached MORI heap 上远端 store 的 cache 位不影响耗时**：sc0|sc1|nt 与 0 一样快（aiter 在 gfx950 上测得 nt 更慢）。保留 sc0|sc1|nt，不依赖 heap 是 uncached。
+29. **固定槽位的容量来自调用方给的 `tokens`**：每个专家 tmax 行，所有 rank 的 token 总数 ≤ tmax 时不会溢出（一个 token 最多一路到同一个专家）。`tokens` 比真实总数小、真实总数又超过 tmax 时，超出的路由被丢掉，combine 读到的是该槽位的旧数据。
+
 ## 11. 后续方向
 
 - **TP 小 batch（≤16 tokens）**：
   - 排序和量化已合成一次 launch（`tp_prep`，1 token 时 3.8 us，原来两步合计约 12.6 us）；
   - gemm1 在极少 token 时用 split-K（`experiments/20261114_splitk_gemm1` 的 split-K EP gemm1 跑 TP 形状，加上 tp_prep，1 / 2 / 4 tokens 端到端快 56% / 47% / 35%），待并入 `ep_gemm.py` 并加一个 TP 类别。
 - **EP 小 batch**：把 prep 合进 gemm1，或者与上一层计算重叠；ep1k 的固定开销还要再分析。
+- **megamoe small**：GEMM 阶段离 W 读取下限还差约 25%，主要是每个 unit 开头的 W 预取填充（10 节第 27 条）。可以在一个 unit 的最后几个 K tile 就发出下一个 unit 的 W 预取（要改 `_make_core` 的结构）；2048 tokens 时它与 mega 持平，fixed slot 也就只留到 1024 tokens。
 - **中等 batch**：tile 数只有 CU 数的 1.7–3 倍，轮次量化明显。a8w4 gemm1 的量化组是 128 列，NI 不能再小；可以考虑让相邻 WG 交换行 amax，把 tile 切得更细。
 - **大 batch**：
   - 重写 gemm2：用更大的 M tile，解码后的 W 经 LDS 在多个 wave 之间共用，参考 pyhip 的 Down，16K tokens 有望快约 6%；

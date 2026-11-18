@@ -1,0 +1,6 @@
+[kernelkit] moe_ep runs on 8 GPUs here (@multi_gpu): 8 ranks; rank 0 prints, the others write /tmp/kernelkit_ranks_h9hf0pdb/rank<r>.log
+[18:57:23] moe_ep mimo-flash2.6-ep8-silu {'model_dim': 4096, 'inter_dim': 2048, 'experts_global': 256, 'world': 8, 'topk': 8, 'routing': 'uniform', 'act': 'silu'}: 32 configs, 8 copies of ['W']
+[18:57:45] tokens    512: mega_small bm64 173.6 | mega_small bm32 174.2 | mega p32 l4 bcm22 210.7
+[18:57:51] tokens   1024: mega_small bm64 228.4 | mega p32 l2 bcm22 242.6 | mega p16 l1 bcm22 242.7
+[18:57:57] tokens   2048: mega p16 l2 bcm22 364.8 | mega p32 l2 bcm22 365.7 | mega p16 l4 bcm22 366.2  (2 n/a: AssertionError)
+[18:58:04] tokens   4096: mega p16 l4 bcm01 531.3 | mega p16 l2 bcm01 534.0 | mega p16 l4 bcm22 537.6  (2 n/a: AssertionError)

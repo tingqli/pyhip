@@ -20,6 +20,10 @@ a8w4.tune:EP_TUNING ...`` start ``world`` ranks; ``mori_init``: MORI shmem):
   mega        ``megamoe.MegaMoeEpA8W4``: dispatch, gemm1 / gemm2 and combine in one
               persistent kernel; knobs ``producers``, ``lag``, ``bcm``; EP8 x 32 local
               experts only (other problems: n/a)
+  mega_small  ``megamoe.MegaMoeSmallEpA8W4`` (after aiter's MegaMoEV2 small-input
+              kernel): x quant, dispatch into fixed per-expert slots, gemm1 / gemm2 and
+              the combine as ONE kernel launch; knob ``bm`` (m-tile rows); ``tokens`` <=
+              ``EpComm.small_tmax`` (1024), EP8 x 32 local experts only
   mori        sglang's MORI path (``tests/test_a8w4_mori_ep8.py``): fp8 quant per (token,
               128), MORI dispatch, ``a8w4_moe_dyn`` ep3k (knob ``cfg``) on the whole
               receive buffer (the received count stays on the device, row estimate
@@ -62,13 +66,15 @@ def mori_init():
 
 class EpComm:
     """One rank's communication state for ``moe_ep``: its ``rank`` of ``world``, the tokens
-    per rank a call may bring (``max_tokens``) and each solver family's symmetric buffers,
-    made by the first call that needs them (a collective: every rank makes the same calls
-    in the same order)."""
+    per rank a call may bring (``max_tokens``), the most tokens over all ranks a
+    ``mega_small`` call may bring (``small_tmax``) and each solver family's symmetric
+    buffers, made by the first call that needs them (a collective: every rank makes the
+    same calls in the same order)."""
 
-    def __init__(self, *, rank, world, max_tokens):
+    def __init__(self, *, rank, world, max_tokens, small_tmax=1024):
         self.rank, self.world, self.max_tokens = rank, world, max_tokens
-        self._mega = self._mori = None
+        self.small_tmax = small_tmax
+        self._mega = self._mori = self._small = None
 
     def mega(self, W, topk):
         """The ``MegaMoeEpA8W4`` (built for W's shape; the calls pass their own W)."""
@@ -78,6 +84,15 @@ class EpComm:
             self._mega = MegaMoeEpA8W4(W, rank=self.rank, max_tokens=self.max_tokens,
                                        topk=topk, world=self.world)
         return self._mega
+
+    def small(self, W, topk):
+        """The ``MegaMoeSmallEpA8W4`` (built for W's shape; the calls pass their own W)."""
+        if self._small is None:
+            from .megamoe import MegaMoeSmallEpA8W4
+
+            self._small = MegaMoeSmallEpA8W4(W, rank=self.rank, tmax=self.small_tmax,
+                                             topk=topk, world=self.world)
+        return self._small
 
     def mori(self, W, topk):
         """(MORI op, fp8 quant per (token, 128)) as sglang builds them for one node with
@@ -218,6 +233,22 @@ def moe_ep_mega(x, W, topk_weights, topk_ids, *, comm, tokens, act="silu", situ=
         return mega(x, topk_ids, topk_weights)
     finally:
         mega.launch, mega.launch_big, mega.slices, mega.grid, mega.W, mega.situ = saved
+
+
+# ---- solver mega_small -------------------------------------------------------------------
+
+@ep_register
+@multi_gpu("world", init=mori_init)
+@knob("bm", (32, 64), id="bm{}")
+@meta(cached_loads=False)
+def moe_ep_mega_small(x, W, topk_weights, topk_ids, *, comm, tokens, act="silu", situ=None,
+                      bm=64, **over):
+    """``comm.small``: one kernel per call, m-tiles of ``bm`` rows; ``over``: the other
+    kernel knobs of ``megamoe.SMALL_KNOBS`` (experiments)."""
+    small = comm.small(W, topk_ids.shape[1])
+    assert tokens <= small.tmax, (
+        f"mega_small: {tokens} tokens over all ranks > its fixed slots ({small.tmax} per expert)")
+    return small(x, topk_ids, topk_weights, W=W, act=act, situ=situ, bm=bm, **over)
 
 
 # ---- solvers mori, mori_eager ------------------------------------------------------------

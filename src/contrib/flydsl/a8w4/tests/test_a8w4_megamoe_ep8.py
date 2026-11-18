@@ -9,6 +9,7 @@ A batch of T tokens (the model's total) is split evenly over the ranks (DP atten
 
     pytest -q a8w4/tests/test_a8w4_megamoe_ep8.py           # correctness vs the fp32 reference
     pytest -q a8w4/tests/test_a8w4_megamoe_ep8.py -k graph  # only the CUDA graph replay
+    pytest -q a8w4/tests/test_a8w4_megamoe_ep8.py -k small  # only MegaMoeSmallEpA8W4
     python a8w4/tests/test_a8w4_megamoe_ep8.py              # perf: T = 2048 .. 32768, vs MORI
     python a8w4/tests/test_a8w4_megamoe_ep8.py -t 8192 --iters 50 --act situv2
 
@@ -32,6 +33,11 @@ barrier, a GPU spin while the host enqueues the layer, and a MORI device barrier
 ranks start together; e2e = the layer of the slowest rank, median over the iterations; the
 two paths alternate per iteration. Stage split of megamoe (events between its launches,
 slowest rank): quant / prep (count exchange) / plan / mega / finish (wait for all ranks).
+
+The small-batch layer ``a8w4.megamoe.MegaMoeSmallEpA8W4`` (one kernel per call, <= 1024
+tokens over all ranks): ``test_megamoe_small_ep8`` (eager: uneven batches with idle ranks
+and a single token, dropped slots, both routings, m-tiles of 32 and 64 rows) and
+``test_megamoe_small_ep8_graph`` (the replay schedule above, with batches of its range).
 """
 
 import argparse
@@ -261,6 +267,115 @@ def test_megamoe_ep8_graph():
     if reason:
         pytest.skip(reason)
     D.spawn(_graph_worker, ("silu",))
+
+
+# ---- MegaMoeSmallEpA8W4 --------------------------------------------------------------
+
+SMALL_TMAX = 1024  # tokens over all ranks
+# tokens per rank: decode-sized, an uneven batch (idle ranks, a single token; 570 in all),
+# one rank alone, every rank idle, the full fixed slots
+SMALL_CHECK_TOKENS = [[8] * WORLD, [0, 1, 37, 300, 5, 128, 99, 0], [1] + [0] * (WORLD - 1),
+                      [0] * WORLD, [SMALL_TMAX // WORLD] * WORLD]
+SMALL_GRAPH_TOKENS = {"a": 12, "b": 96, "e": 40}
+
+
+def _check_small(m, raw, ns, x, tw, ti, act, situ, run, **knobs):
+    """One small-layer call (``run()``) vs the fp32 reference on every rank's fp8 tokens
+    (quantized per (token, 128 columns) as the kernel does); asserts on every rank."""
+    rank, n = m.rank, ns[m.rank]
+    y = run()[:n].float()
+    xq = R.dequant_fp8(*R.quant_fp8_groups(x)) if n else x.float()
+    X, TW, TI = (D.gather_rows(t, ns) for t in (xq, tw, ti))
+    ref = R.ref_moe(X, TW, TI, raw, rank * E_LOCAL, act, situ, quant_x=False)
+    dist.all_reduce(ref)
+    off = sum(ns[:rank])
+    diff = R.cos_diff(ref[off:off + n], y) if n else 0.0
+    res = [None] * len(ns)
+    dist.all_gather_object(res, diff)
+    bad = [(r, d) for r, d in enumerate(res) if not d < COS_TOL]
+    assert not bad, f"tokens per rank {ns} {knobs}: (rank, cos diff) {bad}"
+    return max(res)
+
+
+def _small_worker(rank, port, act):
+    D.init(rank, port)
+    from a8w4.megamoe import MegaMoeSmallEpA8W4
+
+    situ = R.SITU if act == "situv2" else None
+    W, raw = R.make_weights(E_LOCAL, H, I, seed=rank)
+    m = MegaMoeSmallEpA8W4(W, rank=rank, tmax=SMALL_TMAX, topk=TOPK)
+    for rep in range(2):
+        for i, ns in enumerate(SMALL_CHECK_TOKENS):
+            routing = R.ROUTINGS[(rep + i) % 2]
+            seed = 7919 * rank + 31 * i + rep
+            if rep:  # about 1/16 of the slots dropped (topk_ids -1)
+                x, tw, ti = _padded_routing(ns[rank], ns[rank], seed=seed, routing=routing)
+            else:
+                x, tw, ti = R.make_routing(ns[rank], H, E_GLOBAL, TOPK, seed=seed,
+                                           routing=routing)
+            for bm in (32, 64):
+                call = functools.partial(
+                    _bounded, functools.partial(m, x, ti, tw, act=act, situ=situ, bm=bm))
+                d = _check_small(m, raw, ns, x, tw, ti, act, situ, call, bm=bm)
+                if rank == 0:
+                    print(f"small {act} bm{bm} {routing}, tokens per rank {ns} (call {rep + 1})"
+                          f": cos diff vs reference <= {d:.1e}", flush=True)
+    D.finish()
+
+
+def test_megamoe_small_ep8():
+    reason = _skip_reason()
+    if reason:
+        pytest.skip(reason)
+    D.spawn(_small_worker, ("silu",))
+
+
+def _small_graph_worker(rank, port, act):
+    D.init(rank, port)
+    from a8w4.megamoe import MegaMoeSmallEpA8W4
+
+    situ = R.SITU if act == "situv2" else None
+    W, raw = R.make_weights(E_LOCAL, H, I, seed=rank)
+    m = MegaMoeSmallEpA8W4(W, rank=rank, tmax=SMALL_TMAX, topk=TOPK)
+    graphs = {}
+    for kind in "ab":
+        n = SMALL_GRAPH_TOKENS[kind]
+        x, tw, ti = _padded_routing(n, n, seed=rank)  # the graph's static inputs
+        m(x, ti, tw, act=act, situ=situ)  # warm-up (compiles), then capture
+        torch.cuda.synchronize()
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            y = m(x, ti, tw, act=act, situ=situ)
+        graphs[kind] = (g, y, (x, tw, ti))
+    for step, kind in enumerate(GRAPH_STEPS):
+        n = SMALL_GRAPH_TOKENS[kind]
+        n_valid = _valid_tokens(n, step, rank)
+        x, tw, ti = _padded_routing(n, n_valid, seed=7919 * rank + 31 * step + 1,
+                                    routing=R.ROUTINGS[step % 2])
+        if kind == "e":
+            call = functools.partial(
+                _bounded, functools.partial(m, x, ti, tw, act=act, situ=situ))
+        else:
+            g, y, static = graphs[kind]
+            for dst, src in zip(static, (x, tw, ti)):
+                dst.copy_(src)
+            x, tw, ti = static
+            call = functools.partial(_bounded, _replay, g, y)
+        d = _check_small(m, raw, [n] * WORLD, x, tw, ti, act, situ, call)
+        assert not m.out[n_valid:n].any(), f"rank {rank} step {step}: padded rows not 0"
+        if rank == 0:
+            what = "eager call" if kind == "e" else f"replay of graph {kind}"
+            print(f"small step {step} {what}, {n} tokens per rank, {R.ROUTINGS[step % 2]} "
+                  f"routing, real {[_valid_tokens(n, step, r) for r in range(WORLD)]}: cos "
+                  f"diff vs reference <= {d:.1e}", flush=True)
+    D.finish()
+
+
+def test_megamoe_small_ep8_graph():
+    reason = _skip_reason()
+    if reason:
+        pytest.skip(reason)
+    D.spawn(_small_graph_worker, ("silu",))
 
 
 if __name__ == "__main__":

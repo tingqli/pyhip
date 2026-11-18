@@ -50,6 +50,45 @@ def _latomic_add(lds_i32, idx, val):
         llvm.AtomicOrdering.monotonic, syncscope="workgroup", alignment=4).result)
 
 
+def _atomic_add_at(addr, value, scope):
+    """Monotonic i32 fetch-add at an i64 address ("agent-one-as": device, "one-as":
+    system, e.g. another rank's memory)."""
+    return fx.Int32(llvm.AtomicRMWOp(
+        llvm.AtomicBinOp.add, _global_base_ptr1(addr), _raw(fx.Int32(value)),
+        llvm.AtomicOrdering.monotonic, syncscope=scope, alignment=4).result)
+
+
+def _atomic_load_at(addr, scope):
+    """Monotonic i32 load at an i64 address, coherent at ``scope`` (polling)."""
+    return fx.Int32(llvm.LoadOp(T.i32, _global_base_ptr1(addr), alignment=4,
+                                ordering=llvm.AtomicOrdering.monotonic, syncscope=scope).result)
+
+
+def _sys_store_at(addr, value):
+    """System-scope relaxed atomic store (sc0 sc1: written through) of an i32 at an i64
+    address."""
+    llvm.StoreOp(_raw(fx.Int32(value)), _global_base_ptr1(addr), alignment=4,
+                 ordering=llvm.AtomicOrdering.monotonic)
+
+
+def _sys_load_at(addr):
+    """System-scope relaxed atomic load (sc0 sc1) of an i32 at an i64 address."""
+    return fx.Int32(llvm.LoadOp(T.i32, _global_base_ptr1(addr), alignment=4,
+                                ordering=llvm.AtomicOrdering.monotonic).result)
+
+
+def _inv_l1():
+    """Invalidate the CU's L1 (data written through, or into the uncached MORI heap,
+    before the flag a wave waited for)."""
+    llvm.inline_asm(None, [], "buffer_inv sc0", "", has_side_effects=True)
+
+
+def _xcc_id():
+    """The XCD (0..7) this wave runs on."""
+    return fx.Int32(llvm.inline_asm(T.i32, [], "s_getreg_b32 $0, hwreg(HW_REG_XCC_ID)", "=s",
+                                    has_side_effects=True)) & fx.Int32(7)
+
+
 @flyc.jit
 def _atomic_bf16x4(arg_out, base, v4, ok):
     """out[base .. base+3] += 4 f32 values rounded to bf16 (2 bf16x2 agent atomics)."""

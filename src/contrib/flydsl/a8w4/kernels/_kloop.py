@@ -68,6 +68,9 @@ def _make_core(*, K, W_ROWS, BM, PF, bcm, cols, lds_ptr, LDS_BYTES, lane, tx, NT
     and the 4 consecutive columns (L//16)*4 + v). ``row_base16(row)``: 16 B-unit
     index of A row ``row`` (< R) of the block (indices past ``a_num_bytes`` read 0).
     ``hook(acc, kt, s)``: called before MFMA step s of every tile (group rescale).
+    ``pre_a()``: after the W prefetch is issued, before the first A load; ``post_a()``:
+    after the first A tile's loads are issued, before they go to LDS (e.g. finish a
+    table from loads ``pre_a`` issued without waiting for A in between).
     ``ARB``: A bytes per row per K tile (128 / 256).
     ``AQ8``: A source is bf16 (``row_base16`` in bf16 16 B units), quantized while
     staged to fp8 with one scale per (row, 128-K tile); the per-row ratio
@@ -151,7 +154,7 @@ def _make_core(*, K, W_ROWS, BM, PF, bcm, cols, lds_ptr, LDS_BYTES, lane, tx, NT
     def swz(row, col16):
         return col16 ^ (row & fx.Int32(CH - 1))
 
-    def run(R, row_base16, hook=None, pre_a=None):
+    def run(R, row_base16, hook=None, pre_a=None, post_a=None):
         MR = R // 16
         A_LOADS = -(-(R * CH) // NT)  # 16 B A chunks per thread per tile
         AU = 2 if AQ8 else 1  # 16 B source units per LDS chunk
@@ -298,6 +301,8 @@ def _make_core(*, K, W_ROWS, BM, PF, bcm, cols, lds_ptr, LDS_BYTES, lane, tx, NT
             pre_a()  # e.g. wait for A's producer; the W prefetch is already in flight
         a_sources()
         load_a(fx.Int32(0))
+        if const_expr(post_a is not None):
+            post_a()
         store_a(0, first=True, last=KT == 1)
         load_a(fx.Int32(1))
 

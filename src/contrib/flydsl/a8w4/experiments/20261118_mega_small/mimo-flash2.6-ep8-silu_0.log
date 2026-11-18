@@ -1,0 +1,12 @@
+[kernelkit] moe_ep runs on 8 GPUs here (@multi_gpu): 8 ranks; rank 0 prints, the others write /tmp/kernelkit_ranks_n3cd98o7/rank<r>.log
+[18:33:27] moe_ep mimo-flash2.6-ep8-silu {'model_dim': 4096, 'inter_dim': 2048, 'experts_global': 256, 'world': 8, 'topk': 8, 'routing': 'uniform', 'act': 'silu'}: 32 configs, 8 copies of ['W']
+[18:37:45] tokens     64: mega_small bm32 142.5 | mega_small bm64 142.7 | mori t16 168.5
+[18:38:02] tokens    128: mega_small bm64 154.3 | mega_small bm32 154.9 | mori s16 186.1
+[18:38:19] tokens    256: mega_small bm64 158.8 | mega_small bm32 159.8 | mori s16 188.6
+[18:38:35] tokens    512: mega_small bm64 175.0 | mega_small bm32 175.5 | mega p32 l4 bcm22 210.0
+[18:38:58] tokens   1024: mega_small bm64 228.1 | mega p32 l2 bcm22 242.8 | mega p16 l2 bcm22 243.4
+[18:39:21] tokens   2048: mega p32 l2 bcm22 365.0 | mega p32 l1 bcm22 365.1 | mega p16 l1 bcm22 365.6  (2 n/a: AssertionError)
+[18:39:40] tokens   4096: mega p16 l4 bcm01 530.9 | mega p16 l2 bcm01 531.6 | mega p16 l4 bcm22 537.9  (2 n/a: AssertionError)
+[18:40:00] tokens   8192: mega p16 l4 bcm01 897.7 | mega p32 l4 bcm01 903.2 | mega p8 l4 bcm01 905.4  (2 n/a: AssertionError)
+[18:40:10] tokens  16384: mega p16 l4 bcm01 1637.4 | mega p8 l4 bcm01 1643.5 | mega p8 l2 bcm01 1663.7  (2 n/a: AssertionError)
+[18:40:26] tokens  32768: mega p32 l4 bcm01 3158.9 | mega p16 l4 bcm01 3161.7 | mega p16 l2 bcm01 3170.2  (2 n/a: AssertionError)

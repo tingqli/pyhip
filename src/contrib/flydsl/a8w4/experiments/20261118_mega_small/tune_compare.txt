@@ -1,0 +1,22 @@
+act=silu ~tokens=64 old mori s16 169.0 new mega_small bm32 142.5 old-cfg-now 169.3 -15.8% *
+act=silu ~tokens=128 old mori s16 183.5 new mega_small bm64 154.3 old-cfg-now 186.1 -17.1% *
+act=silu ~tokens=256 old mori t16 189.1 new mega_small bm64 158.8 old-cfg-now 188.7 -15.8% *
+act=silu ~tokens=512 old mega p32 l4 bcm22 211.4 new mega_small bm64 173.6 old-cfg-now 210.7 -17.6% *
+act=silu ~tokens=1024 old mega p32 l1 bcm22 242.3 new mega_small bm64 228.4 old-cfg-now 243.0 -6.0% *
+act=silu ~tokens=2048 old mega p16 l1 bcm22 365.8 new mega p16 l2 bcm22 364.8 old-cfg-now 366.5 -0.5% *
+act=silu ~tokens=4096 old mega p16 l4 bcm01 528.9 new mega p16 l4 bcm01 531.3 old-cfg-now 531.3 +0.0%
+act=silu ~tokens=8192 old mega p16 l4 bcm01 898.8 new mega p16 l4 bcm01 897.7 old-cfg-now 897.7 +0.0%
+act=silu ~tokens=16384 old mega p8 l4 bcm01 1646.9 new mega p16 l4 bcm01 1637.4 old-cfg-now 1643.5 -0.4% *
+act=silu ~tokens=32768 old mega p16 l4 bcm01 3159.9 new mega p32 l4 bcm01 3158.9 old-cfg-now 3161.7 -0.1% *
+act=situv2 ~tokens=64 old mori t16 171.7 new mega_small bm64 144.3 old-cfg-now 170.7 -15.5% *
+act=situv2 ~tokens=128 old mori t16 184.4 new mega_small bm64 154.6 old-cfg-now 184.4 -16.2% *
+act=situv2 ~tokens=256 old mori t16 189.2 new mega_small bm64 160.1 old-cfg-now 189.5 -15.5% *
+act=situv2 ~tokens=512 old mega p32 l1 bcm22 215.4 new mega_small bm64 175.3 old-cfg-now 216.7 -19.1% *
+act=situv2 ~tokens=1024 old mega p32 l2 bcm22 247.5 new mega_small bm64 232.5 old-cfg-now 248.1 -6.3% *
+act=situv2 ~tokens=2048 old mega p16 l2 bcm22 373.1 new mega p16 l2 bcm22 373.5 old-cfg-now 373.5 +0.0%
+act=situv2 ~tokens=4096 old mega p16 l4 bcm01 540.8 new mega p16 l4 bcm01 544.1 old-cfg-now 544.1 +0.0%
+act=situv2 ~tokens=8192 old mega p16 l4 bcm01 919.4 new mega p16 l4 bcm01 920.6 old-cfg-now 920.6 +0.0%
+act=situv2 ~tokens=16384 old mega p16 l4 bcm01 1649.4 new mega p16 l4 bcm01 1640.6 old-cfg-now 1640.6 +0.0%
+act=situv2 ~tokens=32768 old mega p16 l4 bcm01 3150.2 new mega p32 l4 bcm01 3268.9 old-cfg-now 3269.1 -0.0% *
+
+14 of 20 points changed winner (*); old-cfg-now: the old winner's time in the new table, the % is what the new winner gains over it

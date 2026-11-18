@@ -91,18 +91,21 @@ python -m pytest a8w4/tests/test_a8w4_moe.py -q -p no:cacheprovider
 
 ## a8w4_moe_ep_tuned.csv：EP 整层（`moe_ep`）
 
-`moe_ep`（`../moe_ep.py`）每个 rank 调用一次，在 solver `mega`、`mori`、`mori_eager` 的全部配置里查这张表选一个。
+`moe_ep`（`../moe_ep.py`）每个 rank 调用一次，在 solver `mega`、`mega_small`、`mori`、`mori_eager` 的全部配置里查这张表选一个。
 
 - **列**：`model_dim, inter_dim, experts_global, world, topk, routing, act, ~tokens, config, us, cos`。
 - **key**：`(model_dim, inter_dim, experts_global, world, topk, routing, act)`，本卡专家数由 `experts_global / world` 推出。
 - **分桶列** `~tokens`：所有 rank 的 token 总数。
 - **`us`**：各 rank 对齐后最慢的那个 rank 的时间。
-- **当前内容**：`mimo-flash2.6-ep8-silu` 和 `-situv2` 两个 problem（4096/2048/256/EP8/topk 8，uniform），token 点为 `tune.EP_TOKENS`（64–32768），每点 30 个配置，共 600 行。
-- **来源**：20261118 用下面的命令生成，耗时 9.3 min，没有 BAD 配置。situv2 的 64 / 128 点中 mori 的结果有异常（比相邻点慢 2–3 倍，mega 的结果正常），在空闲机器上重调这两个点后 `merge` 进表。
-- **结果**（各 solver 最快配置之比）：
-  - ≤256 tokens：`mori` 比 `mega` 快 4–7%。
-  - ≥512 tokens：`mori` 的时间是 `mega` 的 1.03–1.47 倍（2048–4096 tokens 差距最大）。
-  - `mori_eager`：在主机上读收到的 token 数，时间是 `mori` 的 1.02–2.3 倍。
+- **当前内容**：`mimo-flash2.6-ep8-silu` 和 `-situv2` 两个 problem（4096/2048/256/EP8/topk 8，uniform），token 点为 `tune.EP_TOKENS`（64–32768），每点 32 个配置（mega 18、mega_small 2、mori 6、mori_eager 6）。`mega_small` 在 `tokens` > 1024 时报错（n/a，不写入表），共 620 行。
+- **来源**：20261118 用下面的命令生成，耗时 13.9 min，没有 BAD 配置。第一遍有两类异常，在空闲机器上重调这些点后 `merge` 进表：
+  - silu 512–4096、situv2 64 / 128：`mori` 或 `mori_eager` 的时间是重调后的 1.2–3.6 倍，同点的 mega 和 mega_small 不受影响；
+  - situv2 16384 / 32768：`mega` 比上一版表慢 4.1% / 3.0%。重调后 16384 恢复；32768 仍慢 3.8%（3268.9 vs 3150.2 us，原因未查；silu 同点与上一版表一致）。
+- **结果**（与上一版表比较：`../experiments/20261118_mega_small/tune_compare.txt`，记录在 `../experiments/log_20261118.md`）：
+  - 64–1024 tokens：都选 `mega_small`。比上一版表的最快配置快 15.5–19.1%（≤512 tokens）和 6.0–6.3%（1024 tokens）。≤512 tokens 时 bm32 与 bm64 相差不到 1%，1024 tokens 时 bm32 慢 14%。
+  - ≥2048 tokens：仍选 `mega`，与上一版表相差不到 0.5%。
+  - `mega` 在 64–512 tokens 的时间是 `mega_small` 的 1.21–1.28 倍，1024 tokens 时为 1.06 倍。
+  - `mori` 在每个点都不是最快，时间是最快配置的 1.18–1.34 倍；`mori_eager`（在主机上读收到的 token 数）的时间是 `mori` 的 1.02–2.8 倍。
 
 ```bash
 cd pyhip/src/contrib/flydsl
@@ -112,6 +115,6 @@ cp /tmp/a8w4_ep/a8w4_moe_ep_tuned.new.csv a8w4/configs/a8w4_moe_ep_tuned.csv
 python -m kernelkit show   a8w4.tune:EP_TUNING mimo-flash2.6-ep8
 python -m kernelkit verify a8w4.tune:EP_TUNING mimo-flash2.6-ep8 -t 20 100 300 1000 3000 20000
 # 某些点的结果异常时，在空闲机器上重调这些点，再 merge 进表：
-python -m kernelkit tune  a8w4.tune:EP_TUNING mimo-flash2.6-ep8-situv2 -t 64 128 --out /tmp/re.csv
+python -m kernelkit tune  a8w4.tune:EP_TUNING mimo-flash2.6-ep8-situv2 -t 64 128 16384 32768 --out /tmp/re.csv
 python -m kernelkit merge a8w4.tune:EP_TUNING /tmp/re.csv
 ```
