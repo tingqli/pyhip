@@ -57,7 +57,7 @@ TUNING = kit_tune.Tuning(
 # moe_check's metric
 FIELDS = TUNING.fields(["cos"])
 # the problems of the shipped table (configs/README.md): tune-all's default
-JOBS = ("tp8-situv2", "ep8-situv2", "tp8-silu", "ep8-silu", "tp4-silu")
+JOBS = ("tp8-situv2", "ep8-situv2", "tp8-silu", "ep8-silu", "tp4-silu", "tp4-situv2")
 REPORTS = ("compare", "readme", "stats")
 
 

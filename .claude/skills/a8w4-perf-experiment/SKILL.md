@@ -108,10 +108,10 @@ Needs all 8 GPUs idle (`rocm-smi --showuse`). Full-layer comparisons vs MORI: th
 ## 7. Landing checklist
 
 1. Kernel, `ep_gemm.CFGS` / `AUTO`, `moe.EP_CFGS`, and the `moe_<kind>` function in `moe.py`
-   (`@op_register` outermost, then the `@param` grid, `@no_capture` if not graph-safe,
+   (`@op_register` outermost, then the `@knob` grid, `@no_capture` if not graph-safe,
    `@meta`; limits are asserts in the kernel with a message) as needed (README §9.3).
 2. `python -m pytest -q a8w4/tests/test_a8w4_ops.py a8w4/tests/test_a8w4_moe.py` (the ops file
-   runs the tuned configs of every case: tune a new config first); for megamoe / MORI /
+   runs the tuned configs of every problem it lists: tune a new config first); for megamoe / MORI /
    TP-layer changes also the three 8-GPU tests.
 3. Selection changed: `python -m a8w4.tune tune-all --gpus 0-7 --out /tmp/a8w4_tune`
    (idle check, locks, BAD/FAIL report, merged table), `tune compare`, copy the table,

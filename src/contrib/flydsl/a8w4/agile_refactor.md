@@ -13,7 +13,7 @@
 
 ### 0.1 当前状态（每次停下来前更新）
 
-- **迭代**：I1、I1b、I2、I3、I4 已完成。I3 的范围是用户看过 I2 后改的（见 3.4 节）：`_vendor` 只留真正用到的代码，迁到 `kernels/` 下的共享模块，删掉 `_vendor/`。用户看过 I4 后决定先跳过 I4b（NaN 传播，1.1 节），先做 I5（3.2 节）。I5 已完成。之后讨论出函数级 kit 的设计（`refactor6.md`），用户 2026-11-17 让开始实现：迭代 K（3.1 节）已完成。用户看过 K 后讨论了 `refactor7.md`：A 部分（op 注册表 `@op_register`）的迭代 R（3.0a 节）已完成。之后用户委托按推荐定下 B、C 部分的问题，并说明 sglang 现有代码不再考虑（冻结 API 取消）：迭代 D（3.0 节，查表分派进 kit）已完成。用户看过 D 后决定：只保证调优表里的 key，限制交给 kernel 的 assert，迭代 E（3.0e 节，去掉 `@requires`）已完成；用户让 E 之后直接做完 T1–T4（通用 tune / bench），每完成一个就提交并 push 到 tq2：T1–T4 已完成（3.0t 节），等用户看过。I4b、I6 排在这些之后；另有一个待定问题：`ref_moe(raw)` 的调用方（`bench/core.py`、`bench/dist.py` 的 megamoe 参考、两个 MORI 测试）要不要改用 `moe_ref(W)`。
+- **迭代**：I1、I1b、I2、I3、I4 已完成。I3 的范围是用户看过 I2 后改的（见 3.4 节）：`_vendor` 只留真正用到的代码，迁到 `kernels/` 下的共享模块，删掉 `_vendor/`。用户看过 I4 后决定先跳过 I4b（NaN 传播，1.1 节），先做 I5（3.2 节）。I5 已完成。之后讨论出函数级 kit 的设计（`refactor6.md`），用户 2026-11-17 让开始实现：迭代 K（3.1 节）已完成。用户看过 K 后讨论了 `refactor7.md`：A 部分（op 注册表 `@op_register`）的迭代 R（3.0a 节）已完成。之后用户委托按推荐定下 B、C 部分的问题，并说明 sglang 现有代码不再考虑（冻结 API 取消）：迭代 D（3.0 节，查表分派进 kit）已完成。用户看过 D 后决定：只保证调优表里的 key，限制交给 kernel 的 assert，迭代 E（3.0e 节，去掉 `@requires`）已完成；用户让 E 之后直接做完 T1–T4（通用 tune / bench），每完成一个就提交并 push 到 tq2：T1–T4 已完成（3.0t 节）。之后用户重新梳理了术语和分工（2026-11-18）：problem 的维度叫 dim、solver 的旋钮叫 knob，测试和调优各自集中声明：迭代 V（3.0v 节）已完成，等用户看过。I4b、I6 排在这些之后；另有一个待定问题：`ref_moe(raw)` 的调用方（`bench/core.py`、`bench/dist.py` 的 megamoe 参考、两个 MORI 测试）要不要改用 `moe_ref(W)`。
 - **分支**：`/sgl-workspace/pyhip` 的 `refactor/a8w4`。
 - **已有提交**：
   - 迭代 0，安全网：`64ce77c`、`d17f502`（ISA 基线在这个提交上生成）、`4e256d9`。
@@ -32,6 +32,7 @@
   - T2：`3637665`。
   - T3：`ef107ba`。
   - T4：`712fc05`。
+  - V：`af50811`（V0）、`9adc2f0`（V1）、`893e3f2`（V2）、V3（文档，本文件所在的提交）。
 - **用户的文件**：未跟踪的 `refactory2.md` 属于用户，不要改，也不要提交。`refactor3.md`–`refactor7.md`（设计稿）同样不提交。
 
 ### 0.2 工作方式
@@ -100,6 +101,15 @@
 - 删完后，剩下的 kernel 的 ISA 必须完全不变。不在快照矩阵里的配置，本来就走不到。
 
 ## 3. 当前迭代
+
+### 3.0v V：术语 dim / knob，测试和调优集中声明（已完成）
+
+用户 2026-11-18：调优表本质上是 problem 到 solver 配置的映射；problem 的维度叫 dim（原 vocabulary）、solver 的旋钮叫 knob（原 `@param`），同一个东西只有一个名字；bucket 是允许非精确匹配的那个 dim，其余 dim 精确匹配；问题相关的放在 `<op>_test`，solver 相关的放在 `<op>_<kind>`，测试和调优各自集中、显式传入。按推荐定下：表头用 `~num_tokens` 标出 bucket；去掉 relax、补调 tp4-situv2；`seed` 是 `<op>_test` 的保留参数、不是 dim；多个 dim 一起的 `@dim` 要有轴名；命令行的第一个参数是 `<模块>:<Tuning 名>`。
+
+- [x] V0 `af50811`：改名。`param` 拆成 `dim`（只用在 `<op>_test` 上）和 `knob`（只用在 solver 上），用错位置注册时报错；`Op.vocab` → `Op.dim_names`，各方法的 `vocab` 参数 → `dims`；`seed` 必须是带默认值的仅限关键字参数；“implementation” → “solver”；a8w4 `shape_vocab` → `shape_dims`。语义不变。对照 HEAD（用 HEAD 快照遮住可编辑安装的 pyhip）：tune cases / candidates / show 相同，360 个测试 ID 相同；ISA IDENTICAL；kit 18、单卡 413 passed。
+- [x] V1 `9adc2f0`：problem 显式化。`<op>_test` 上的 `@dim` 只给 dim 的取值命名（shape 预设、act、routing），不再决定测什么、调什么；`op.problems(*axes)` 组合 problem；`op_tests(op, problems)` 必须传入要测的 problem；`kit.tune.Tuning(op, problems=, bucket=, points=, keys=, rotate=, table=)` 放下全部调优设置，`Registry` 去掉 points / unkeyed / rotate；命令行 `python -m pyhip.kit <cmd> <模块>:<Tuning 名>`，`cases` 改名 `problems`；bench 也吃 Tuning。a8w4：`tune.py` 有 `TOKENS` 和 `TUNING`，测试文件写明 problem（`test_moe` / `test_moe_dyn`）。对照 HEAD：problem = 旧 case，candidates / show / FIELDS / 360 个测试 ID 相同；EP8 16 / 600 tokens 新旧 tune 两张卡并排：表头、行、配置相同，cos 在 atomics 噪声内，时间比 1.008；ISA IDENTICAL；413 passed。
+- [x] V2 `893e3f2`：表头说明 bucket（`~<dim>`，`kit.table.bucket`），分派从表头读 key 和 bucket，`Registry(name, table=)`；去掉 relax。a8w4 表头改为 `~num_tokens`（行不变），补调 tp4-situv2 280 行（tune-all 8 卡，无 BAD；35 点里 4 点的 winner 与 silu 不同，差 0.2–0.7%）。分派对照 HEAD：600 次查表里只有 10 次不同，全是 tp4-situv2 用上自己的行；测试 ID 不变；ISA IDENTICAL；单卡 413、8 卡 3 passed。
+- [x] V3：文档。kit README 按新术语重写（术语表、四处分工、axpy 例子分 op / 调优脚本 / 测试三个文件，输出都是实跑的；用户 `3b30b0a` 加的“调优时的值从哪来”改写成 8.2 节）；a8w4 README、configs/README、skill a8w4-perf-experiment；`tune.JOBS` 加上 tp4-situv2。
 
 ### 3.0t T1–T4：通用 tune / bench（已完成，设计见 `refactor7.md` C 部分）
 
@@ -533,6 +543,7 @@ host 端（`moe._run_tp2k`，G1/G2 唯一的调用方）只用到 gemm1 的 `epi
 | 2026-11-17 | D 查表分派进 kit，取消冻结 API | kit：`Registry(table=, bucket=, relax=)`、`Op.pick` / `points` / `__call__`、`<op>_fallback`；`op(...)` 按调用记住实现，mtime 每秒最多读一次。a8w4：`_ops.py` 声明表；两个兜底函数；`moe_dyn` 词汇改名（capacity / num_tokens）；删 7 个元组形式的函数；薄包装只留 M == 0，入参检查进 dims；工具和测试改用 op 的方法。K2 golden 只有三类有意差异；op golden 中 moe 相同、moe_dyn 只差改名；测试 ID 不变；ISA IDENTICAL；API 22、kit 15 passed；单卡 413 passed、146 skipped；8 卡 3 passed；查表路径的 host 时间在噪声内 | `056028b` `5d0b861` `4f51e94` `23a3e8f` `e60470a` |
 | 2026-11-17 | E 去掉 `@requires` | 限制只在 kernel 的 assert 里（164 种被拒绝的组合实测都是干净的 `AssertionError`）；只保证调优表里的 key，没调过的抛 `ValueError`；删兜底；`@no_capture`、`Op.tuned`、`Op.capturable`；生成的测试测调优过的配置（与原来没 skip 的 360 项相同）；ISA IDENTICAL；单卡 413、8 卡 3 passed | `e522ebe` |
 | 2026-11-17 | T1–T4 通用 tune / bench | `pyhip.kit.table`（表的读写、合并、比较）、`kit.timing`（冷 cache 协议、ABBA、噪声带）、`kit.tune` + `python -m pyhip.kit`（cases / candidates / tune / merge / show / verify / tune-all / compare）、`kit.bench`（ab / check）；a8w4 的 tune、bench 变成薄包装。表文件逐字节相同；tune 的候选、表头、选择相同，计时在噪声内；bench 新旧输出相同；ISA IDENTICAL；kit 18、单卡 413、8 卡 3 passed | `bebaff3` `3637665` `ef107ba` `712fc05` |
+| 2026-11-18 | V 术语 dim / knob，测试和调优集中声明 | `@dim`（problem 的取值）/ `@knob`（solver 的网格）；`op.problems`、`op_tests(op, problems)`、`Tuning`；表头 `~num_tokens` 标出 bucket，`Registry(name, table)`；去掉 relax，补调 tp4-situv2。测试 ID、候选、show 不变；分派只在 tp4-situv2 上变；ISA IDENTICAL；kit 18、单卡 413、8 卡 3 passed | `af50811` `9adc2f0` `893e3f2` |
 
 **I4 的经验**：
 
