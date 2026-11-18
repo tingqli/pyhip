@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """The a8w4 side of the bench tools, on top of ``pyhip.kit.bench`` (variants, A/B and
-check engines, run records) and ``pyhip.kit.timing`` (protocols, ABBA rounds, noise band;
+check engines, run records) and ``pyhip.kit.timing`` (cold timing, ABBA rounds, noise band;
 both re-exported here): the cases (``ref.SHAPES`` or a shape tuple) and their inputs
 (``--local-experts-per-token``), the routing annotation of a sample (local routes,
 m-blocks per ``@meta`` tile_m), bare ep3k preset names in variant specs, and the
@@ -16,12 +16,10 @@ import torch
 
 from pyhip.kit import bench as kb
 from pyhip.kit.bench import Recorder, md_table, meta_line  # noqa: F401 - re-exported
-from pyhip.kit.bench import check_protocols  # noqa: F401
 from pyhip.kit.bench import fmt as fmt_cos  # noqa: F401
 from pyhip.kit.timing import (  # noqa: F401 - re-exported for the bench tools
     MIN_COPIES,
     MIN_NOISE,
-    PROTOCOLS,
     Timer,
     interleaved,
     noise_band,

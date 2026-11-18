@@ -213,7 +213,7 @@ test_axpy = op_tests(ops.axpy, ops.axpy.problems(dim("n", (1000, 65536), id="n{}
 4
 ```
 
-命令行的第一个参数是 `<模块>:<Tuning 名>`：
+命令行在命令名之后是 `<模块>:<Tuning 名>`：
 
 ```
 $ python -m pyhip.kit problems axpy_tune:TUNING
@@ -324,14 +324,24 @@ $ python -m pytest -q test_axpy.py -k "bf16 and tiled"
 
 ```
 $ python -m pyhip.kit ab axpy_tune:TUNING bf16 -t 4096 1000000 -v @table "tiled b16384" --rounds 3 --out exp
+every call cold: L2 flush, the next of 8 copies of ['x', 'y']; 3 rounds x 16 calls; ...
+...
 #### 1000000 n (seed 1000007)
 
-| variant | config | protocol | us | delta % | rounds min-max | verdict | err ref | err base |
-|---|---|---|---:|---:|---:|---|---:|---:|
-| @table | `torch` | coldrot | 6.1 | +0.0 | 6.1-6.1 | base | 2.9e-03 | 0 |
-| @table#2 | `torch` | coldrot | 6.1 | +0.0 | 6.1-6.2 | noise floor | 2.9e-03 | 0 |
-| tiled b16384 | `tiled b16384` | coldrot | 6.2 | +0.3 | 6.1-6.2 | slower | 2.9e-03 | 0 |
-| *noise band +-0.3%* |  |  |  |  |  |  |  |  |
+| variant | config | us | delta % | rounds min-max | verdict | err ref | err base |
+|---|---|---:|---:|---:|---|---:|---:|
+| @table | `torch` | 6.1 | +0.0 | 6.1-6.1 | base | 2.9e-03 | 0 |
+| @table#2 | `torch` | 6.1 | +0.0 | 6.1-6.2 | noise floor | 2.9e-03 | 0 |
+| tiled b16384 | `tiled b16384` | 127.7 | +1981.7 | 127.3-128.5 | slower | 2.9e-03 | 0 |
+| *noise band +-0.3%* |  |  |  |  |  |  |  |
+
+#### summary: base in us, the others delta vs the base; ~ = within the noise band
+
+| variant | config | 4096 | 1000000 |
+|---|---|---:|---:|
+| @table | `torch` | 5.9 us | 6.1 us |
+| @table#2 | `torch` | +0.0%~ | +0.0%~ |
+| tiled b16384 | `tiled b16384` | +0.0%~ | +1981.7% |
 
 $ python -m pyhip.kit check axpy_tune:TUNING fp32 -t 1000 1000000 -v @table "tiled b1024" "mine=py:mine.py:axpy" --graph --diff-tol 1e-6
 | n | variant | config | err ref | err base | repeat | bitwise | graph | result |
@@ -410,7 +420,7 @@ kit 不提供“这个配置能不能跑”的声明。solver 遇到跑不了的
 @meta(tile_m=lambda block_m: block_m, cached_loads=lambda g1_bcm: g1_bcm != 2)
 ```
 
-kit 自己读的只有 `cached_loads`（`kit.bench` 用它判断计时协议是否会偏向这个配置，第 11 节）；其他项由使用方约定（例如 a8w4 的 `tile_m`）。
+kit 自己读的只有 `cached_loads`（`kit.bench` 用它判断副本少于 8 份时计时会不会偏向这个配置，第 11 节）；其他项由使用方约定（例如 a8w4 的 `tile_m`）。
 
 **`@no_capture(reason)`**：这个 solver 不能在 CUDA graph capture 中运行（例如把 host 计数器作为 launch 参数传入）。当前 stream 正在 capture 时，分派跳过它，选下一个最快的；`op.capturable(cfg)` 返回 False；`bench check --graph` 把它记为 n/a。
 
@@ -458,7 +468,7 @@ op_register = ops.register
 | `meta(cfg, name, problem=None)` | `@meta` 的 `name` 项；函数在 `problem`、knob 和覆盖项上求值 |
 | `capturable(cfg)` | solver 有没有 `@no_capture` |
 | `tuned(problem, table=)` | 查表得到的配置（`pick` 从中选），最快的在前；没有行时为 `[]` |
-| `pick(problem, table=, capturing=False)` | `op(...)` 会运行的配置：`tuned` 里第一个能在当前 capture 状态下运行的；没有时 `ValueError` |
+| `pick(problem, table=, capturing=False)` | `op(...)` 会运行的配置：`tuned` 里的第一个，`capturing=True` 时跳过 `@no_capture` 的 solver（`op(...)` 传入当前 stream 是否在 capture）；没有时 `ValueError` |
 | `points(problem, table=)` | `[(分桶值, [(us, cfg), ...])]`：这个 key 的所有调优点 |
 | `op(*args, config=None, table=..., **kwargs)` | 运行 op，见第 6 节 |
 
@@ -485,7 +495,7 @@ op_register = ops.register
   | 4097 – 1048576 | 1048576 |
   | > 1048576 | 1048576（最大的点） |
 
-- 这个 key 和点上的行按 `us` 从快到慢就是 `tuned(problem)`；`pick` 返回第一个，当前 stream 在 capture 时跳过 `@no_capture` 的 solver。都没有时抛 `ValueError`，消息里写明是没有调优行，还是这些配置都不能 capture。
+- 这个 key 和点上的行按 `us` 从快到慢就是 `tuned(problem)`；`pick` 返回第一个，`capturing=True` 时（`op(...)` 在当前 stream 正在 capture 时这样调用）跳过 `@no_capture` 的 solver。都没有时抛 `ValueError`，消息里写明是没有调优行，还是这些配置都不能 capture。
 
 缓存：
 
@@ -620,7 +630,7 @@ table.identity(fields)                    # config 及之前的列
 table.bucket(fields)                      # bucket 的 dim（"~n" -> "n"），没有时 None
 table.write(path, rows, fields)           # 排序后原子替换
 table.merge(path, rows, fields=None)      # 加入 / 替换行；文件不存在时创建
-table.compare(old, new, label=None, order=None, out=print)   # 返回最快配置变了的点数
+table.compare(old, new, *, label=None, order=None, out=print)   # 返回最快配置变了的点数
 ```
 
 ## 10. 计时：kit.timing
@@ -635,24 +645,26 @@ Ws = copies(W)                                     # NCOPIES = 8 份副本（ten
 nxt = itertools.cycle(Ws).__next__
 us = time_cold(lambda: fn(nxt()))                  # GPU 时间的中位数（us），不含 host 开销
 
-timer = Timer(Ws)                                  # 按协议计时，fn 接受这次要读的副本
-res = interleaved({"a": fa, "a#2": fa, "b": fb}, ["coldrot"], timer, rounds=5, iters=16)
-band = noise_band(res["coldrot", "a"], res["coldrot", "a#2"])
+timer = Timer(Ws)                                  # fn 接受这次要读的副本
+res = interleaved({"a": fa, "a#2": fa, "b": fb}, timer, rounds=5, iters=16)
+band = noise_band(res["a"], res["a#2"])
 verdict(delta_pct, band)                           # "~" / "faster" / "slower"
 ```
 
-| 协议 | 做法 | 用途 |
-|---|---|---|
-| `coldrot` | 读 512 MB 刷 L2，GPU sleep，每次调用读下一份副本 | **唯一和模型一致的协议**（副本数 ≥ `MIN_COPIES` = 8） |
-| `rotate` | 副本连续调用，不刷 | 受上一次调用留在 MALL 里的数据影响 |
-| `cold` | 刷 L2 + sleep，每次读同一份输入 | MALL 保留输入，走 cache 读的 solver 会显得快 5–13% |
-| `bigread` | 读 2 GB 刷 + sleep，同一份输入 | 偏差同 `cold` |
-| `wflush` | 写 512 MB 再读，同一份输入 | 留下脏行，走 cache 读的 solver 显得慢 9–48% |
-| `warm` | 不刷，同一份输入 | |
+计时只有一种方式，没有选项：每次调用前读 512 MB 刷 L2，再让 GPU sleep 约 1 ms，调用读下一份输入副本（副本数 ≥ `MIN_COPIES` = 8）。别的做法都测不出模型里的耗时（a8w4 `experiments/log_20261115.md` 3.3 节）：
 
-- `flush_cache()`：读 512 MB。这能用干净的行挤掉 L2，但挤不掉每次调用都会再读的、留在 256 MB MALL 里的数据，所以要靠副本轮换。
-- `time_cold(fn, iters=20, warmup=3, flush=True)`：刷 cache 之后让 GPU sleep 约 1 ms，host 趁这段时间把 `fn` 的 launch 都排进队列，所以测到的时间不含 host 开销（和 CUDA graph 回放一样）。
-- `interleaved`：每轮把每个（协议, 变体）各测一次，隔一轮把变体顺序反过来（ABBA），使时钟和功耗漂移对所有变体的影响相同。返回 `{(协议, 标签): [每轮的中位数]}`。
+| 做法 | 偏差 |
+|---|---|
+| 刷 L2，但每次读同一份输入 | 每次都读的输入留在 256 MB 的 MALL 里，读 512 MB 甚至 2 GB 都挤不掉：走 cache 读的 solver 显得快 5–13% |
+| 先写再读地刷 | 留下脏行，走 cache 读的 solver 显得慢 9–48% |
+| 轮换副本但不刷 | 结果取决于上一次调用留在 cache 里的数据 |
+| 只有 2 份副本 | 16 tokens 时走 cache 读仍然显得快 |
+
+- `flush_cache()`：读 512 MB，用干净的行挤掉 L2（挤不掉 MALL 里的数据，所以要靠副本轮换）。
+- `copies(x, n=NCOPIES)`：`x` 的 `n` 份副本（tensor，或 dict 里的 tensor），第一份是 `x` 本身。
+- `time_cold(fn, iters=20, warmup=3)`：`fn()` 的 GPU 时间的中位数（us），`fn` 自己取下一份副本。刷 cache 之后 GPU sleep 的这段时间里，host 已经把 `fn` 的 launch 都排进队列，所以测到的时间不含 host 开销（和 CUDA graph 回放一样）。
+- `Timer(Ws).times(fn, iters, warmup=3)`：同样的冷 cache 计时，返回 `iters` 个时间；每次调用 `fn(W)`，`W` 是 `Ws` 的下一份。
+- `interleaved(fns, timer, rounds, iters)`：每轮把每个变体各测一次，隔一轮把变体顺序反过来（ABBA），使时钟和功耗漂移对所有变体的影响相同。返回 `{标签: [每轮的中位数]}`。
 - `noise_band(base, dup)`：噪声带（%），取 dup 相对 base 的差、base 各轮极差的一半、`MIN_NOISE` = 0.3% 三者中的最大值。
 - `verdict(delta, noise)`：差值在噪声带内为 `"~"`，否则为 `"faster"` / `"slower"`。
 
@@ -663,7 +675,7 @@ python -m pyhip.kit ab    M:T P -t V [V ...] -v SPEC [SPEC ...] [选项]
 python -m pyhip.kit check M:T P -t V [V ...] -v SPEC [SPEC ...] [选项]
 ```
 
-problem、`--set` 和输入都和 `kit.tune` 相同（同一个 `Tuning`）：每个 `-t` 值作为分桶值，输入由 `<op>_problem` 生成（seed = `--seed` + 值，ab 的第 s 个样本再加 1000 × s），计时时轮换 `rotate` 的输入。参考答案来自 `<op>_ref`，比较用 `<op>_check`（它返回的第一个指标就是报告里的列，例如 `err`、`cos`）。
+problem、`--set` 和输入都和 `kit.tune` 相同（同一个 `Tuning`）：每个 `-t` 值作为分桶值，输入由 `<op>_problem` 生成（seed = `--seed` + 值，ab 的第 s 个样本再加 1000 × s），每次计时的调用读 `rotate` 输入的下一份副本（第 10 节；这些输入随值或样本换了对象时重新复制）。参考答案来自 `<op>_ref`，比较用 `<op>_check`（它返回的第一个指标就是报告里的列，例如 `err`、`cos`）。
 
 **变体写法**：
 
@@ -678,19 +690,19 @@ problem、`--set` 和输入都和 `kit.tune` 相同（同一个 `Tuning`）：�
 
 **`ab` 的过程**：
 
-1. 先解析所有值上的所有变体：base 在某个值上没有配置时直接退出；不安全的计时协议也在这一步拒绝（见下）。
+1. 先解析所有值上的所有变体：base 在某个值上没有配置时直接退出；副本数不够时也在这一步拒绝（见下）。
 2. 对每个值和每个样本，每个变体先运行一次：和参考比较（`<op>_check` 失败记 BAD，抛异常记 FAIL，这两种都会被丢弃并列在 dropped 里），再和 base 比较（`--diff-tol` 之上标 DIFF）。
-3. 然后做 `--rounds` 轮 ABBA，每轮每个（协议, 变体）调用 `--iters` 次。base 会以 `<base>#2` 的名字再测一份，它和 base 的差就是噪声下限（`--no-dup` 关闭）。
+3. 然后做 `--rounds` 轮 ABBA，每轮每个变体调用 `--iters` 次。base 会以 `<base>#2` 的名字再测一份，它和 base 的差就是噪声下限（`--no-dup` 关闭）。
 4. 表格列：`us`（各轮中位数的中位数）、`delta %`、各轮的最小–最大值、verdict（只在噪声带之外才判 faster / slower）、对参考和对 base 的指标、`--bitwise` 时是否逐位相同。
-5. 多个协议时检查各协议的 verdict 是否一致，不一致标 PROTOCOL-SENSITIVE（以 coldrot 为准）。多个值或多个样本时最后输出汇总表。
+5. 多个值或多个样本时最后输出汇总表。
 
-**协议检查**：`@meta(cached_loads=True)` 的 solver、没有这项 meta 的 solver 和 `py:` 变体都可能通过 cache 读轮换的输入；除非某个协议是 `coldrot` 且 `--copies` ≥ 8，否则拒绝计时（`--allow-biased` 只给警告，用于专门测量这个偏差）。只有 `cached_loads=False` 的 solver 不受限制。
+**副本数检查**：`@meta(cached_loads=True)` 的 solver、没有这项 meta 的 solver 和 `py:` 变体都可能通过 cache 读轮换的输入；`--copies` < 8 时拒绝计时它们。只有 `cached_loads=False` 的 solver 不受限制。
 
 **`check`**：对每个值和每个变体，检查对参考（失败：`ref`）、对 base（`base`）、`--repeats` 次重复调用中和第一次最差的差（`repeat`，能发现没复位的状态）、`--bitwise` 时与 base 是否逐位相同、`--graph` 时 CUDA graph capture 后回放与 eager 的差（`@no_capture` 记为 n/a）。`--diff-tol` 是对 base / repeat / graph 允许的最大指标值。`@table` 在没有调优行的值上记为 n/a，不算失败。有失败项时退出码为 1。
 
-**选项**：`--seed`（默认 7）、`--diff-tol`、`--bitwise`；ab：`--protocol`（默认 coldrot，可给多个）、`--copies`、`--rounds`（5）、`--iters`（16）、`--samples`（1）、`--no-dup`、`--allow-biased`、`--no-ref`；check：`--repeats`（5）、`--graph`。
+**选项**：`--seed`（默认 7）、`--diff-tol`、`--bitwise`；ab：`--copies`（8）、`--rounds`（5）、`--iters`（16）、`--samples`（1）、`--no-dup`、`--no-ref`；check：`--repeats`（5）、`--graph`。
 
-**输出**：屏幕上打印 Markdown；`--out DIR` 时追加到 `DIR/<name>.md` 和 `DIR/<name>.jsonl`（`--name`，默认是命令名）。jsonl 的第一行是运行元数据 `{"meta": ...}`（命令、git 版本、torch / FlyDSL 版本、GPU、功耗上限、参数），之后每个测量一行（`T`、`variant`、`config`、`us`、`rounds`、`delta_pct`、`noise_pct`、`verdict`、`<指标>_ref`、`<指标>_base`、`copies` 等）。
+**输出**：屏幕上打印 Markdown；`--out DIR` 时追加到 `DIR/<name>.md` 和 `DIR/<name>.jsonl`（`--name`，默认是命令名）。jsonl 里每次运行先写一行运行元数据 `{"meta": ...}`（命令、git 版本、torch / FlyDSL 版本、GPU、功耗上限、参数），之后每个测量一行（`T`、`variant`、`config`、`us`、`rounds`、`delta_pct`、`noise_pct`、`verdict`、`<指标>_ref`、`<指标>_base`、`copies` 等）。
 
 **Python API**（包装成某个包自己的工具时用）：
 
@@ -699,9 +711,9 @@ from pyhip.kit import bench as kb
 
 v = kb.parse_variant(op, "pf1=ep3k m64:g2.pf=1", alias=None)   # -> Variant
 r = kb.resolve(op, v, problem)          # -> Resolved(label, spec, config, run(inputs), cfg, cached)，或 str（没有调优配置）
-kb.ab(TUNING, problem, points, specs, protocols=("coldrot",), rounds=5, iters=16, samples=1,
-      seed=7, dup=True, allow_biased=False, ref=True, bitwise=False, diff_tol=None, ncopies=8,
-      rec=None, inputs=None, annotate=None, alias=None, unit=None, describe=None)
+kb.ab(TUNING, problem, points, specs, rounds=5, iters=16, samples=1, seed=7, dup=True, ref=True,
+      bitwise=False, diff_tol=None, ncopies=8, rec=None, inputs=None, annotate=None, alias=None,
+      unit=None, describe=None)
 bad = kb.check(TUNING, problem, points, specs, seed=7, repeats=5, graph=False, bitwise=False,
                diff_tol=None, rec=None, inputs=None, alias=None, unit=None, describe=None)
 rec = kb.Recorder(out_dir, name, kb.run_meta(tool, args, prog="python -m mypkg.bench", path=pkg_dir))
@@ -753,6 +765,6 @@ kit 自身的测试：[`tests/kit/test_kit.py`](../../tests/kit/test_kit.py)（�
 | `picking a config needs <op>_dims; pass config=` | 没有 `<op>_dims` 时 `op(...)` 不能查表 |
 | `unknown argument(s) [...]` | `op(...)` 的关键字参数既不是接口参数也不是 dim |
 | `a tuned table has at most one bucket column` | 表头里有多个 `~` 列 |
-| `not a pyhip.kit.tune.Tuning` | 命令行的第一个参数要指向一个 `Tuning` 对象（`模块:名字`） |
-| `variants [...] read the rotated inputs with cached loads ...` | 计时协议会偏向走 cache 读的 solver：用 `coldrot` 且 `--copies` ≥ 8，或者给 solver 加 `@meta(cached_loads=False)` |
-| `GPUs busy (GFX use %)` / `GPU g is locked by another job` | `tune-all` 发现卡被占用：等一下、换 `--gpus`，或者 `--force` |
+| `not a pyhip.kit.tune.Tuning` | 命令名之后的参数要指向一个 `Tuning` 对象（`模块:名字`） |
+| `variants [...] may read the rotated inputs with cached loads ...` | `--copies` < 8 时计时会偏向走 cache 读的 solver：用 `--copies` ≥ 8（默认 8）；solver 确实不走 cache 读时给它加 `@meta(cached_loads=False)` |
+| `GPUs busy (GFX use %)` / `GPU g is locked by another job` | `tune-all` 发现卡被占用：等一下，或者换 `--gpus`；`--force` 只跳过前一个（空闲检查），不跳过锁 |

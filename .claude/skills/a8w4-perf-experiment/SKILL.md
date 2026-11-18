@@ -14,7 +14,7 @@ wrappers of new kernels follow `flydsl-host-launch`; for the timing rules behind
 
 | mistake (log) | cost | guard |
 |---|---|---|
-| timed one weight copy: the 256 MB MALL kept W, cached-W configs looked 5-13% faster (1115 §3.3) | a full EP8 retune and CFGS change thrown away; a shipped table with wrong TP picks | `bench ab` defaults to coldrot (flush + 8 copies) and refuses cached-W variants on other protocols |
+| timed one weight copy: the 256 MB MALL kept W, cached-W configs looked 5-13% faster (1115 §3.3) | a full EP8 retune and CFGS change thrown away; a shipped table with wrong TP picks | the tools time one way only (flush + the next of 8 weight copies); `bench ab` refuses cached-W variants with fewer copies |
 | believed a gain with no mechanism (t16 "faster" while each expert's W is read once) | as above | rule: no mechanism, suspect the measurement; `prof counters` to locate the level |
 | started outside the focus range (split-K at <=16 tokens, 1114b §4) | a session's budget | step 1 below: baseline + breakdown on 1024-32768 first |
 | swept a knob before reading the scheduler (lag only matters at 3-4 groups per queue, 1114b §3.4) | wasted 8-GPU jobs | step 2: derive where the knob can matter, then pick points |
@@ -57,8 +57,7 @@ control). Cheap hypotheses first: `python a8w4/exp.py grep <knob>` may already a
 ```bash
 python -m a8w4.bench ab --case ep8 -t 1024 2048 -v "ep3k m64" "pf2=m64:g2.pf=2" l128 \
     --out a8w4/experiments/<dir> --name pf
-python -m a8w4.bench ab --case tp8 -t 16 64 -v "tp2k bm32 g1bcm2 g2nt4" "tp2k bm32 g1bcm1 g2nt4" \
-    --protocol coldrot cold      # shows whether a gain survives the deployment-like protocol
+python -m a8w4.bench ab --case tp8 -t 16 64 -v "tp2k bm32 g1bcm2 g2nt4" "tp2k bm32 g1bcm1 g2nt4"
 python -m a8w4.bench ab --case ep8 -t 4096 --samples 3 -v l128 l128c     # EP8: work depends on the routing draw
 ```
 - Variant spec: `[label=]<config name | bare CFGS name | @table>[:override,...]`;
@@ -70,8 +69,7 @@ python -m a8w4.bench ab --case ep8 -t 4096 --samples 3 -v l128 l128c     # EP8: 
   kernel variant behind such a function instead of writing a new timing script.
 - Read the output: `us` = median of round medians; `delta %` vs the first variant;
   `<base>#2` = the noise floor; verdict `faster` / `slower` only beyond the noise band, `~`
-  otherwise; `DIFF` = cos vs base > 1e-4 (a numerics change, not just order); with several
-  protocols `PROTOCOL-SENSITIVE` lines say which result to trust (coldrot).
+  otherwise; `DIFF` = cos vs base > 1e-4 (a numerics change, not just order).
 - Paste the generated `<name>.md` tables into the log; never hand-compute deltas.
 - Defaults: 5 rounds x 16 calls. For effects < 2% at large T use `--rounds 7`; still treat
   < 1% at >= 8192 tokens as noise unless repeated with `--samples`.

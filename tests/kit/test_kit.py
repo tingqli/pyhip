@@ -379,6 +379,7 @@ def test_tune(tmp_path, monkeypatch):
 
 
 def test_bench(tmp_path, monkeypatch):
+    import dataclasses
     import json
     import types
 
@@ -420,11 +421,11 @@ def test_bench(tmp_path, monkeypatch):
     assert kb.resolve(op, table, dict(prob, n=6)).config == "tiled b4"  # the nearest point
     assert "no tuned config" in kb.resolve(op, table, dict(prob, n=4, alpha=3.0))
 
-    # protocol check: unknown cached loads need coldrot with >= MIN_COPIES copies
-    kb.check_protocols([r], ["coldrot"], kb.MIN_COPIES, False)
+    # copies check: unknown cached loads need >= MIN_COPIES copies
+    kb.check_copies([r], kb.MIN_COPIES)
     with pytest.raises(SystemExit, match="cached loads"):
-        kb.check_protocols([r], ["cold"], kb.MIN_COPIES, False)
-    kb.check_protocols([r], ["cold"], kb.MIN_COPIES, True)  # warns
+        kb.check_copies([r], kb.MIN_COPIES - 1)
+    kb.check_copies([dataclasses.replace(r, cached=False)], 1)  # nt loads: any copies
 
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
     meta = dict(time="t", git="g", flydsl="f", torch="t", gpu="gpu", arch="a", cus=1,
@@ -449,10 +450,10 @@ def test_bench(tmp_path, monkeypatch):
     # ab: timing stubbed; the base timed twice; the verdict beyond the noise band
     us = {"loop": 15.0, "tiled b4": 10.0, "tiled b4#2": 10.0, "tiled b2": 10.01}
 
-    def interleaved(fns, protocols, timer, rounds, iters):
+    def interleaved(fns, timer, rounds, iters):
         for fn in fns.values():
             fn({})
-        return {(p, lab): [us[lab]] * rounds for p in protocols for lab in fns}
+        return {lab: [us[lab]] * rounds for lab in fns}
 
     monkeypatch.setattr(kb, "Timer", lambda Ws: None)
     monkeypatch.setattr(kb, "interleaved", interleaved)
@@ -464,6 +465,20 @@ def test_bench(tmp_path, monkeypatch):
     with pytest.raises(SystemExit, match="the base at n 4: axpy: no tuned config"):
         kb.ab(t, dict(prob, alpha=3.0), [4], ["@table", "loop"],
               rec=kb.Recorder(None, None, meta))
+
+    # rotated inputs that change with the value (x sized by n): copies of the new ones
+    timed = []
+
+    class Timer:
+        def __init__(self, Ws):
+            self.Ws = Ws
+            timed.append(len(Ws[0]["x"]))
+
+    monkeypatch.setattr(kb, "Timer", Timer)
+    monkeypatch.setattr(kb, "_rotated", lambda names, inp, n: [{k: inp[k] for k in names}])
+    tx = kt.Tuning(op, problems=op.problems("alpha"), bucket="n", points=(4, 6), rotate=("x",))
+    kb.ab(tx, prob, [4, 6], ["loop"], dup=False, rec=kb.Recorder(None, None, meta))
+    assert timed == [4, 6]
 
 
 def test_marks_return_the_function_in_written_order():

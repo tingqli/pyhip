@@ -96,7 +96,7 @@ def main(argv=None):
                 continue
             fn = lambda Wc, r=r: r.run(x, Wc, tw, ti)  # noqa: E731
             cos = R.cos_diff(ref, fn(W).float())
-            e2e = statistics.median(timer.times(fn, "coldrot", a.iters))
+            e2e = statistics.median(timer.times(fn, a.iters))
             kt = kernel_times(fn, Ws, a.iters)
             for k, t in kt.items():
                 fams[k] = fams.get(k, 0.0) + t

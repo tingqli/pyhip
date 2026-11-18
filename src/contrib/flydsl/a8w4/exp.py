@@ -45,7 +45,7 @@ NOTES_TEMPLATE = """# {name} ({date})
 - change (commit or diff in this dir; not a full copy of a kernel file):
 - commands (re-runnable, from src/contrib/flydsl):
   `python -m a8w4.bench ab --case ... -t ... -v ... --out a8w4/experiments/{dir}`
-- protocol: coldrot, 8 weight copies (the bench default); anything else needs a reason
+- protocol: coldrot, 8 weight copies (the only way the bench tools time); anything else needs a reason
 - results: the tables ab.md / dist.md got (do not copy numbers by hand)
 - conclusion + mechanism (a gain without a mechanism: suspect the measurement first):
 - index: `python -m a8w4.exp add --dir {dir} --area ... --knob ... --verdict ...`

@@ -6,9 +6,10 @@ description: How to time GPU kernels on MI300X-class AMD GPUs so that A/B result
 # Timing GPU kernels so the result holds in the model
 
 Reference implementation: pyhip `src/kit/timing.py` (`pyhip.kit.timing`: `flush_cache`,
-`copies`, `time_cold`, `Timer`, `interleaved`, `noise_band`, `verdict`), used by the tuner
-(`pyhip.kit.tune`) and the A/B tool (`pyhip.kit.bench`: `ab`, `check_protocols`; a8w4:
-`python -m a8w4.bench ab`). Evidence: `a8w4/experiments/log_20261115.md` §3.3.
+`copies`, `time_cold`, `Timer`, `interleaved`, `noise_band`, `verdict`; it times only the
+way section 1 describes), used by the tuner (`pyhip.kit.tune`) and the A/B tool
+(`pyhip.kit.bench`: `ab`, `check_copies`; a8w4: `python -m a8w4.bench ab`). Evidence:
+`a8w4/experiments/log_20261115.md` §3.3.
 
 ## 1. Cold caches: flush L2 AND do not let the MALL keep the weights
 
@@ -78,8 +79,8 @@ Reference implementation: pyhip `src/kit/timing.py` (`pyhip.kit.timing`: `flush_
 
 - Name the mechanism (fewer bytes, better overlap, fewer waits, higher occupancy) and the point
   where it should vanish; check that point.
-- Cache-policy or rasterization knobs (anything that changes data reuse): measure one point
-  under two protocols first (deployment-like vs single copy); if they disagree, only the
-  deployment-like one counts.
+- Cache-policy or rasterization knobs (anything that changes data reuse): only a
+  measurement with the flush AND >= 8 rotated weight copies counts; a single-copy result
+  is no evidence either way (it reversed the sign of such knobs).
 - Ablations that skip code are not additive (dead-code elimination, changed write patterns):
   confirm with a parameter change.

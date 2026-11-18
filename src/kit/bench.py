@@ -6,8 +6,8 @@
 The problem and the inputs are ``kit.tune``'s (a ``Tuning``): a tune problem (``--set``
 overrides), the bucket value per ``-t``, ``<op>_problem`` with seed ``--seed`` + value
 (+ 1000 * sample). The answer is ``<op>_ref``, the comparison ``<op>_check`` (its first
-metric is the column reported, e.g. cos). The timed calls cycle through copies of the
-tuning's ``rotate`` inputs (``kit.timing``).
+metric is the column reported, e.g. cos). Every timed call is cold (``kit.timing``): an
+L2 flush and the next of ``--copies`` copies of the tuning's ``rotate`` inputs.
 
 variant spec: [label=]<base>[:<k>=<v>,...]  or  [label=]py:<module | file.py>:<func>
   base      a config name (``python -m pyhip.kit configs <spec> <problem>``) or
@@ -20,11 +20,11 @@ variant spec: [label=]<base>[:<k>=<v>,...]  or  [label=]py:<module | file.py>:<f
 
 ab: per bucket value and sample, every variant first runs once against ``<op>_ref``
 (fails the check: BAD, raises: FAIL; both dropped) and against the first variant, the
-base. Then ``--rounds`` ABBA rounds time ``--iters`` calls of every (protocol, variant).
-The base also runs as "<base>#2": that copy's difference is the noise floor; a
-difference gets a verdict only beyond the noise band (``kit.timing.noise_band``).
-Solvers with ``@meta(cached_loads=True)`` (they read the rotated inputs through
-the cache) are refused unless a protocol rotates >= MIN_COPIES copies.
+base. Then ``--rounds`` ABBA rounds time ``--iters`` calls of every variant. The base
+also runs as "<base>#2": that copy's difference is the noise floor; a difference gets a
+verdict only beyond the noise band (``kit.timing.noise_band``). With fewer than
+MIN_COPIES copies, variants that may read the rotated inputs through the cache (all but
+solvers with ``@meta(cached_loads=False)``) are refused.
 
 check: per bucket value, every variant vs ``<op>_ref``, vs the base, the worst of
 ``--repeats`` further calls vs the first, bit equality with the base (``--bitwise``) and
@@ -47,11 +47,11 @@ import sys
 
 import torch
 
-from .timing import MIN_COPIES, MIN_NOISE, NCOPIES, PROTOCOLS, Timer, copies, interleaved
+from .timing import MIN_COPIES, MIN_NOISE, NCOPIES, Timer, copies, interleaved
 from .timing import noise_band, verdict
 from .tune import _check, _inputs, resolve as resolve_tuning
 
-__all__ = ["Variant", "Resolved", "parse_variant", "resolve", "check_protocols", "ab", "check",
+__all__ = ["Variant", "Resolved", "parse_variant", "resolve", "check_copies", "ab", "check",
            "run_meta", "meta_line", "Recorder", "md_table", "fmt", "main"]
 
 
@@ -166,20 +166,17 @@ def resolve(op, v, problem):
                     lambda inputs, cfg=cfg: op.run(cfg, **inputs), cfg=cfg, cached=cached)
 
 
-def check_protocols(resolved, protocols, ncopies, allow_biased):
-    """Refuse to time variants with cached loads under protocols that keep the inputs in
-    the MALL only (a whole retune once ran on such a protocol)."""
-    safe = "coldrot" in protocols and ncopies >= MIN_COPIES
+def check_copies(resolved, ncopies):
+    """Refuse to time variants that may read the rotated inputs with cached loads on fewer
+    than MIN_COPIES copies: the MALL keeps them between calls (a whole retune once ran
+    on one copy)."""
     risky = sorted({r.label for r in resolved if r.cached is not False})
-    if safe or not risky:
-        return
-    msg = (f"variants {risky} read the rotated inputs with cached loads (or are py variants / "
-           f"lack @meta(cached_loads=...): unknown), but no protocol of {list(protocols)} "
-           f"rotates >= {MIN_COPIES} copies (coldrot; copies: {ncopies}): the MALL keeps the "
-           "inputs between calls and favors cached loads by 5-13%")
-    if not allow_biased:
-        raise SystemExit(msg + ". Add coldrot, or pass --allow-biased to measure the bias.")
-    print("WARNING: " + msg, flush=True)
+    if ncopies < MIN_COPIES and risky:
+        raise SystemExit(
+            f"variants {risky} may read the rotated inputs with cached loads (py variants and "
+            f"solvers without @meta(cached_loads=False)), but only {ncopies} copies rotate: "
+            f"the MALL keeps them between calls and favors cached loads by 5-13%: rotate >= "
+            f"{MIN_COPIES} copies")
 
 
 # ---- run records -----------------------------------------------------------------------
@@ -350,10 +347,9 @@ def _correctness(op, res, inputs, ref, bitwise):
     return ok, notes, name
 
 
-def ab(t, problem, points, specs, *, protocols=("coldrot",), rounds=5, iters=16, samples=1,
-       seed=7, dup=True, allow_biased=False, ref=True, bitwise=False, diff_tol=None,
-       ncopies=NCOPIES, rec=None, inputs=None, annotate=None, alias=None, unit=None,
-       describe=None):
+def ab(t, problem, points, specs, *, rounds=5, iters=16, samples=1, seed=7, dup=True, ref=True,
+       bitwise=False, diff_tol=None, ncopies=NCOPIES, rec=None, inputs=None, annotate=None,
+       alias=None, unit=None, describe=None):
     """A/B timing of the variants ``specs`` on ``problem`` of the ``Tuning`` ``t`` (see
     the module docstring). Hooks: ``inputs(value, seed)`` -> interface arguments
     (default ``<op>_problem``); ``annotate(inputs, resolved)`` -> (heading text, record
@@ -376,12 +372,10 @@ def ab(t, problem, points, specs, *, protocols=("coldrot",), rounds=5, iters=16,
     for T, res in plan.items():  # before any timing: fail fast
         if isinstance(res[0], str):
             raise SystemExit(f"the base at {unit} {T}: {res[0]}")
-        check_protocols([r for r in res if not isinstance(r, str)], protocols, ncopies,
-                        allow_biased)
-    rot = [p for p in protocols if p in ("coldrot", "rotate")]
-    rec.text((describe or f"{op.name} {problem}") + f"\n\nprotocol {', '.join(protocols)}"
-             + (f" ({ncopies} copies of {list(t.rotate)})" if rot else "")
-             + f", {rounds} rounds x {iters} calls; us = median of the round medians; "
+        check_copies([r for r in res if not isinstance(r, str)], ncopies)
+    rec.text((describe or f"{op.name} {problem}") + "\n\nevery call cold: L2 flush"
+             + (f", the next of {ncopies} copies of {list(t.rotate)}" if t.rotate else "")
+             + f"; {rounds} rounds x {iters} calls; us = median of the round medians; "
              f"verdict only beyond the noise band (max(|{dup_label or 'copy'} delta|, half the "
              f"base's round spread, {MIN_NOISE}%))\n")
     agg, cfgs, timer = {}, {}, None
@@ -389,85 +383,72 @@ def ab(t, problem, points, specs, *, protocols=("coldrot",), rounds=5, iters=16,
         for s in range(samples):
             sd = seed + T + 1000 * s
             inp = gen(T, sd)
-            if timer is None:  # the rotated inputs are the same objects at every value
-                timer = Timer(_rotated(t.rotate, inp, ncopies) if rot
-                              else [{k: inp[k] for k in t.rotate}])
+            if timer is None or any(timer.Ws[0][k] is not inp[k] for k in t.rotate):
+                timer = None  # new rotated inputs (e.g. sized by the value): free the old copies
+                timer = Timer(_rotated(t.rotate, inp, ncopies))
             res = [r for r in plan[T] if not isinstance(r, str)]
             ok, notes, mname = _correctness(op, res, inp, ref, bitwise)
             fns = {r.label: (lambda Wc, r=r: r.run({**inp, **Wc})) for r in ok}
-            times = interleaved(fns, protocols, timer, rounds, iters)
+            times = interleaved(fns, timer, rounds, iters)
             extra_head, extra_rec = annotate(inp, ok) if annotate else ("", {})
             head = (f"#### {T} {unit}" + (f", sample {s}" if samples > 1 else "")
                     + f" (seed {sd})" + extra_head)
-            rows, verdicts = [], {}
+            rows = []
             m = mname or "check"
-            for p in protocols:
-                b = times[p, base_label]
-                bmed = statistics.median(b)
-                noise = noise_band(b, times.get((p, dup_label)))
-                for r in ok:
-                    rr = times[p, r.label]
-                    med = statistics.median(rr)
-                    d = (med / bmed - 1) * 100
-                    v = ("base" if r.label == base_label else
-                         "noise floor" if r.label == dup_label else verdict(d, noise))
-                    verdicts[p, r.label] = (d, v)
-                    cr, cb, bw = notes[r.label]
-                    flag = diff_tol is not None and cb is not None and cb > diff_tol
-                    rows.append([r.label, f"`{r.config}`", p, f"{med:.1f}", f"{d:+.1f}",
-                                 f"{min(rr):.1f}-{max(rr):.1f}", v, fmt(cr),
-                                 fmt(cb) + (" DIFF" if flag else "")]
-                                + (["yes" if bw else "no"] if bitwise else []))
-                    agg.setdefault((p, r.label, T), []).append((med, noise))
-                    cfgs.setdefault(r.label, set()).add(r.config)
-                    rec.row(T=T, sample=s, seed=sd, protocol=p, variant=r.label, spec=r.spec,
-                            config=r.config, us=med, rounds=rr, delta_pct=d, noise_pct=noise,
-                            verdict=v, **{f"{m}_ref": cr, f"{m}_base": cb}, bitwise=bw,
-                            cached=r.cached, copies=ncopies if p in rot else 1, **extra_rec)
-                rows.append([f"*noise band +-{noise:.1f}%*"] + [""] * (len(rows[-1]) - 1))
+            b = times[base_label]
+            bmed = statistics.median(b)
+            noise = noise_band(b, times.get(dup_label))
+            for r in ok:
+                rr = times[r.label]
+                med = statistics.median(rr)
+                d = (med / bmed - 1) * 100
+                v = ("base" if r.label == base_label else
+                     "noise floor" if r.label == dup_label else verdict(d, noise))
+                cr, cb, bw = notes[r.label]
+                flag = diff_tol is not None and cb is not None and cb > diff_tol
+                rows.append([r.label, f"`{r.config}`", f"{med:.1f}", f"{d:+.1f}",
+                             f"{min(rr):.1f}-{max(rr):.1f}", v, fmt(cr),
+                             fmt(cb) + (" DIFF" if flag else "")]
+                            + (["yes" if bw else "no"] if bitwise else []))
+                agg.setdefault((r.label, T), []).append((med, noise))
+                cfgs.setdefault(r.label, set()).add(r.config)
+                rec.row(T=T, sample=s, seed=sd, variant=r.label, spec=r.spec, config=r.config,
+                        us=med, rounds=rr, delta_pct=d, noise_pct=noise, verdict=v,
+                        **{f"{m}_ref": cr, f"{m}_base": cb}, bitwise=bw, cached=r.cached,
+                        copies=ncopies, **extra_rec)
+            rows.append([f"*noise band +-{noise:.1f}%*"] + [""] * (len(rows[-1]) - 1))
             table = md_table(
-                ["variant", "config", "protocol", "us", "delta %", "rounds min-max", "verdict",
+                ["variant", "config", "us", "delta %", "rounds min-max", "verdict",
                  f"{m} ref", f"{m} base"] + (["bitwise"] if bitwise else []), rows,
-                right=(3, 4, 5, 7, 8))
+                right=(2, 3, 4, 6, 7))
             drop = [f"- {v.label}: {r}" for v, r in zip(variants, plan[T]) if isinstance(r, str)]
             drop += [f"- {n}: {why}" for n, why in notes.items() if isinstance(why, str)]
             rec.text(head + "\n\n" + table + ("\n\ndropped:\n" + "\n".join(drop) if drop else ""))
-            if len(protocols) > 1:
-                sens = []
-                for r in ok:
-                    vs = {p: verdicts[p, r.label] for p in protocols}
-                    if r.label not in (base_label, dup_label) and len({v for _, v in vs.values()}) > 1:
-                        sens.append(f"- {r.label}: " + ", ".join(
-                            f"{p} {d:+.1f}% ({v})" for p, (d, v) in vs.items())
-                            + " -> PROTOCOL-SENSITIVE: trust coldrot")
-                rec.text("\nprotocols agree on every verdict" if not sens else
-                         "\n" + "\n".join(sens))
             rec.text("")
     if len(points) * samples > 1:
         order = labels[:1] + ([dup_label] if dup_label else []) + labels[1:]
-        for p in protocols:
-            rows = []
-            for lab in order:
-                if lab not in cfgs:
+        rows = []
+        for lab in order:
+            if lab not in cfgs:
+                continue
+            cells = []
+            for T in points:
+                pts, bpts = agg.get((lab, T)), agg.get((base_label, T))
+                if not pts:
+                    cells.append("-")
                     continue
-                cells = []
-                for T in points:
-                    pts, bpts = agg.get((p, lab, T)), agg.get((p, base_label, T))
-                    if not pts:
-                        cells.append("-")
-                        continue
-                    us = statistics.fmean(m for m, _ in pts)
-                    if lab == base_label:
-                        cells.append(f"{us:.1f} us")
-                        continue
-                    d = (us / statistics.fmean(m for m, _ in bpts) - 1) * 100
-                    noise = max(n for _, n in bpts)
-                    cells.append(f"{d:+.1f}%" + ("~" if abs(d) <= noise else ""))
-                rows.append([lab, " / ".join(f"`{c}`" for c in sorted(cfgs[lab]))] + cells)
-            rec.text(f"#### summary ({p}): base in us, the others delta vs the base; "
-                     "~ = within the noise band\n\n"
-                     + md_table(["variant", "config"] + [str(T) for T in points], rows,
-                                right=tuple(range(2, 2 + len(points)))) + "\n")
+                us = statistics.fmean(m for m, _ in pts)
+                if lab == base_label:
+                    cells.append(f"{us:.1f} us")
+                    continue
+                d = (us / statistics.fmean(m for m, _ in bpts) - 1) * 100
+                noise = max(n for _, n in bpts)
+                cells.append(f"{d:+.1f}%" + ("~" if abs(d) <= noise else ""))
+            rows.append([lab, " / ".join(f"`{c}`" for c in sorted(cfgs[lab]))] + cells)
+        rec.text("#### summary: base in us, the others delta vs the base; "
+                 "~ = within the noise band\n\n"
+                 + md_table(["variant", "config"] + [str(T) for T in points], rows,
+                            right=tuple(range(2, 2 + len(points)))) + "\n")
     rec.done()
 
 
@@ -581,14 +562,14 @@ def parser(prog="python -m pyhip.kit"):
                     help="largest metric vs the base / repeat / graph that passes")
     ap.add_argument("--bitwise", action="store_true", help="also bit equality with the base")
     g = ap.add_argument_group("ab")
-    g.add_argument("--protocol", nargs="+", default=["coldrot"], choices=PROTOCOLS)
-    g.add_argument("--copies", type=int, default=NCOPIES)
+    g.add_argument("--copies", type=int, default=NCOPIES,
+                   help=f"copies of the rotate inputs the timed calls cycle through (>= "
+                        f"{MIN_COPIES} unless every variant has @meta(cached_loads=False))")
     g.add_argument("--rounds", type=int, default=5)
     g.add_argument("--iters", type=int, default=16, help="timed calls per round")
     g.add_argument("--samples", type=int, default=1,
                    help="input samples per value (seed + 1000 * sample)")
     g.add_argument("--no-dup", action="store_true", help="do not time the base twice")
-    g.add_argument("--allow-biased", action="store_true")
     g.add_argument("--no-ref", action="store_true", help="skip the reference")
     g = ap.add_argument_group("check")
     g.add_argument("--repeats", type=int, default=5)
@@ -610,9 +591,8 @@ def main(argv=None, prog="python -m pyhip.kit"):
     rec = Recorder(a.out, a.name or a.cmd, run_meta(a.cmd, a, prog))
     desc = f"{t.op.name} problem {a.problem}: {({k: v for k, v in prob.items() if v is not None})}"
     if a.cmd == "ab":
-        return ab(t, prob, pts, a.variants, protocols=a.protocol, rounds=a.rounds, iters=a.iters,
-                  samples=a.samples, seed=a.seed, dup=not a.no_dup, allow_biased=a.allow_biased,
-                  ref=not a.no_ref, bitwise=a.bitwise, diff_tol=a.diff_tol, ncopies=a.copies,
-                  rec=rec, describe=desc)
+        return ab(t, prob, pts, a.variants, rounds=a.rounds, iters=a.iters, samples=a.samples,
+                  seed=a.seed, dup=not a.no_dup, ref=not a.no_ref, bitwise=a.bitwise,
+                  diff_tol=a.diff_tol, ncopies=a.copies, rec=rec, describe=desc)
     return 1 if check(t, prob, pts, a.variants, seed=a.seed, repeats=a.repeats, graph=a.graph,
                       bitwise=a.bitwise, diff_tol=a.diff_tol, rec=rec, describe=desc) else 0

@@ -8,8 +8,8 @@
     python -m a8w4.bench dist       -t 4096 32768 -v default lag=4 bcm=0/1      # megamoe, 8 GPUs
 
 Run from the directory that holds ``a8w4/`` (pyhip: ``src/contrib/flydsl``). Every tool
-times with the deployment-like protocol by default (L2 flush + a different weight copy
-per call, see ``pyhip.kit.timing.PROTOCOLS``) and writes ``--out DIR``: ``<name>.jsonl``
+times every call cold, as in a model (L2 flush + a different weight copy per call, see
+``pyhip.kit.timing``) and writes ``--out DIR``: ``<name>.jsonl``
 (one record per measurement, run metadata first) and ``<name>.md`` (the printed tables).
 ab and check are ``pyhip.kit.bench`` on an a8w4 case (``core.py``); the same engines run
 on the package's Tuning: ``python -m pyhip.kit ab a8w4.tune:TUNING ep8-silu -t 600 -v @table "ep3k m64"``.

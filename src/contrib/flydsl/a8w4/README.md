@@ -159,7 +159,7 @@ a8w4/
   tables.py                    调优表报告：compare（`kit.table.compare`，按 shape / act / tokens 列出两张表逐点的 winner）、readme（重新生成 / 检查 README 7.2–7.4）、stats（situv2 与 silu）
   ref.py                       测试与调优用：算子的问题定义（moe_ref 参考实现、moe_problem 由 problem 生成输入（@dim shape / act / routing）、moe_check 判定、moe_dims 由输入读出 dim 并检查；moe_dyn_* 同理）、随机权重和路由、模拟 fp8 量化的 fp32 参考、冷 cache 计时
   megamoe.py                   MegaMoeEpA8W4：EP8 整层（dispatch + 专家 + combine）的单 persistent kernel 封装，用于大 batch
-  bench/                       实验工具 python -m a8w4.bench：ab（A/B 计时）、breakdown（每个 kernel 的耗时）、check（正确性）、dist（megamoe 8 卡变体）；core.py 是 a8w4 的用例、输入和变体别名（变体解析、A/B 和 check 的引擎、运行记录在 `pyhip.kit.bench`，计时协议、ABBA、噪声带在 `pyhip.kit.timing`），dist.py 也是 8 卡测试共用的 helper
+  bench/                       实验工具 python -m a8w4.bench：ab（A/B 计时）、breakdown（每个 kernel 的耗时）、check（正确性）、dist（megamoe 8 卡变体）；core.py 是 a8w4 的用例、输入和变体别名（变体解析、A/B 和 check 的引擎、运行记录在 `pyhip.kit.bench`，冷 cache 计时、ABBA、噪声带在 `pyhip.kit.timing`），dist.py 也是 8 卡测试共用的 helper
   prof.py                      python -m a8w4.prof：counters（rocprofv3 计数器汇总）、isa（VGPR / spill / LDS）
   exp.py                       python a8w4/exp.py：实验登记 experiments/index.csv 的 grep / ls / add / new / lint / clean
   experiments/                 历次实验：index.csv（一行一个实验）、log_YYYYMMDD.md、各实验目录；_launch.py 是旧实验脚本用的 _run_compiled
@@ -828,7 +828,7 @@ python a8w4/tests/test_a8w4_mori_tp8.py --allreduce aiter --act silu situv2 \
      - `id` 是它在配置名里的写法。`MOE.name_of` / `MOE.parse` 由此生成，CSV 里存的就是这个名字；
    - 限制不写在 solver 函数上：kernel（builder 或 host 封装）在跑不了的组合上 `assert` 失败，并在消息里写出原因和数值。tune 遇到异常就把该配置记为 n/a；
    - 不能在 CUDA graph capture 中运行的 solver 加 `@no_capture("原因")`，capture 期间分派跳过它；
-   - `@meta(tile_m=..., cached_loads=...)` 给 bench 用：`tile_m` 是 block 行数表头；`cached_loads` 表示 W / A 走 cache，这时 bench 拒绝不轮换权重的计时协议。
+   - `@meta(tile_m=..., cached_loads=...)` 给 bench 用：`tile_m` 是 block 行数表头；`cached_loads` 表示 W / A 走 cache，这时 bench 拒绝少于 8 份权重副本的计时。
 
    例如 tp1kq：
 
@@ -920,7 +920,7 @@ TP kernel（`tp_gemm1`、`tp_gemm2`、`tp_fmoe`、`tp_fmoe_q`）里走不到的�
 14. **ATT 每个 dispatch 的 `realtime.json` 换算出的时钟不可靠**：同一 kernel 两次 trace 的 cycle 数能差 2 倍，只能比较 cycle 数。
 15. **计时要排除几种干扰。**
     - 刚 JIT 完的第一次计时偏慢；
-    - 刷 cache 只挤得掉 L2：每次调用都读的权重会留在 256 MB 的 MALL 里，读 512 MB 甚至 2 GB 都挤不掉（MALL 看起来不让一次性扫过的数据替换反复读的行）。W 走 nt 的配置不受影响，W 走 cache 的（bcm 0 / 1）因此显得快 5–13%；rocprof 的 L2 命中率和 HBM 读请求数在两种 cache 策略下完全相同，差别只在 L2 之后。旧调优表因此在 TP 6–128 tokens 选了 `g1bcm1`，实际慢 5–7.7%。计时要让每次调用读一份最近没读过的权重（`ref.weight_copies`，≥8 份；2 份不够）。`python -m a8w4.bench ab` 默认就这样计时，W / A 走 cache 的变体在不轮换权重的协议下会被拒绝；`--protocol coldrot cold` 可以把两种协议并排测出来；
+    - 刷 cache 只挤得掉 L2：每次调用都读的权重会留在 256 MB 的 MALL 里，读 512 MB 甚至 2 GB 都挤不掉（MALL 看起来不让一次性扫过的数据替换反复读的行）。W 走 nt 的配置不受影响，W 走 cache 的（bcm 0 / 1）因此显得快 5–13%；rocprof 的 L2 命中率和 HBM 读请求数在两种 cache 策略下完全相同，差别只在 L2 之后。旧调优表因此在 TP 6–128 tokens 选了 `g1bcm1`，实际慢 5–7.7%。计时要让每次调用读一份最近没读过的权重（`ref.weight_copies`，≥8 份；2 份不够）。`pyhip.kit.timing` 只提供这一种计时方式（调优器和 `python -m a8w4.bench` 都用它），W / A 走 cache 的变体在权重副本少于 8 份时会被 `bench ab` 拒绝；
     - 先刷 cache 再写一遍（读改写）也不对：W 走 cache 的读要先把 dirty 行写回才能占位，会显得慢 9–48%；
     - host 的 launch 开销要排除（GPU 先空转，再记开始 event）；
     - 单次测量有 ±3–5% 的抖动，配置之间要交错测量；
