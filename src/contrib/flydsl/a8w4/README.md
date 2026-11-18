@@ -158,7 +158,7 @@ a8w4/
   tune.py                      调优：TOKENS 和 TUNING（kernelkit.tune.Tuning：problem、分桶维、调优点、key、轮换的权重，6.3 节）；CLI `python -m a8w4.tune <cmd>` 就是 `python -m kernelkit <cmd> a8w4.tune:TUNING`（problems / configs / tune / merge / show / verify / tune-all），另有 a8w4 的报告 compare / readme / stats；表的读、写、合并、比较在 `kernelkit.table`（分派和 tune 共用）
   tables.py                    调优表报告：compare（`kernelkit.table.compare`，按 shape / act / tokens 列出两张表逐点的 winner）、readme（重新生成 / 检查 README 7.2–7.4）、stats（situv2 与 silu）
   ref.py                       测试与调优用：算子的问题定义（moe_ref 参考实现、moe_problem 由 problem 生成输入（@dim shape / act / routing）、moe_check 判定、moe_dims 由输入读出 dim 并检查；moe_dyn_* 同理）、随机权重和路由、模拟 fp8 量化的 fp32 参考、冷 cache 计时
-  megamoe.py                   MegaMoeEpA8W4：EP8 整层（dispatch + 专家 + combine）的单 persistent kernel 封装，用于大 batch
+  megamoe.py                   MegaMoeEpA8W4：EP8 整层（dispatch + 专家 + combine）的单 persistent kernel 封装，用于大 batch；可以 CUDA graph capture / 回放（跨卡 flag 的 epoch 是 device 计数器），topk_ids 为负（padding）的路由不发送
   bench/                       实验工具 python -m a8w4.bench：ab（A/B 计时）、breakdown（每个 kernel 的耗时）、check（正确性）、dist（megamoe 8 卡变体）；core.py 是 a8w4 的用例、输入和变体别名（变体解析、A/B 和 check 的引擎、运行记录在 `kernelkit.bench`，冷 cache 计时、ABBA、噪声带在 `kernelkit.timing`），dist.py 也是 8 卡测试共用的 helper
   prof.py                      python -m a8w4.prof：counters（rocprofv3 计数器汇总）、isa（VGPR / spill / LDS）
   exp.py                       python a8w4/exp.py：实验登记 experiments/index.csv 的 grep / ls / add / new / lint / clean
@@ -169,6 +169,7 @@ a8w4/
   tests/test_a8w4_moe.py       pytest：参考实现、查表、CUDA graph 等其余性质
   tests/test_a8w4_mori_ep8.py  8 卡 EP8 整层（MORI dispatch → a8w4_moe_dyn → MORI combine）：pytest 查正确性，命令行测性能（8.1 节）
   tests/test_a8w4_mori_tp8.py  8 卡 TP8 整层（a8w4_moe → all-reduce），EP8 脚本的 TP 对照：pytest 查正确性，命令行测性能（8.2 节）
+  tests/test_a8w4_megamoe_ep8.py  8 卡 megamoe 整层：pytest 查正确性（eager，以及带 -1 padding 的 CUDA graph 连续回放），命令行与 MORI 路径比性能
   kernels/                     FlyDSL device 代码
     row_quant.py               x 按行 fp8 量化（行数是运行时参数）
     tp_prep.py                 TP 族的 prep：全部专家的路由排序 + x 量化 + out 清零，1 次 launch
@@ -910,7 +911,7 @@ TP kernel（`tp_gemm1`、`tp_gemm2`、`tp_fmoe`、`tp_fmoe_q`）里走不到的�
 7. **gfx942 上的 release fence 会生成 `buffer_wbl2 sc0 sc1`，把整个 L2 写回，每次 7–14 us。** 数据改用写穿 store（sc0|sc1），加 `s_waitcnt vmcnt(0)` 后再写 flag 就够了。
 8. **各 XCD 的 L2 之间不一致。** 读其他 WG（可能在别的 XCD 上）写的数据，要用 sc0|sc1 的一致性 load（`_gload_sys`）绕过本地 L2。
 9. **所有 WG 对同一个地址做 atomic 会串行化，每次约 40 ns。** 计数器要拆成多级（ep1k 用 32 个子计数器），并且每个计数器单独占一条 cache line。
-10. **用 host 端的 epoch 当 flag 不是 graph-safe 的**（tp1kq）。计数器要在 kernel 里由最后一个 WG 复位（ep_prep、ep1k）。
+10. **用 host 端的 epoch 当 flag 不是 graph-safe 的**（tp1kq）。计数器要在 kernel 里由最后一个 WG 复位（ep_prep、ep1k）；跨卡 flag 的 epoch 要放在 device 上，由每次调用的最后一个 kernel 推进（megamoe 的 ep_finish）。
 
 **性能测量**
 

@@ -13,10 +13,13 @@ complete at its kernel boundary (ep_finish runs after it on the same stream).
 Workspace ``ws`` (symmetric, int32): counts [NPES][E_GLOBAL] (row s written by rank s),
 flags [2][NPES] (count row / combine of rank s finished, each holding the call's epoch),
 then arrived [s_cap / BLOCK_M] (routes already written into each sorted block here, added
-by the sources' producers). ``sched`` (local, int32): ticket counter of mega-kernel queue q
-at q * QSTRIDE, the routes block b receives at SCHED_EXPECTED + b, gemm1 tiles finished of
-block b at SCHED_EXPECTED + s_cap / BLOCK_M + b. ``plan`` (local, int32): ep_prep ->
-ep_plan tables (PLAN_*), incl. a copy of the count matrix.
+by the sources' producers). The epoch is ``status[STATUS_EPOCH] + 1``, a device counter
+of the completed calls that ep_finish advances: the same on every rank (they make the same
+calls) and right in a CUDA graph replay (a launch argument would be frozen in the graph).
+``sched`` (local, int32): ticket counter of mega-kernel queue q at q * QSTRIDE, the routes
+block b receives at SCHED_EXPECTED + b, gemm1 tiles finished of block b at
+SCHED_EXPECTED + s_cap / BLOCK_M + b. ``plan`` (local, int32): ep_prep -> ep_plan tables
+(PLAN_*), incl. a copy of the count matrix.
 """
 
 import flydsl.compiler as flyc
@@ -51,6 +54,7 @@ from ._protocol import (
     NPES,
     ROW_BITS,
     SCHED_EXPECTED,
+    STATUS_EPOCH,
 )
 
 # plan (int32): totals [E_GLOBAL], fewest routes from one source [E_GLOBAL], expert bases
@@ -165,7 +169,8 @@ def mega_quant_kernel(*, H):
 @flydsl_kernel
 def mega_prep_kernel():
     """route_idx [T*TOPK]: rank of each route among this rank's routes to its global
-    expert. Writes this rank's count row to every rank, waits for all rows, and fills
+    expert (a negative id is no route: padding, not counted, route_idx not written).
+    Writes this rank's count row to every rank, waits for all rows, and fills
     ``plan``, num_valid [1] (rows this rank receives, capped at s_cap) and status[1] (rows
     needed). Zeroes this rank's arrived counters (before its count flag: no source adds to
     them before it has seen the flag) and the mega kernel's ticket and done counters."""
@@ -185,11 +190,12 @@ def mega_prep_kernel():
     @flyc.kernel(name="a8w4_megamoe_prep", known_block_size=[NT, 1, 1])
     def kernel(topk_ids: fx.Int64, route_idx: fx.Int64, ws: fx.Int64, ws_tab: fx.Int64,
                num_valid: fx.Int64, status: fx.Int64, sched: fx.Int64, plan: fx.Int64,
-               num_routes: fx.Int32, me: fx.Int32, epoch: fx.Int32, s_cap: fx.Int32):
+               num_routes: fx.Int32, me: fx.Int32, s_cap: fx.Int32):
         lds_i32 = fx.Int32(fx.ptrtoint(fx.SharedAllocator().allocate(SharedStorage).peek().raw.ptr))
         lds = lds_typed_ptr(lds_i32, T.i32)
         tid = fx.Int32(gpu.thread_id("x"))
         lane = tid % fx.Int32(64)
+        epoch = global_typed_ptr(status, T.i32)[fx.Int32(STATUS_EPOCH)] + fx.Int32(1)
         sched_p = global_typed_ptr(sched, T.i32)
         plan_p = global_typed_ptr(plan, T.i32)
         ridx_p = global_typed_ptr(route_idx, T.i32)
@@ -207,7 +213,7 @@ def mega_prep_kernel():
                   for j in range(ROUTE_BATCH)]
             for j in range_constexpr(ROUTE_BATCH):
                 r = r0 + fx.Int32(j * NT) + tid
-                if r < num_routes:
+                if (r < num_routes) & (gs[j] >= fx.Int32(0)):
                     _store(ridx_p, r, _latomic_add(lds_i32, fx.Int32(L_HIST) + gs[j], 1))
         gpu.barrier()
         for k in range_constexpr(NPES * E_GLOBAL // NT):
@@ -273,10 +279,9 @@ def mega_prep_kernel():
     @flyc.jit
     def launch(topk_ids: fx.Int64, route_idx: fx.Int64, ws: fx.Int64, ws_tab: fx.Int64,
                num_valid: fx.Int64, status: fx.Int64, sched: fx.Int64, plan: fx.Int64,
-               num_routes: fx.Int32, me: fx.Int32, epoch: fx.Int32, s_cap: fx.Int32,
-               stream: fx.Stream):
+               num_routes: fx.Int32, me: fx.Int32, s_cap: fx.Int32, stream: fx.Stream):
         kernel(topk_ids, route_idx, ws, ws_tab, num_valid, status, sched, plan, num_routes, me,
-               epoch, s_cap).launch(grid=(1, 1, 1), block=(NT, 1, 1), stream=stream)
+               s_cap).launch(grid=(1, 1, 1), block=(NT, 1, 1), stream=stream)
 
     return launch
 
@@ -291,7 +296,8 @@ def mega_plan_kernel():
     """send_route / send_info [T*TOPK]: workgroup j sorts routes [j S, (j + 1) S) (S =
     ceil(routes / grid)) by when the destination's mega-kernel queues need them (block
     position in the queue) into the same range; the producer wave j sends that range in
-    order. info = destination row | global expert << ROW_BITS, -1 past s_cap.
+    order. info = destination row | global expert << ROW_BITS, -1 past s_cap and for a
+    negative id (padding: sent never).
     expert_ids [s_cap / BLOCK_M] / sched expected rows per block: this rank's sorted
     blocks; down_ids (symmetric, local view): padding rows set to -1 (producers fill the
     valid ones). The rows of an expert interleave the sources: source s's i-th route sits
@@ -332,24 +338,27 @@ def mega_plan_kernel():
             r = begin + fx.Int32(j * NT) + tid
             ok = r < end
             g = fx.Int32(_ld(ids_rs, r, mask=ok))
+            valid = g >= fx.Int32(0)
+            g = fx.max(g, fx.Int32(0))  # in-range table reads; the route gets info -1
             idx = fx.Int32(_ld(ridx_rs, r, mask=ok))
             pos = idx * fx.Int32(NPES) + me
-            if ok & (idx >= lds[fx.Int32(PLAN_MIN) + g]):  # some source ran out
+            if ok & valid & (idx >= lds[fx.Int32(PLAN_MIN) + g]):  # some source ran out
                 p = fx.Int32(0)
                 for s in range_constexpr(NPES):
                     c = plan_p[fx.Int32(PLAN_COUNTS + s * E_GLOBAL) + g]
                     p = p + fx.min(c, idx + (fx.Int32(s) < me).select(fx.Int32(1), fx.Int32(0)))
                 pos = p
             row = lds[fx.Int32(PLAN_BASE) + g] + pos
-            info = (row < s_cap).select(row | (g << fx.Int32(ROW_BITS)), fx.Int32(-1))
+            kept = valid & (row < s_cap)
+            info = kept.select(row | (g << fx.Int32(ROW_BITS)), fx.Int32(-1))
             # key: the block's position in its destination's queue
             qs = fx.Int32(PLAN_QSTART) + g // fx.Int32(E_LOCAL) * fx.Int32(9)
             block = row // fx.Int32(BLOCK_M)
             q = (block >= lds[qs + fx.Int32(4)]).select(fx.Int32(4), fx.Int32(0))
             q = q + (block >= lds[qs + q + fx.Int32(2)]).select(fx.Int32(2), fx.Int32(0))
             q = q + (block >= lds[qs + q + fx.Int32(1)]).select(fx.Int32(1), fx.Int32(0))
-            key = (row < s_cap).select(fx.min(block - lds[qs + q], fx.Int32(MAX_KEYS - 1)),
-                                       fx.Int32(MAX_KEYS - 1))
+            key = kept.select(fx.min(block - lds[qs + q], fx.Int32(MAX_KEYS - 1)),
+                              fx.Int32(MAX_KEYS - 1))
             rank = fx.Int32(0)
             if ok:
                 rank = _latomic_add(lds_i32, fx.Int32(L_KC) + key, 1)
@@ -406,18 +415,22 @@ def mega_plan_kernel():
 @flydsl_kernel
 def mega_finish_kernel():
     """After the mega kernel (same stream): tell every rank this rank's remote adds are
-    done, then wait for all ranks."""
+    done, wait for all ranks, then advance the epoch (status[STATUS_EPOCH])."""
 
     @flyc.kernel(name="a8w4_megamoe_finish", known_block_size=[64, 1, 1])
-    def kernel(ws: fx.Int64, ws_tab: fx.Int64, me: fx.Int32, epoch: fx.Int32):
+    def kernel(ws: fx.Int64, ws_tab: fx.Int64, status: fx.Int64, me: fx.Int32):
         tid = fx.Int32(gpu.thread_id("x"))
+        status_p = global_typed_ptr(status, T.i32)
+        epoch = status_p[fx.Int32(STATUS_EPOCH)] + fx.Int32(1)
         if tid < fx.Int32(NPES):
             tab = global_typed_ptr(ws_tab, T.i64, align=8)
             _sys_store(fx.Int64(tab[tid]) + fx.Int64((fx.Int32(FFLAG) + me) * fx.Int32(4)), epoch)
             _flag_wait(fx.Int64(ws) + fx.Int64((fx.Int32(FFLAG) + tid) * fx.Int32(4)), epoch)
+        if tid == fx.Int32(0):  # one wave: every lane's wait is over
+            _store(status_p, fx.Int32(STATUS_EPOCH), epoch)
 
     @flyc.jit
-    def launch(ws: fx.Int64, ws_tab: fx.Int64, me: fx.Int32, epoch: fx.Int32, stream: fx.Stream):
-        kernel(ws, ws_tab, me, epoch).launch(grid=(1, 1, 1), block=(64, 1, 1), stream=stream)
+    def launch(ws: fx.Int64, ws_tab: fx.Int64, status: fx.Int64, me: fx.Int32, stream: fx.Stream):
+        kernel(ws, ws_tab, status, me).launch(grid=(1, 1, 1), block=(64, 1, 1), stream=stream)
 
     return launch

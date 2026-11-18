@@ -21,3 +21,6 @@ QSTRIDE = 16  # i32 between two ticket counters (separate cache lines)
 SCHED_EXPECTED = QUEUES * QSTRIDE
 ROW_BITS = 18
 BLOCK_M = 128
+# status (local, i32 [8]): [1] rows the last call needed (ep_prep); [STATUS_EPOCH] calls
+# completed (ep_finish advances it; ep_prep / ep_finish flag the call with it + 1)
+STATUS_EPOCH = 2

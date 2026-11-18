@@ -19,6 +19,12 @@ Needs: 8 ranks of one node (EP8, 32 local experts each), MORI shmem initialized
 (``mori.shmem.shmem_torch_process_group_init``: the buffers peers write live in its
 symmetric heap), and the whole GPU while it runs (one workgroup on every CU). All kernels
 are FlyDSL (``kernels/ep_mega.py``, ``kernels/ep_mega_comm.py``).
+
+CUDA graphs: capture after one eager call (it compiles the kernels); a replay is a call
+with the captured token count, so pad the batch to it with topk_ids -1 (as sglang's
+``num_token_non_padded`` mask does): negative ids are no routes, their output rows stay 0.
+The cross-rank flags carry a device-side call counter, so replays, eager calls and several
+graphs mix freely as long as every rank makes the same calls in the same order.
 """
 
 import torch
@@ -106,11 +112,11 @@ class MegaMoeEpA8W4:
         self.big_tokens = BLOCK_M * E_LOCAL // topk
         self.quant_k, self.prep_k = C.mega_quant_kernel.get(H=H), C.mega_prep_kernel.get()
         self.plan_k, self.finish_k = C.mega_plan_kernel.get(), C.mega_finish_kernel.get()
-        self.epoch = 0
 
     def __call__(self, x, topk_ids, topk_weights, x_scale=None, marks=None):
         """x: bf16 [T, H] (quantized here), or fp8 FNUZ [T, H] with ``x_scale`` f32
-        [T, H/128]; topk_ids int32 [T, topk] (global ids), topk_weights f32 [T, topk].
+        [T, H/128]; topk_ids int32 [T, topk] (global ids; negative: no route, e.g. padding),
+        topk_weights f32 [T, topk].
         Returns bf16 [T, H], a view of the symmetric output buffer (valid until the next
         call). ``marks``: a list that gets (stage, CUDA event) after every stage (timing)."""
 
@@ -126,7 +132,6 @@ class MegaMoeEpA8W4:
         assert topk_ids.dtype == torch.int32 and topk_weights.dtype == torch.float32
         topk_ids, topk_weights = topk_ids.contiguous(), topk_weights.contiguous()
         tab = self.tables
-        self.epoch += 1
         routes = T * self.topk
         quant = x_scale is None
         if quant:
@@ -139,7 +144,7 @@ class MegaMoeEpA8W4:
             self.quant_k(x if quant else None, x8, xs, self.out, T, int(quant), -(-waves // 4))
         mark("quant")
         self.prep_k(topk_ids, self.route_idx, self.ws, tab["ws"], self.num_valid, self.status,
-                    self.sched, self.plan, routes, self.rank, self.epoch, self.s_cap)
+                    self.sched, self.plan, routes, self.rank, self.s_cap)
         mark("prep")
         self.plan_k(topk_ids, self.route_idx, self.plan, self.send_route, self.send_info,
                     self.down_ids, self.expert_ids, self.sched, routes, self.rank, self.s_cap,
@@ -154,7 +159,7 @@ class MegaMoeEpA8W4:
              self.a2_scale, self.expert_ids, self.num_valid, self.sched, routes, T, self.rank,
              self.nblk, *self.situ, self.grid)
         mark("mega")
-        self.finish_k(self.ws, tab["ws"], self.rank, self.epoch)
+        self.finish_k(self.ws, tab["ws"], self.status, self.rank)
         mark("finish")
         return self.out[:T]
 

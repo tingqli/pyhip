@@ -7,8 +7,9 @@ speed, against MORI dispatch -> ``a8w4_moe_dyn`` -> MORI combine (``test_a8w4_mo
 
 A batch of T tokens (the model's total) is split evenly over the ranks (DP attention).
 
-    pytest -q a8w4/tests/test_a8w4_megamoe_ep8.py        # correctness vs the fp32 reference
-    python a8w4/tests/test_a8w4_megamoe_ep8.py           # perf: T = 2048 .. 32768, vs MORI
+    pytest -q a8w4/tests/test_a8w4_megamoe_ep8.py           # correctness vs the fp32 reference
+    pytest -q a8w4/tests/test_a8w4_megamoe_ep8.py -k graph  # only the CUDA graph replay
+    python a8w4/tests/test_a8w4_megamoe_ep8.py              # perf: T = 2048 .. 32768, vs MORI
     python a8w4/tests/test_a8w4_megamoe_ep8.py -t 8192 --iters 50 --act situv2
 
 Run from the directory that holds ``a8w4/``; needs 8 gfx942 GPUs and mori.
@@ -16,6 +17,15 @@ Run from the directory that holds ``a8w4/``; needs 8 gfx942 GPUs and mori.
 Correctness: every point runs twice, the points interleaved (stale data from an earlier
 call would show up); each rank's output vs the reference (each rank evaluates its experts
 on all ranks' fp8 tokens, summed over the ranks), cos diff < 5e-3.
+CUDA graph replay (``test_megamoe_ep8_graph``): two graphs (96 and 1536 tokens per rank;
+the second runs the big-batch W cache variant, its experts span several blocks) captured
+after one eager call each, as sglang's graph runner does, replayed several times in a row,
+the other graph and eager calls in between. Every call gets new inputs padded as sglang
+pads a batch: the rows past the real tokens (all of them on an idle rank) and some single
+slots have topk_ids -1; uniform and hot-expert routing alternate, so the row layout
+changes from call to call. Each call vs the reference, padded rows exactly 0; a call
+unfinished after ``GRAPH_TIMEOUT_S`` (a cross-rank wait that never ends) fails the test
+instead of hanging it.
 Timing (as test_a8w4_mori_ep8): every iteration flushes L2 and takes the next of
 ``R.WCOPIES`` weight copies (the flush leaves re-read weights in the MALL), then a host
 barrier, a GPU spin while the host enqueues the layer, and a MORI device barrier, so all
@@ -25,9 +35,11 @@ slowest rank): quant / prep (count exchange) / plan / mega / finish (wait for al
 """
 
 import argparse
+import functools
 import itertools
 import os
 import sys
+import time
 
 import pytest
 import torch
@@ -44,6 +56,12 @@ BENCH_TOKENS = [2048, 4096, 8192, 16384, 32768]  # T, the total over the ranks
 # tokens per rank of the correctness test: uniform, an uneven batch (idle ranks, a single
 # token) and the full capacity
 CHECK_TOKENS = [[256] * WORLD, [0, 1, 37, 300, 5, 128, 999, 0], [MAX_TOKENS] * WORLD]
+# CUDA graph replay: tokens per rank of the two graphs (a, b) and of the eager calls (e);
+# the steps: consecutive replays of one graph (what a launch-argument epoch broke), every
+# transition between a, b and e
+GRAPH_TOKENS = {"a": 96, "b": 1536, "e": 300}
+GRAPH_STEPS = "aaaebbbeabba"
+GRAPH_TIMEOUT_S = 60
 SPIN_US = D.SPIN_US
 STAGES = D.MEGA_STAGES
 
@@ -155,6 +173,94 @@ def test_megamoe_ep8():
     if reason:
         pytest.skip(reason)
     run(CHECK_TOKENS)
+
+
+def _valid_tokens(n, step, rank):
+    """Real tokens of a call padded to ``n``: k n / 6 (k = 0: an idle rank), varying over
+    the ranks and, in total, over the steps."""
+    return n * ((5 * step + 3 * rank) % 7) // 6
+
+
+def _padded_routing(n, n_valid, seed, routing="uniform"):
+    """Inputs of an ``n``-token call with ``n_valid`` real tokens, padded as sglang pads a
+    batch: topk_ids -1 in the rows past them (``num_token_non_padded``), and in about 1/16
+    of the real rows' slots as well (single dropped routes)."""
+    x, tw, ti = R.make_routing(n, H, E_GLOBAL, TOPK, seed=seed, routing=routing)
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    drop = torch.rand(ti.shape, device="cuda", generator=gen) < 1 / 16
+    drop[n_valid:] = True
+    return x, tw, ti.masked_fill(drop, -1)
+
+
+def _bounded(fn, *args):
+    """fn(*args), then wait for its GPU work at most ``GRAPH_TIMEOUT_S``. Past that, this
+    rank exits at once: a hung kernel blocks a normal exit as well, while a dead rank makes
+    the spawn stop the others and fail."""
+    out = fn(*args)
+    done = torch.cuda.Event()
+    done.record()
+    t0 = time.monotonic()
+    while not done.query():
+        if time.monotonic() - t0 > GRAPH_TIMEOUT_S:
+            print(f"rank {torch.cuda.current_device()}: megamoe call unfinished after "
+                  f"{GRAPH_TIMEOUT_S} s, a cross-rank wait never ended", file=sys.stderr,
+                  flush=True)
+            os._exit(1)
+        time.sleep(1e-3)
+    return out
+
+
+def _replay(graph, out):
+    graph.replay()
+    return out
+
+
+def _graph_worker(rank, port, act):
+    D.init(rank, port)
+    from a8w4.megamoe import MegaMoeEpA8W4
+
+    situ = R.SITU if act == "situv2" else None
+    W, raw = R.make_weights(E_LOCAL, H, I, seed=rank)
+    mega = MegaMoeEpA8W4(W, rank=rank, max_tokens=MAX_TOKENS, topk=TOPK, act=act, situ=situ)
+    graphs = {}
+    for kind in "ab":
+        n = GRAPH_TOKENS[kind]
+        x, tw, ti = _padded_routing(n, n, seed=rank)  # the graph's static inputs
+        mega(x, ti, tw)  # warm-up (compiles), as sglang's graph runner does before capture
+        torch.cuda.synchronize()
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            y = mega(x, ti, tw)
+        graphs[kind] = (g, y, (x, tw, ti))
+    for step, kind in enumerate(GRAPH_STEPS):
+        n = GRAPH_TOKENS[kind]
+        n_valid = _valid_tokens(n, step, rank)
+        x, tw, ti = _padded_routing(n, n_valid, seed=7919 * rank + 31 * step + 1,
+                                    routing=R.ROUTINGS[step % 2])
+        if kind == "e":
+            call = functools.partial(_bounded, mega, x, ti, tw)
+        else:
+            g, y, static = graphs[kind]
+            for dst, src in zip(static, (x, tw, ti)):
+                dst.copy_(src)
+            x, tw, ti = static
+            call = functools.partial(_bounded, _replay, g, y)
+        res = _check(mega, raw, [n] * WORLD, x, tw, ti, act, situ, run=call)
+        assert not mega.out[n_valid:n].any(), f"rank {rank} step {step}: padded rows not 0"
+        if rank == 0:
+            what = "eager call" if kind == "e" else f"replay of graph {kind}"
+            print(f"step {step} {what}, {n} tokens per rank, {R.ROUTINGS[step % 2]} routing, "
+                  f"real {[_valid_tokens(n, step, r) for r in range(WORLD)]}: rows needed "
+                  f"{[r for r, _ in res]}, cos diff vs reference <= "
+                  f"{max(d for _, d in res):.1e}", flush=True)
+    D.finish()
+
+
+def test_megamoe_ep8_graph():
+    reason = _skip_reason()
+    if reason:
+        pytest.skip(reason)
+    D.spawn(_graph_worker, ("silu",))
 
 
 if __name__ == "__main__":
