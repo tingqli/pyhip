@@ -889,6 +889,11 @@ TP kernel（`tp_gemm1`、`tp_gemm2`、`tp_fmoe`、`tp_fmoe_q`）里走不到的�
   - **加载时检查形状**（`create_weights`）：TP 族要求 H % 512 == 0、I % 256 == 0；MORI 要求 EP kernel 能跑（本地专家 ≤ 32 等）。
   - **激活**：`activation="silu"`，或 `"situv2"`（`MoeRunnerConfig` 的 `situ_beta` / `situ_linear_beta` 必须设置且 > 0；clamp 上限取 `gemm1_clamp_limit` 或 `swiglu_limit`，未设置表示不 clamp）。
   - **不支持的配置直接报错**：SiLU 带 clamp、silu / situv2 以外的激活、fused shared experts、`apply_router_weight_on_input`，以及除 none / mori 之外的 a2a backend。
+- **EP 整层 `moe_ep`（还没接入 sglang）**：
+  - 各 rank 必须选同一个 solver 族，否则 hang；
+  - 查表用的 `tokens` 要取各 rank 相同的全局 token 数；
+  - decode graph 要各 rank replay 同一 bs。
+  - 分析和接入清单见 [moe_ep_sglang.md](moe_ep_sglang.md)。
 
 ## 10. 踩过的坑
 
