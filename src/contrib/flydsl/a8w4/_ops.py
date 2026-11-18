@@ -11,6 +11,12 @@ Dispatch (``ops.moe(...)``, ``ops.moe.pick(problem)``): the tuned table ``DEFAUL
 ``num_tokens`` (its column ``~num_tokens``: the first tuned point >= the call's token
 count). A key without rows raises ValueError: tune it first. How the table is tuned:
 ``tune.TUNING``.
+
+``ep_ops.moe_ep`` (``moe_ep.py``): the expert-parallel MoE layer (dispatch, experts,
+combine), one call on each rank's GPU (``@multi_gpu("world")``; solvers ``mega`` and the
+MORI-based ``mori`` / ``mori_eager``), with its own table ``EP_CSV`` keyed by the shape,
+experts and ranks and bucketed by the batch over all ranks (``~tokens``); tuned by
+``tune.EP_TUNING``.
 """
 
 import os
@@ -21,3 +27,7 @@ DEFAULT_CSV = os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs"
                            "a8w4_moe_tuned.csv")
 ops = Registry("a8w4", table=DEFAULT_CSV)
 op_register = ops.register
+
+EP_CSV = os.path.join(os.path.dirname(DEFAULT_CSV), "a8w4_moe_ep_tuned.csv")
+ep_ops = Registry("a8w4-moe-ep", table=EP_CSV)
+ep_register = ep_ops.register

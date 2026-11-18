@@ -152,18 +152,20 @@ out = a8w4_moe_dyn(x, W, topk_weights, topk_ids, m_valid, x_scale=None,
 ```
 a8w4/
   __init__.py                  公开接口；另导出 ops（算子注册表，ops.moe / ops.moe_dyn）和 DEFAULT_CSV
-  _ops.py                      本包的算子注册表 ops = kernelkit.Registry("a8w4", table=DEFAULT_CSV) 和装饰器 op_register；ref.py 注册问题定义，moe.py 注册 solver
+  _ops.py                      本包的算子注册表 ops = kernelkit.Registry("a8w4", table=DEFAULT_CSV) 和装饰器 op_register；ref.py 注册问题定义，moe.py 注册 solver；EP 整层的注册表 ep_ops（表 EP_CSV）和 ep_register，moe_ep.py 注册
   moe.py                       a8w4_moe / a8w4_moe_dyn（只处理 M == 0，其余交给算子）；各 solver 函数 moe_<solver>（@op_register 注册；@knob 取值、@meta，tp1kq 另有 @no_capture；限制由 kernel 的 assert 检查），算子 MOE = ops.moe、MOE_DYN = ops.moe_dyn（9.3 节）；shape_problem（工具用：由 shape 元组构造 problem）
   weights.py                   prepare_weights（fd2 权重）、shuffle_mxfp4、weight_shape
-  tune.py                      调优：TOKENS 和 TUNING（kernelkit.tune.Tuning：problem、分桶维、调优点、key、轮换的权重，6.3 节）；CLI `python -m a8w4.tune <cmd>` 就是 `python -m kernelkit <cmd> a8w4.tune:TUNING`（problems / configs / tune / merge / show / verify / tune-all），另有 a8w4 的报告 compare / readme / stats；表的读、写、合并、比较在 `kernelkit.table`（分派和 tune 共用）
+  tune.py                      调优：TOKENS 和 TUNING（kernelkit.tune.Tuning：problem、分桶维、调优点、key、轮换的权重，6.3 节）；CLI `python -m a8w4.tune <cmd>` 就是 `python -m kernelkit <cmd> a8w4.tune:TUNING`（problems / configs / tune / merge / show / verify / tune-all），另有 a8w4 的报告 compare / readme / stats；表的读、写、合并、比较在 `kernelkit.table`（分派和 tune 共用）；EP 整层：EP_TOKENS 和 EP_TUNING（`python -m kernelkit <cmd> a8w4.tune:EP_TUNING`，自动起 8 个 rank）
   tables.py                    调优表报告：compare（`kernelkit.table.compare`，按 shape / act / tokens 列出两张表逐点的 winner）、readme（重新生成 / 检查 README 7.2–7.4）、stats（situv2 与 silu）
   ref.py                       测试与调优用：算子的问题定义（moe_ref 参考实现、moe_problem 由 problem 生成输入（@dim shape / act / routing）、moe_check 判定、moe_dims 由输入读出 dim 并检查；moe_dyn_* 同理）、随机权重和路由、模拟 fp8 量化的 fp32 参考、冷 cache 计时
   megamoe.py                   MegaMoeEpA8W4：EP8 整层（dispatch + 专家 + combine）的单 persistent kernel 封装，用于大 batch；可以 CUDA graph capture / 回放（跨卡 flag 的 epoch 是 device 计数器），topk_ids 为负（padding）的路由不发送
+  moe_ep.py                    EP 整层算子 moe_ep（每个 rank 调用一次）：EpComm（rank、world 和各 solver 的通信缓冲）、问题定义（moe_ep_ref / _problem / _check / _dims）和 3 个 solver：mega（MegaMoeEpA8W4）、mori（MORI dispatch → ep3k → MORI combine，可以 CUDA graph capture）、mori_eager（host 读收到的行数），都是 @multi_gpu("world")
   bench/                       实验工具 python -m a8w4.bench：ab（A/B 计时）、breakdown（每个 kernel 的耗时）、check（正确性）、dist（megamoe 8 卡变体）；core.py 是 a8w4 的用例、输入和变体别名（变体解析、A/B 和 check 的引擎、运行记录在 `kernelkit.bench`，冷 cache 计时、ABBA、噪声带在 `kernelkit.timing`），dist.py 也是 8 卡测试共用的 helper
   prof.py                      python -m a8w4.prof：counters（rocprofv3 计数器汇总）、isa（VGPR / spill / LDS）
   exp.py                       python a8w4/exp.py：实验登记 experiments/index.csv 的 grep / ls / add / new / lint / clean
   experiments/                 历次实验：index.csv（一行一个实验）、log_YYYYMMDD.md、各实验目录；_launch.py 是旧实验脚本用的 _run_compiled
   configs/a8w4_moe_tuned.csv   调优表（每个点保存全部配置的耗时）
+  configs/a8w4_moe_ep_tuned.csv  EP 整层 moe_ep 的调优表（mega / mori / mori_eager 的全部配置）
   configs/README.md            调优表的内容与生成命令
   tests/test_a8w4_ops.py       pytest：每个 solver 的每个调优过的配置对参考实现，由算子生成（op_tests：moe 测 tune.TUNING 的每个 problem，moe_dyn 的 problem 写在这个文件里）
   tests/test_a8w4_moe.py       pytest：参考实现、查表、CUDA graph 等其余性质
@@ -199,7 +201,7 @@ kernel 文件之间不互相 import（只有 `ep_gemm` 的 host 入口调用 `ep
 |---|---|---|
 | GPU | gfx942（MI300X / MI325X） | fp8 FNUZ MFMA；硬件假设见 9.2 |
 | torch | ROCm 版，测试用 2.9.1+rocm7.2.0 | |
-| kernelkit | [tingqli/kernelkit](https://github.com/tingqli/kernelkit) v0.1.0（pyhip 的依赖，随 pyhip 安装） | 算子注册表、查表分派、测试生成、调优器和 A/B 工具（`_ops.py`、`ref.py`、`moe.py`、`tune.py`、`bench/`、`tests/`） |
+| kernelkit | [tingqli/kernelkit](https://github.com/tingqli/kernelkit) v0.2.0（pyhip 的依赖，随 pyhip 安装） | 算子注册表、查表分派、测试生成、调优器和 A/B 工具，多卡 op（`_ops.py`、`ref.py`、`moe.py`、`moe_ep.py`、`tune.py`、`bench/`、`tests/`） |
 | FlyDSL | **0.3.2**（用到 0.3 的新 API，0.1.x 导入时就会失败） | 全部 kernel |
 | aiter | 测试用 tq/mimo-moe 分支 | 运行时只有 TP 族在专家切片（EP 形状）上用 `aiter.fused_moe.moe_sorting`；`shuffle_mxfp4` 用 `aiter.ops.shuffle`（纯 torch 重排）；`ref.py` 和测试用 `aiter.get_torch_quant` 生成权重 |
 
@@ -210,7 +212,7 @@ EP 族（`ep3k` / `ep1k`）和 `prepare_weights` 在运行时都不需要 aiter�
 - 整个目录复制过去即可，也可以放进别的包里。包内对 pyhip 的绝对导入只有一处，其余全部是相对 import：
   - kernel 文件的 `from pyhip.contrib.flydsl.host_launch import flydsl_kernel`。
 
-  用 `grep -rn "pyhip\.contrib" --include=*.py . | grep -v experiments/` 列出它们。不带 pyhip 时，把 `host_launch.py` 一起复制过去并改这些 import，另外 `pip install "kernelkit @ git+https://github.com/tingqli/kernelkit.git@v0.1.0"`（`_ops.py`、`moe.py`、`ref.py`、`tune.py`、`bench/`、`tests/` 用它）。只有 `tests/` 和 `tune.py` 的命令行入口按顶层包名 `a8w4` 导入，改了包名要同步修改。
+  用 `grep -rn "pyhip\.contrib" --include=*.py . | grep -v experiments/` 列出它们。不带 pyhip 时，把 `host_launch.py` 一起复制过去并改这些 import，另外 `pip install "kernelkit @ git+https://github.com/tingqli/kernelkit.git@v0.2.0"`（`_ops.py`、`moe.py`、`moe_ep.py`、`ref.py`、`tune.py`、`bench/`、`tests/` 用它）。只有 `tests/` 和 `tune.py` 的命令行入口按顶层包名 `a8w4` 导入，改了包名要同步修改。
 - 调优表按 shape 存放，其他模型要先调优（第 6 节）。
 - 换了机器（不同 SKU 或功耗墙）要先跑 `verify`，必要时重新调优。
 

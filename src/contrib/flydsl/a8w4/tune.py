@@ -24,6 +24,13 @@ about tuning is ``TUNING`` below: the problem groups (a shape each, x every act)
 token counts, the table's keys and the rotated weights. SiTUv2 runs with
 ``ref.SITU`` (its betas / clamp are launch arguments: no effect on the time). See
 configs/README.md for the commands that produced the shipped table.
+
+The EP MoE layer (``moe_ep.py``: solvers mega, mori, mori_eager on ``world`` GPUs per call)
+is ``EP_TUNING``, with the generic command line; every command that runs it starts the
+ranks itself:
+
+    python -m kernelkit tune a8w4.tune:EP_TUNING mimo-flash2.6-ep8-silu -t 4096
+    python -m kernelkit tune-all a8w4.tune:EP_TUNING --gpus 0-7 --out /tmp/a8w4_ep
 """
 
 import argparse
@@ -40,6 +47,7 @@ from kernelkit import tune as kit_tune  # noqa: E402
 
 from ._ops import DEFAULT_CSV  # noqa: E402
 from .moe import MOE  # noqa: E402
+from .moe_ep import MOE_EP  # noqa: E402
 
 # the token counts tuned: the points of the bucket dim num_tokens
 TOKENS = (1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 320, 384, 448, 512,
@@ -62,6 +70,17 @@ TUNING = (
 # the table's columns: the key dims, the bucket num_tokens, the config name and its time,
 # moe_check's metric
 FIELDS = TUNING.fields(["cos"])
+# the EP MoE layer (its solvers are @multi_gpu("world")): the batch over all ranks from
+# decode-sized to prefill-sized, split evenly over the ranks, every act of
+# moe_ep_problem's @dim, EP8 over 256 experts; the table is keyed by the shape, experts,
+# ranks, routing and act; the timed calls rotate copies of every rank's weights W
+EP_TOKENS = (64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768)
+EP_TUNING = (
+    kit_tune.Tuning(MOE_EP, keys=("model_dim", "inter_dim", "experts_global", "world", "topk",
+                                  "routing", "act"), rotate=("W",))
+    .set_bucket("tokens")
+    .add_problem("mimo-flash2.6-ep8", tokens=EP_TOKENS, experts_global=256, world=8,
+                 routing="uniform"))
 REPORTS = ("compare", "readme", "stats")
 
 

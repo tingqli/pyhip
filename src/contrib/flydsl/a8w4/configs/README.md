@@ -1,6 +1,6 @@
 # configs：a8w4 调优表
 
-`a8w4_moe_tuned.csv` 是 `a8w4_moe` / `a8w4_moe_dyn` 选配置时查的表，由 `kernelkit.tune`（`python -m a8w4.tune`）生成。查表和计时的机制见上级 README 第 6 节；本文件记录表里有什么，以及生成它的命令。
+`a8w4_moe_tuned.csv` 是 `a8w4_moe` / `a8w4_moe_dyn` 选配置时查的表，由 `kernelkit.tune`（`python -m a8w4.tune`）生成。查表和计时的机制见上级 README 第 6 节；本文件记录表里有什么，以及生成它的命令。EP 整层 `moe_ep` 的表 `a8w4_moe_ep_tuned.csv` 见最后一节。
 
 ## 格式
 
@@ -88,3 +88,30 @@ python -m pytest a8w4/tests/test_a8w4_moe.py -q -p no:cacheprovider
   - 之后同样 `tune`（或 `tune-all <problem>`）再 `merge`。
 - **`--set routing=hot`**：结果写成另一组行，调用时用 `a8w4_moe(..., routing="hot")` 选这组。
 - **act**：可选值见 `ref.ACTS`（problem 名的后半段）。每个 shape 的每个 act 都要调：act 是精确匹配的 key。
+
+## a8w4_moe_ep_tuned.csv：EP 整层（`moe_ep`）
+
+`moe_ep`（`../moe_ep.py`）每个 rank 调用一次，在 solver `mega`、`mori`、`mori_eager` 的全部配置里查这张表选一个。
+
+- **列**：`model_dim, inter_dim, experts_global, world, topk, routing, act, ~tokens, config, us, cos`。
+- **key**：`(model_dim, inter_dim, experts_global, world, topk, routing, act)`，本卡专家数由 `experts_global / world` 推出。
+- **分桶列** `~tokens`：所有 rank 的 token 总数。
+- **`us`**：各 rank 对齐后最慢的那个 rank 的时间。
+- **当前内容**：`mimo-flash2.6-ep8-silu` 和 `-situv2` 两个 problem（4096/2048/256/EP8/topk 8，uniform），token 点为 `tune.EP_TOKENS`（64–32768），每点 30 个配置，共 600 行。
+- **来源**：20261118 用下面的命令生成，耗时 9.3 min，没有 BAD 配置。situv2 的 64 / 128 点中 mori 的结果有异常（比相邻点慢 2–3 倍，mega 的结果正常），在空闲机器上重调这两个点后 `merge` 进表。
+- **结果**（各 solver 最快配置之比）：
+  - ≤256 tokens：`mori` 比 `mega` 快 4–7%。
+  - ≥512 tokens：`mori` 的时间是 `mega` 的 1.03–1.47 倍（2048–4096 tokens 差距最大）。
+  - `mori_eager`：在主机上读收到的 token 数，时间是 `mori` 的 1.02–2.3 倍。
+
+```bash
+cd pyhip/src/contrib/flydsl
+# 每个 problem 是一个 8 rank 的任务，两个 problem 依次跑；tune-all 自己拿 GPU 锁
+python -m kernelkit tune-all a8w4.tune:EP_TUNING --gpus 0-7 --out /tmp/a8w4_ep
+cp /tmp/a8w4_ep/a8w4_moe_ep_tuned.new.csv a8w4/configs/a8w4_moe_ep_tuned.csv
+python -m kernelkit show   a8w4.tune:EP_TUNING mimo-flash2.6-ep8
+python -m kernelkit verify a8w4.tune:EP_TUNING mimo-flash2.6-ep8 -t 20 100 300 1000 3000 20000
+# 某些点的结果异常时，在空闲机器上重调这些点，再 merge 进表：
+python -m kernelkit tune  a8w4.tune:EP_TUNING mimo-flash2.6-ep8-situv2 -t 64 128 --out /tmp/re.csv
+python -m kernelkit merge a8w4.tune:EP_TUNING /tmp/re.csv
+```

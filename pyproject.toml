@@ -10,7 +10,7 @@ dependencies = [
     "filelock",
     "numpy",
     # op registry, table dispatch, tests, tuner and A/B tools of the contrib ops (a8w4)
-    "kernelkit @ git+https://github.com/tingqli/kernelkit.git@v0.1.0",
+    "kernelkit @ git+https://github.com/tingqli/kernelkit.git@v0.2.0",
 ]
 description = "Python AMDGPU kernel developing tool"
 readme = "README.md"

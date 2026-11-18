@@ -561,6 +561,7 @@ host 端（`moe._run_tp2k`，G1/G2 唯一的调用方）只用到 gemm1 的 `epi
 | 2026-11-18 | V 术语 dim / knob，测试和调优集中声明 | `@dim`（problem 的取值）/ `@knob`（solver 的网格）；`op.problems`、`op_tests(op, problems)`、`Tuning`；表头 `~num_tokens` 标出 bucket，`Registry(name, table)`；去掉 relax，补调 tp4-situv2。测试 ID、候选、show 不变；分派只在 tp4-situv2 上变；ISA IDENTICAL；kit 18、单卡 413、8 卡 3 passed | `af50811` `9adc2f0` `893e3f2` |
 | 2026-11-18 | W 一个概念一个名字 | kind → solver（配置键、`Op.solvers`）；`<op>_test` → `<op>_problem`；dict 参数 `dims` → `problem`；data → inputs；CLI `candidates` → `configs`。测试 ID、分派、CLI 输出不变；ISA IDENTICAL；kit 18、单卡 413、8 卡 3 passed | 见 git log |
 | 2026-11-18 | kit 迁出 pyhip | `pyhip.kit` 迁到独立仓库 [tingqli/kernelkit](https://github.com/tingqli/kernelkit)（包 `kernelkit`，CLI `python -m kernelkit`，v0.1.0）；pyhip 删掉 `src/kit`、`tests/kit`，`pyproject.toml` 依赖 `kernelkit @ git+https://github.com/tingqli/kernelkit.git@v0.1.0`；a8w4 的 import 和文档改指 kernelkit。测试 ID 不变；单卡 413 passed；kernelkit 18 passed | 见 git log |
+| 2026-11-18 | EP 整层算子 moe_ep（kernelkit v0.2.0） | kernelkit 0.2.0：solver 上的 `@multi_gpu(world, init=)`（卡数可以是 problem 的 dim，进表的 key），tune / verify / ab / check 自动起 world 个 rank（`kernelkit.spmd`：首次调用和 check 的结果各 rank 一致，计时取最慢的 rank，rank 0 写表），tune-all 按卡数分配 GPU。a8w4：`moe_ep.py`（`EpComm`；solver mega / mori / mori_eager，30 个配置），`_ops.ep_ops` 和表 `configs/a8w4_moe_ep_tuned.csv`，`tune.EP_TUNING`（EP8，64–32768 tokens，600 行）：≤256 tokens 选 mori，≥512 选 mega。不改 kernel；8 卡 check（含 `--graph`）、verify 通过；kernelkit 22 passed | 见 git log |
 
 **I4 的经验**：
 
