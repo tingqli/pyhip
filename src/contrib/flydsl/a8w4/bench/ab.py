@@ -23,7 +23,7 @@ import argparse
 from pyhip.kit import bench as kb
 
 from .. import ref as R
-from ..moe import MOE
+from ..tune import TUNING
 from . import core
 
 
@@ -64,7 +64,7 @@ def main(argv=None):
         core.quiet()
     case = core.case_from_args(a)
     rec = core.Recorder(a.out, a.name, core.run_meta("ab", a))
-    kb.ab(MOE, case.dims(), a.tokens, a.variants, protocols=a.protocol, rounds=a.rounds,
+    kb.ab(TUNING, case.dims(), a.tokens, a.variants, protocols=a.protocol, rounds=a.rounds,
           iters=a.iters, samples=a.samples, seed=a.seed, dup=not a.no_dup,
           allow_biased=a.allow_biased, ref=not a.no_ref, bitwise=a.bitwise,
           diff_tol=core.DIFF_TOL, ncopies=a.wcopies, rec=rec,

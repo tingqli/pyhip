@@ -263,9 +263,9 @@ def _weights(experts, model_dim, inter_dim):
 
 
 @op_register
-@dim(_SHAPE, SHAPES)
-@dim("num_tokens", (1, 77, 600), id="t{}")
+@dim(_SHAPE, SHAPES, name="shape")
 @dim("act", ACTS, id="{}")
+@dim("routing", ROUTINGS, id="{}")
 def moe_test(model_dim, inter_dim, experts, experts_global, topk, expert_offset, num_tokens,
              routing="uniform", act="silu", *, seed=0):
     """Inputs of ``moe_ref`` / ``a8w4_moe``: random mxfp4 weights of ``experts`` local
@@ -302,11 +302,10 @@ def moe_dims(x, W, topk_weights, topk_ids, *, expert_offset=0, num_experts=None,
 
 
 @op_register
-@dim(_SHAPE, {"ep8": SHAPES["ep8"]})
-@dim("capacity, num_tokens", {"v0": (512, 0), "v1": (512, 1), "v37": (512, 37),
-                              "v300": (512, 300), "v1500": (2048, 1500)})
+@dim(_SHAPE, {"ep8": SHAPES["ep8"]}, name="shape")
 @dim("fp8", {"bf16": False, "fp8": True})
 @dim("act", ACTS, id="{}")
+@dim("routing", ROUTINGS, id="{}")
 def moe_dyn_test(model_dim, inter_dim, experts, experts_global, topk, expert_offset,
                  capacity, num_tokens, fp8=False, act="silu", routing="uniform", *, seed=0):
     """Inputs of ``moe_dyn_ref`` / ``a8w4_moe_dyn``: an EP all-to-all receive buffer of

@@ -71,7 +71,7 @@ def isa_tokens():
     """Tuned token counts + the counts where a token-dependent compile option flips:
     tp_prep's histogram unroll (every 128 tokens up to 2048 at topk 8) and route range
     (> 2048 / 4096 / 8192), ep_prep's multi-WG path (> 256)."""
-    from ._ops import TOKENS
+    from .tune import TOKENS
 
     extra = [128 * h for h in range(1, 17)] + [257, 2049, 4097, 8193]
     return sorted(set(TOKENS) | set(extra))

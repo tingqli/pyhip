@@ -1,27 +1,25 @@
 """Tune an op into its tuned table, and inspect the table (torch; ``python -m pyhip.kit``).
 
-    python -m pyhip.kit cases      a8w4:moe                     # the tune cases: tp8-silu ...
-    python -m pyhip.kit candidates a8w4:moe tp8-silu            # the grid configs
-    python -m pyhip.kit tune       a8w4:moe tp8-silu -t 1 2 4 --out /tmp/p0.csv
-    python -m pyhip.kit merge      a8w4:moe /tmp/p*.csv         # into the registry's table
-    python -m pyhip.kit show       a8w4:moe tp8-silu            # per point: the fastest configs
-    python -m pyhip.kit verify     a8w4:moe ep8-silu -t 1 100 3000
-    python -m pyhip.kit tune-all   a8w4:moe [CASE ...] --gpus 0-7 --per-job 4 --out /tmp/t
+    python -m pyhip.kit problems   a8w4.tune:TUNING             # the tune problems: tp8-silu ...
+    python -m pyhip.kit candidates a8w4.tune:TUNING tp8-silu    # the grid configs
+    python -m pyhip.kit tune       a8w4.tune:TUNING tp8-silu -t 1 2 4 --out /tmp/p0.csv
+    python -m pyhip.kit merge      a8w4.tune:TUNING /tmp/p*.csv # into the tuning's table
+    python -m pyhip.kit show       a8w4.tune:TUNING tp8-silu    # per point: the fastest configs
+    python -m pyhip.kit verify     a8w4.tune:TUNING ep8-silu -t 1 100 3000
+    python -m pyhip.kit tune-all   a8w4.tune:TUNING [PROBLEM ...] --gpus 0-7 --per-job 4 --out /tmp/t
     python -m pyhip.kit compare    OLD.csv NEW.csv
 
-``<module>:<op>``: an importable module holding one ``Registry`` and the op's name. The
-registry declares the table, its ``bucket`` and the bucket's tune ``points``, the dims
-the table does not store (``unkeyed``) and the interface arguments the timed calls cycle
-through copies of (``rotate``).
+``<module>:<name>``: an importable module and the name of the ``Tuning`` in it that
+declares how to tune the op (see ``Tuning``): the problems, the bucket dim and its
+points, the key dims the table stores, the inputs the timed calls rotate, the table.
 
-A tune case is a point of ``<op>_test``'s grid without the bucket axis (its id joins the
-other axes' ids, e.g. ``tp8-silu``); ``--set name=value`` overrides dim values (another
-shape, a routing). ``tune``: per point, ``--rounds`` rounds, each with fresh inputs
-(``<op>_test``, seed 101 * point + round); per round every grid config runs once
-(one that raises cannot run the case: n/a), is checked against ``<op>_ref``
-(``<op>_check``: a failure is BAD) and timed cold (``kit.timing.time_cold``, the
-``rotate`` inputs cycling through ``--copies`` copies), the configs interleaved. Every
-config that ran and passed is stored: the median time, the worst metric of the check.
+``--set name=value`` overrides dim values of a problem (another shape, a routing).
+``tune``: per point, ``--rounds`` rounds, each with fresh inputs (``<op>_test``, seed
+101 * point + round); per round every grid config runs once (one that raises cannot run
+the problem: n/a), is checked against ``<op>_ref`` (``<op>_check``: a failure is BAD)
+and timed cold (``kit.timing.time_cold``, the ``rotate`` inputs cycling through
+``--copies`` copies), the configs interleaved. Every config that ran and passed is
+stored: the median time, the worst metric of the check.
 """
 
 import argparse
@@ -38,77 +36,82 @@ import time
 
 import torch
 
-from . import Registry, _cell, _guess
+from . import _cell, _guess, _unknown
 from . import table as _table
 from .timing import NCOPIES, copies, time_cold
 
-__all__ = ["resolve", "cases", "case", "fields", "tune", "show", "verify", "merge", "tune_all",
-           "main"]
+__all__ = ["Tuning", "resolve", "tune", "show", "verify", "merge", "tune_all", "main"]
+
+_DEFAULT = object()  # table=: the registry's
+
+
+class Tuning:
+    """How to tune ``op`` (all of it, in one place):
+
+    * ``problems``: [(id, problem)] (``op.problems(...)``); the bucket is set per point;
+    * ``bucket``: the dim tuned at ``points``, matched inexactly by the dispatch (the
+      first tuned point >= the call's value; the other key dims match exactly);
+    * ``keys``: the dims the table stores (default: every dim but the bucket); a dim
+      left out must not change which config is fastest (e.g. an expert offset);
+    * ``rotate``: interface arguments the timed calls cycle through copies of (e.g.
+      the weights: ``kit.timing.copies``);
+    * ``table``: the table ``tune`` / ``merge`` write and ``show`` / ``verify`` read
+      (default: the registry's, which the dispatch reads).
+    """
+
+    def __init__(self, op, *, problems, bucket, points, keys=None, rotate=(), table=_DEFAULT):
+        where = f"Tuning({op.name})"
+        if bucket not in op.dim_names:
+            raise TypeError(f"{where}: bucket {bucket!r} is not a dim {list(op.dim_names)}")
+        if op.registry.bucket not in (None, bucket):
+            raise TypeError(f"{where}: bucket {bucket!r}, but the dispatch buckets "
+                            f"{op.registry.bucket!r} (Registry(bucket=))")
+        keys = tuple(n for n in op.dim_names if n != bucket) if keys is None else tuple(keys)
+        if _unknown(keys, op.dim_names) or bucket in keys or len(set(keys)) < len(keys):
+            raise TypeError(f"{where}: keys {list(keys)}: distinct dims, not the bucket")
+        if isinstance(rotate, str) or _unknown(rotate, op._ref_names):
+            raise TypeError(f"{where}: rotate {rotate!r}: names of {op.name}_ref's parameters")
+        self.op, self.bucket, self.points = op, bucket, tuple(points)
+        self.keys, self.rotate = keys, tuple(rotate)
+        self.table = op.registry.table if table is _DEFAULT else table
+        self.problems = {}
+        for pid, prob in problems:
+            if pid in self.problems:
+                raise TypeError(f"{where}: two problems {pid!r}")
+            self.problems[pid] = {**op._blank, **prob, bucket: None}
+
+    def __repr__(self):
+        return (f"Tuning({self.op.name}, problems={list(self.problems)}, bucket={self.bucket!r}, "
+                f"{len(self.points)} points)")
+
+    def fields(self, metrics):
+        """The table header: key columns, bucket, config, us, the check's metrics."""
+        return [*self.keys, self.bucket, "config", "us", *metrics]
+
+    def problem(self, pid, sets=()):
+        """Problem ``pid`` with ``sets`` ("name=value") applied."""
+        if pid not in self.problems:
+            raise SystemExit(f"{self.op.name}: no tune problem {pid!r}; problems: "
+                             f"{list(self.problems)}")
+        c = dict(self.problems[pid])
+        for s in sets:
+            k, eq, v = s.partition("=")
+            if not eq or k not in self.op.dim_names:
+                raise SystemExit(f"--set {s!r}: expected name=value, name in "
+                                 f"{list(self.op.dim_names)}")
+            c[k] = _cell(v, self.op._test_defaults.get(k))
+        return c
 
 
 def resolve(spec):
-    """``"module:op"`` -> the Op (the module holds exactly one Registry)."""
+    """``"module:name"`` -> the ``Tuning`` ``name`` of ``module``."""
     mod, _, name = spec.rpartition(":")
     if not mod or not name:
-        raise SystemExit(f"{spec!r}: expected <module>:<op>, e.g. a8w4:moe")
-    m = importlib.import_module(mod)
-    regs = {id(v): v for v in vars(m).values() if isinstance(v, Registry)}
-    if len(regs) != 1:
-        raise SystemExit(f"{mod}: expected one Registry, found {len(regs)}")
-    reg = next(iter(regs.values()))
-    if name not in reg:
-        raise SystemExit(f"{mod}: no op {name!r}; ops: {list(reg)}")
-    return reg[name]
-
-
-def _bucket(op):
-    b = op.registry.bucket
-    if b is None or b not in op.dim_names:
-        raise SystemExit(f"{op.name}: tuning needs Registry(bucket=) naming a dim")
-    return b
-
-
-def cases(op):
-    """{id: case}: the points of ``<op>_test``'s grid without the bucket axis; the bucket
-    is None in ``case``."""
-    b = _bucket(op)
-    axes = [p for p in op._axes if b not in p.names]
-    if any(b in p.names and len(p.names) > 1 for p in op._axes):
-        raise SystemExit(f"{op.name}_test: the bucket {b!r} shares a @dim axis with other "
-                         "names; tuning replaces that axis")
-    out = {}
-    for combo in itertools.product(*(p.points() for p in axes)):
-        c = dict(op._test_defaults)
-        for _, vals in combo:
-            c.update(vals)
-        c[b] = None
-        out["-".join(tok for tok, _ in combo)] = c
-    return out
-
-
-def case(op, cid, sets=()):
-    """The tune case ``cid`` with ``sets`` ("name=value") applied."""
-    all_ = cases(op)
-    if cid not in all_:
-        raise SystemExit(f"{op.name}: no tune case {cid!r}; cases: {list(all_)}")
-    c = dict(all_[cid])
-    for s in sets:
-        k, eq, v = s.partition("=")
-        if not eq or k not in op.dim_names:
-            raise SystemExit(f"--set {s!r}: expected name=value, name in {list(op.dim_names)}")
-        c[k] = _cell(v, op._test_defaults.get(k))
-    return c
-
-
-def _keys(op):
-    """The dims the table stores, in dim order (bucket excluded)."""
-    reg = op.registry
-    return [n for n in op.dim_names if n not in reg.unkeyed and n != reg.bucket]
-
-
-def fields(op, metrics):
-    """The table header: key columns, bucket, config, us, the check's metrics."""
-    return [*_keys(op), _bucket(op), "config", "us", *metrics]
+        raise SystemExit(f"{spec!r}: expected <module>:<Tuning name>, e.g. a8w4.tune:TUNING")
+    t = getattr(importlib.import_module(mod), name, None)
+    if not isinstance(t, Tuning):
+        raise SystemExit(f"{spec}: not a pyhip.kit.tune.Tuning ({type(t).__name__})")
+    return t
 
 
 def _check(op, out, expected, inputs):
@@ -122,11 +125,11 @@ def _check(op, out, expected, inputs):
 
 
 class _Rotation:
-    """Copies of the ``rotate`` inputs, made once per input object; ``next()`` -> {name:
+    """Copies of the ``names`` inputs, made once per input object; ``next()`` -> {name:
     the next copy}."""
 
-    def __init__(self, op, n):
-        self.names, self.n, self.cyc = op.registry.rotate, n, {}
+    def __init__(self, names, n):
+        self.names, self.n, self.cyc = names, n, {}
 
     def bind(self, inputs):
         for k in self.names:
@@ -143,13 +146,14 @@ def _inputs(op, dims, seed):
     return op.test(**dims, seed=seed) if op._seeded else op.test(**dims)
 
 
-def tune(op, c, points, out, *, rounds=3, iters=20, ncopies=NCOPIES, log=print, cid=""):
-    """Tune case ``c`` at ``points`` into the table ``out`` (see the module docstring)."""
-    b = _bucket(op)
+def tune(t, c, points, out, *, rounds=3, iters=20, ncopies=NCOPIES, log=print, pid=""):
+    """Tune problem ``c`` of ``t`` at ``points`` into the table ``out`` (see the module
+    docstring)."""
+    op, b = t.op, t.bucket
     known = {k: v for k, v in c.items() if v is not None and k != b}
-    log(f"{op.name} {cid} {known}: {len(op.configs(dict(c, **{b: points[0]})))} candidates, "
-        f"{ncopies} copies of {list(op.registry.rotate)}")
-    rot = _Rotation(op, ncopies)
+    log(f"{op.name} {pid} {known}: {len(op.configs(dict(c, **{b: points[0]})))} candidates, "
+        f"{ncopies} copies of {list(t.rotate)}")
+    rot = _Rotation(t.rotate, ncopies)
     for p in points:
         dims = dict(c, **{b: p})
         cfgs = op.configs(dims)
@@ -183,12 +187,12 @@ def tune(op, c, points, out, *, rounds=3, iters=20, ncopies=NCOPIES, log=print, 
             if name in bad or name in na:
                 continue
             us = sorted(times[name])[len(times[name]) // 2]
-            rows.append(dict({k: dims[k] for k in _keys(op)}, **{b: p}, config=name,
+            rows.append(dict({k: dims[k] for k in t.keys}, **{b: p}, config=name,
                              us=f"{us:.1f}", **{k: f"{v:.1e}" for k, v in metrics[name].items()}))
         rows.sort(key=lambda r: float(r["us"]))
         if rows:
-            _table.merge(out, rows, fields(op, [k for k in rows[0] if k not in
-                                                 (*_keys(op), b, "config", "us")]))
+            _table.merge(out, rows, t.fields([k for k in rows[0] if k not in
+                                              (*t.keys, b, "config", "us")]))
         top = " | ".join(f"{r['config']} {r['us']}" for r in rows[:3])
         msgs = [f"{n}: {m}" for n, m in bad.items()]
         kinds = sorted(set(na.values()))
@@ -205,10 +209,10 @@ def _points(op, c, path):
     return pts
 
 
-def show(op, c, path=None, out=print):
+def show(t, c, path=None, out=print):
     """Markdown, per point: the fastest config, the fastest of each solver kind
     and the capture pick when it differs."""
-    b, path = _bucket(op), path or op.registry.table
+    op, b, path = t.op, t.bucket, path or t.table
     pts = _points(op, c, path)
     kinds = [k for k in op.impls if any(cfg["kind"] == k for _, cs in pts for _, cfg in cs)]
     out(f"| {b} | best | us | " + " | ".join(f"best {k} | us" for k in kinds)
@@ -228,29 +232,29 @@ def show(op, c, path=None, out=print):
         out(f"| {n} | {op.name_of(best)} | {us0:.1f} | " + " | ".join(cells) + f" | {cap} |")
 
 
-def verify(op, c, points, path=None, *, iters=20, ncopies=NCOPIES, log=print):
+def verify(t, c, points, path=None, *, iters=20, ncopies=NCOPIES, log=print):
     """``op(...)`` (the table's pick) at each bucket value, also between tuned points:
     the check against ``<op>_ref`` and the time vs the table entry."""
-    b, path = _bucket(op), path or op.registry.table
+    op, b, path = t.op, t.bucket, path or t.table
     pts = dict(_points(op, c, path))
-    rot = _Rotation(op, ncopies)
-    for t in points:
-        dims = dict(c, **{b: t})
-        inputs = _inputs(op, dims, 7 + t)
+    rot = _Rotation(t.rotate, ncopies)
+    for v in points:
+        dims = dict(c, **{b: v})
+        inputs = _inputs(op, dims, 7 + v)
         rot.bind(inputs)
         expected = op.ref(**inputs)
         cfg = op.pick(dims, table=path)
-        hints = {k: dims[k] for k in _keys(op) if k not in op._ref_names}
+        hints = {k: dims[k] for k in t.keys if k not in op._ref_names}
         fn = lambda over: op(**{**inputs, **over}, table=path, **hints)  # noqa: E731
         try:
             m = _check(op, fn({}), expected, inputs)
-            msg = "".join(f" | {k} {v:.1e}" for k, v in m.items())
+            msg = "".join(f" | {k} {x:.1e}" for k, x in m.items())
         except AssertionError as ex:
             msg = f" | BAD {ex}"
         us = time_cold(lambda: fn(rot.next()), iters=iters)
-        n = next((p for p in sorted(pts) if p >= t), max(pts))
+        n = next((p for p in sorted(pts) if p >= v), max(pts))
         tus = next(u for u, cc in pts[n] if cc == cfg)
-        log(f"{b} {t:6} -> point {n:6}: {op.name_of(cfg):24s} {us:8.1f} us (table {tus:8.1f})"
+        log(f"{b} {v:6} -> point {n:6}: {op.name_of(cfg):24s} {us:8.1f} us (table {tus:8.1f})"
             + msg)
 
 
@@ -307,17 +311,16 @@ def lock_gpus(gpus):
     return held
 
 
-def tune_all(spec, op, cids, gpus, per_job, points, out_dir, *, rounds=3, iters=20,
+def tune_all(spec, t, pids, gpus, per_job, points, out_dir, *, rounds=3, iters=20,
              ncopies=NCOPIES, sets=(), force=False, log=print):
-    """Every case of ``cids`` on ``per_job`` GPUs (GPU g of the group takes
-    points[g::per_job]); groups of ``gpus`` take the next case when they free up. Then
-    the BAD lines of all logs and a merged <out_dir>/<table name>.new.csv."""
+    """Every problem of ``pids`` on ``per_job`` GPUs (GPU g of the group takes
+    points[g::per_job]); groups of ``gpus`` take the next problem when they free up.
+    Then the BAD lines of all logs and a merged <out_dir>/<table name>.new.csv."""
     if len(gpus) < per_job:
         raise SystemExit(f"--per-job {per_job} needs at least that many --gpus ({gpus})")
-    known = cases(op)
-    for cid in cids:
-        if cid not in known:
-            raise SystemExit(f"case {cid!r}: one of {list(known)}")
+    for pid in pids:
+        if pid not in t.problems:
+            raise SystemExit(f"problem {pid!r}: one of {list(t.problems)}")
     if not force:
         busy = busy_gpus(gpus)
         if busy:
@@ -327,7 +330,7 @@ def tune_all(spec, op, cids, gpus, per_job, points, out_dir, *, rounds=3, iters=
     os.makedirs(out_dir, exist_ok=True)
     groups = [gpus[i:i + per_job] for i in range(0, len(gpus) - per_job + 1, per_job)]
     env = dict(os.environ, AITER_LOG_LEVEL=os.environ.get("AITER_LOG_LEVEL", "ERROR"))
-    todo, running, failed = list(cids), {}, []
+    todo, running, failed = list(pids), {}, []
     t0 = time.time()
     while todo or running:
         for gi, procs in list(running.items()):
@@ -337,14 +340,14 @@ def tune_all(spec, op, cids, gpus, per_job, points, out_dir, *, rounds=3, iters=
         for gi, grp in enumerate(groups):
             if gi in running or not todo:
                 continue
-            cid = todo.pop(0)
+            pid = todo.pop(0)
             procs = []
             for g, gpu in enumerate(grp):
                 shard = points[g::per_job]
                 if not shard:
                     continue
-                stem = os.path.join(out_dir, f"{cid}_{g}")
-                cmd = [sys.executable, "-m", "pyhip.kit", "tune", spec, cid, "-t",
+                stem = os.path.join(out_dir, f"{pid}_{g}")
+                cmd = [sys.executable, "-m", "pyhip.kit", "tune", spec, pid, "-t",
                        *map(str, shard), "--out", stem + ".csv", "--iters", str(iters),
                        "--rounds", str(rounds), "--copies", str(ncopies)]
                 if sets:
@@ -354,7 +357,7 @@ def tune_all(spec, op, cids, gpus, per_job, points, out_dir, *, rounds=3, iters=
                         cmd, stdout=fh, stderr=subprocess.STDOUT,
                         env=dict(env, HIP_VISIBLE_DEVICES=str(gpu)))))
             running[gi] = procs
-            log(f"{cid}: GPUs {grp}, {len(points)} points")
+            log(f"{pid}: GPUs {grp}, {len(points)} points")
         time.sleep(2)
     log(f"all jobs done in {(time.time() - t0) / 60:.1f} min")
     logs = sorted(glob.glob(os.path.join(out_dir, "*_[0-9]*.log")))
@@ -364,14 +367,14 @@ def tune_all(spec, op, cids, gpus, per_job, points, out_dir, *, rounds=3, iters=
     if failed:
         print(f"FAILED processes (see their logs): {failed}")
     parts = sorted(glob.glob(os.path.join(out_dir, "*_[0-9]*.csv")))
-    stem = os.path.splitext(os.path.basename(op.registry.table or f"{op.name}.csv"))[0]
+    stem = os.path.splitext(os.path.basename(t.table or f"{t.op.name}.csv"))[0]
     new = os.path.join(out_dir, f"{stem}.new.csv")
     if os.path.exists(new):
         os.remove(new)
     if parts:
         merge(parts, new)
-    print(f"next: python -m pyhip.kit compare {op.registry.table} {new}\n"
-          f"      cp {new} {op.registry.table}")
+    print(f"next: python -m pyhip.kit compare {t.table} {new}\n"
+          f"      cp {new} {t.table}")
     return 1 if failed else 0
 
 
@@ -380,16 +383,17 @@ def tune_all(spec, op, cids, gpus, per_job, points, out_dir, *, rounds=3, iters=
 def parser(prog="python -m pyhip.kit"):
     p = argparse.ArgumentParser(prog=prog, description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("cmd", choices=["cases", "candidates", "tune", "merge", "show", "verify",
+    p.add_argument("cmd", choices=["problems", "candidates", "tune", "merge", "show", "verify",
                                    "tune-all", "compare"])
-    p.add_argument("op", help="<module>:<op> (compare: the old table)")
-    p.add_argument("args", nargs="*", help="a case (candidates / tune / show / verify), cases "
-                                           "(tune-all; default all), tables (merge, compare)")
+    p.add_argument("spec", help="<module>:<Tuning name> (compare: the old table)")
+    p.add_argument("args", nargs="*", help="a problem (candidates / tune / show / verify), "
+                                           "problems (tune-all; default all), tables (merge, "
+                                           "compare)")
     p.add_argument("-t", "--points", nargs="+", default=None,
-                   help="bucket values (default: the registry's points; verify: a few)")
+                   help="bucket values (default: the tuning's points; verify: a few)")
     p.add_argument("--set", nargs="+", default=[], metavar="NAME=VALUE",
-                   help="override dim values of the case")
-    p.add_argument("--table", default=None, help="the table (default: the registry's)")
+                   help="override dim values of the problem")
+    p.add_argument("--table", default=None, help="the table (default: the tuning's)")
     p.add_argument("--out", default=None, help="tune: output table (default --table); "
                                                "tune-all: output directory")
     p.add_argument("--iters", type=int, default=20)
@@ -397,7 +401,7 @@ def parser(prog="python -m pyhip.kit"):
     p.add_argument("--copies", type=int, default=NCOPIES,
                    help="copies of the rotate inputs the timed calls cycle through")
     p.add_argument("--gpus", default="0-7", help="tune-all: GPUs, e.g. 0-7 or 0,1,2,3")
-    p.add_argument("--per-job", type=int, default=4, help="tune-all: GPUs per case")
+    p.add_argument("--per-job", type=int, default=4, help="tune-all: GPUs per problem")
     p.add_argument("--force", action="store_true", help="tune-all: skip the idle-GPU check")
     return p
 
@@ -407,35 +411,35 @@ def main(argv=None, prog="python -m pyhip.kit"):
     if a.cmd == "compare":
         if len(a.args) != 1:
             raise SystemExit("compare OLD.csv NEW.csv")
-        return _table.compare(a.op, a.args[0])
-    op = resolve(a.op)
+        return _table.compare(a.spec, a.args[0])
+    t = resolve(a.spec)
+    op = t.op
     log = lambda s: print(f"[{time.strftime('%H:%M:%S')}] {s}", flush=True)  # noqa: E731
-    path = a.table or op.registry.table
+    path = a.table or t.table
     pts = [_guess(v) for v in a.points] if a.points else None
-    if a.cmd == "cases":
-        for cid, c in cases(op).items():
-            print(cid, {k: v for k, v in c.items() if v is not None})
+    if a.cmd == "problems":
+        for pid, c in t.problems.items():
+            print(pid, {k: v for k, v in c.items() if v is not None})
         return 0
     if a.cmd == "merge":
         return merge(a.args, path)
     if a.cmd == "tune-all":
-        return tune_all(a.op, op, a.args or list(cases(op)), gpu_list(a.gpus), a.per_job,
-                        pts or list(op.registry.points or ()), a.out or "/tmp/kit_tune",
+        return tune_all(a.spec, t, a.args or list(t.problems), gpu_list(a.gpus), a.per_job,
+                        pts or list(t.points), a.out or "/tmp/kit_tune",
                         rounds=a.rounds, iters=a.iters, ncopies=a.copies, sets=a.set,
                         force=a.force, log=log)
     if len(a.args) != 1:
-        raise SystemExit(f"{a.cmd}: one case, one of {list(cases(op))}")
-    c = case(op, a.args[0], a.set)
+        raise SystemExit(f"{a.cmd}: one problem, one of {list(t.problems)}")
+    c = t.problem(a.args[0], a.set)
     if a.cmd == "candidates":
-        b = _bucket(op)
-        for cfg in op.configs(dict(c, **{b: (pts or op.registry.points or [None])[0]})):
+        for cfg in op.configs(dict(c, **{t.bucket: (pts or t.points or [None])[0]})):
             print(op.name_of(cfg))
     elif a.cmd == "tune":
-        tune(op, c, pts or list(op.registry.points), a.out or path, rounds=a.rounds,
-             iters=a.iters, ncopies=a.copies, log=log, cid=a.args[0])
+        tune(t, c, pts or list(t.points), a.out or path, rounds=a.rounds, iters=a.iters,
+             ncopies=a.copies, log=log, pid=a.args[0])
     elif a.cmd == "show":
-        show(op, c, path)
+        show(t, c, path)
     else:
-        verify(op, c, pts or [1, 3, 20, 100, 300, 1000, 3000, 10000], path, iters=a.iters,
+        verify(t, c, pts or [1, 3, 20, 100, 300, 1000, 3000, 10000], path, iters=a.iters,
                ncopies=a.copies, log=log)
     return 0

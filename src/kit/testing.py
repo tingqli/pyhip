@@ -1,20 +1,24 @@
-"""pytest adapter of ``pyhip.kit``.
+"""pytest adapter of ``pyhip.kit``: the problems to test are passed in.
 
+    from pyhip.kit import dim
     from pyhip.kit.testing import op_tests
-    test_ops = op_tests(ops)          # in a test module; ops: a kit.Registry
 
-generates, for every op with an ``<op>_test`` and every case of its grid:
+    test_axpy = op_tests(ops.axpy, ops.axpy.problems("dtype", dim("n", (1, 1000), id="n{}")))
 
-* ``<op>-<case>-dims``: ``<op>_dims(**inputs)`` agrees with the case (when the op has
-  ``<op>_dims``);
-* ``<op>-<case>-<config name>`` for every config that should run the case: ``run`` it
-  on the case's inputs and ``<op>_check`` it against ``<op>_ref`` (default:
-  ``torch.testing.assert_close``). With a tuned table (``Registry(table=)``) these are
-  the tuned configs of the case's key and point (``op.tuned``: what the dispatch can
-  pick; no rows, no items); without one, every grid point (all must run).
+generates, for every problem (``op.problems(...)``: [(id, problem)]):
 
-Select with ``-k``, e.g. ``-k "tp8 and tiled"``. Items run case by case; the inputs and
-the reference result of the current case are computed once and kept until the next.
+* ``<op>-<problem>-dims``: ``<op>_dims(**inputs)`` agrees with the problem (when the op
+  has ``<op>_dims``);
+* ``<op>-<problem>-<config name>`` for every config that should run the problem: ``run``
+  it on the problem's inputs (``<op>_test``) and ``<op>_check`` it against ``<op>_ref``
+  (default: ``torch.testing.assert_close``). With a tuned table (``table=``, default the
+  registry's) these are the tuned configs of the problem's key and point (``op.tuned``:
+  what the dispatch can pick; no rows, no items); with ``table=None``, every grid point
+  (all must run).
+
+Select with ``-k``, e.g. ``-k "tp8 and tiled"``. Items run problem by problem; the inputs
+and the reference result of the current problem are computed once and kept until the
+next.
 """
 
 import inspect
@@ -22,6 +26,8 @@ import inspect
 import pytest
 
 __all__ = ["op_tests", "assert_close"]
+
+_DEFAULT = object()  # table=: the registry's
 
 
 def assert_close(out, expected, /, **_):
@@ -34,45 +40,50 @@ def assert_close(out, expected, /, **_):
     torch.testing.assert_close(out, expected)
 
 
-def op_tests(ops):
-    """A pytest test function over every (op, case, config) of ``ops`` (a ``Registry``,
-    or any mapping {name: Op})."""
+def op_tests(op, problems, *, table=_DEFAULT):
+    """A pytest test function over every (problem, config) of ``op``; ``problems``:
+    [(id, problem)] (``op.problems(...)``), every dim without an ``<op>_test`` default
+    set."""
+    if op.test is None:
+        raise TypeError(f"{op.name}: op_tests needs {op.name}_test (problem -> inputs)")
+    path = op.registry.table if table is _DEFAULT else table
     items = []
-    for op in ops.values():
-        if op.test is None:
-            continue
-        for cid, case in op.cases():
-            pre = f"{op.name}-{cid}" if cid else op.name
-            if op.dims is not None:
-                items.append(pytest.param(op, cid, case, None, id=f"{pre}-dims"))
-            tuned = op.registry.table is not None
-            for cfg in op.tuned(case) if tuned else op.configs(case):
-                items.append(pytest.param(op, cid, case, cfg, id=f"{pre}-{op.name_of(cfg)}"))
+    for pid, prob in problems:
+        missing = [n for n in op.dim_names if prob.get(n) is None and n not in op._test_defaults]
+        if missing:
+            raise TypeError(f"{op.name} problem {pid!r}: dims {missing} unset")
+        pre = f"{op.name}-{pid}" if pid else op.name
+        if op.dims is not None:
+            items.append(pytest.param(op, pid, prob, None, id=f"{pre}-dims"))
+        cfgs = op.tuned(prob, table=path) if path is not None else op.configs(prob)
+        for cfg in cfgs:
+            items.append(pytest.param(op, pid, prob, cfg, id=f"{pre}-{op.name_of(cfg)}"))
     current = {}
 
-    def prepared(op, cid, case):
-        key = (op.name, cid)
+    def prepared(op, pid, prob):
+        key = (op.name, pid)
         if key not in current:
-            current.clear()  # one case at a time: inputs can be large
-            inputs = op.test(**case)
+            current.clear()  # one problem at a time: inputs can be large
+            inputs = op.test(**prob)
             try:
                 inspect.signature(op.ref).bind(**inputs)
             except TypeError as e:
-                raise TypeError(f"{op.name}_test{case} returned arguments {op.name}_ref does "
+                raise TypeError(f"{op.name}_test{prob} returned arguments {op.name}_ref does "
                                 f"not take: {e}") from None
             current[key] = inputs, op.ref(**inputs)
         return current[key]
 
-    @pytest.mark.parametrize("op, cid, case, cfg", items)
-    def test_ops(op, cid, case, cfg):
-        inputs, expected = prepared(op, cid, case)
+    @pytest.mark.parametrize("op, pid, prob, cfg", items)
+    def test_op(op, pid, prob, cfg):
+        inputs, expected = prepared(op, pid, prob)
         if cfg is None:
             got = op.dims(**inputs)
-            bad = {k: (v, case.get(k, "<not a dim>")) for k, v in got.items()
-                   if k not in case or case[k] != v}
-            assert not bad, f"{op.name}_dims disagrees with the case, {{name: (dims, case)}}: {bad}"
+            bad = {k: (v, prob.get(k, "<not a dim>")) for k, v in got.items()
+                   if k not in prob or prob[k] != v}
+            assert not bad, (f"{op.name}_dims disagrees with the problem, {{name: (dims, "
+                             f"problem)}}: {bad}")
             return
         out = op.run(cfg, **inputs)
         (op.check or assert_close)(out, expected, **inputs)
 
-    return test_ops
+    return test_op

@@ -65,8 +65,8 @@ Conventions:
   optionally ``**over`` (free overrides, e.g. for experiments).
 * ``<op>_test(...)`` returns the interface arguments (a dict) of one problem. Its
   parameter names but ``seed`` are the op's dims, the names ``meta`` / ``dims`` and the
-  tuned table speak; its ``@dim`` grid gives the test cases. ``seed``, when present, is
-  keyword-only with a default.
+  tuned table speak; its ``@dim`` marks name values of dims (``op.problems`` builds
+  problems from them). ``seed``, when present, is keyword-only with a default.
 * ``<op>_check(out, expected, **inputs)`` raises when ``out`` is wrong; it may return a
   dict of error metrics. Default: ``torch.testing.assert_close``. The first two
   arguments come by position: name them apart from the interface's parameters.
@@ -329,13 +329,19 @@ class _Axis(_Mark):
 
 
 class dim(_Axis):
-    """Values of problem dims, on ``<op>_test``: ``@dim("act", ("silu", "gelu"),
-    id="{}")``. A sequence or a dict of values (see ``_Axis``)."""
+    """Values of problem dims. On ``<op>_test``: named values of a dim (``op.problems``
+    picks from them by the axis name); in ``op.problems``: an ad hoc axis.
+    ``@dim("act", ("silu", "gelu"), id="{}")``; several dims at once take a dict, and on
+    ``<op>_test`` a ``name``: ``@dim("m, n", {"sq": (64, 64)}, name="shape")``. A
+    sequence or a dict of values (see ``_Axis``)."""
 
-    def __init__(self, names, values, id=None):
+    def __init__(self, names, values, id=None, name=None):
         if callable(values):
             raise TypeError(f"dim {names!r}: values must be a sequence or a dict")
         super().__init__(names, values, id)
+        if name is not None and not str(name).isidentifier():
+            raise TypeError(f"dim {names!r}: bad name {name!r}")
+        self.name = name if name is not None or len(self.names) > 1 else self.names[0]
 
 
 class knob(_Axis):
@@ -470,7 +476,7 @@ class Op:
         fns = {}
         for k, v in dict(name=name, ref=ref, test=None, check=None, dims=None,
                          impls=types.MappingProxyType(fns), dim_names=(), _imp={}, _fns=fns,
-                         _axes=(), _test_defaults={}, _seeded=False, _ref_params=ref_params,
+                         _axes={}, _test_defaults={}, _seeded=False, _ref_params=ref_params,
                          _ref_names=frozenset(p.name for p in ref_params),
                          _registry=registry if registry is not None else Registry(),
                          _dget=_getter(()), _blank={}, _tables={}, _memo={},
@@ -506,18 +512,22 @@ class Op:
             raise TypeError(f"{name}_test: only @dim marks (a solver's options are @knob)")
         tps = [p for p in tps if p is not seed]
         dims = tuple(p.name for p in tps)
-        axes = tuple(_marks(test, dim))
-        grid = [n for p in axes for n in p.names]
-        if _unknown(grid, dims) or len(set(grid)) < len(grid):
-            raise TypeError(f"{name}_test: the @dim names {grid} must be distinct dims of "
+        axes = {}
+        for p in _marks(test, dim):
+            if p.name is None:
+                raise TypeError(f"{name}_test: {p!r} needs name= (problems pick its values by "
+                                "the axis name)")
+            if p.name in axes:
+                raise TypeError(f"{name}_test: two @dim axes named {p.name!r}")
+            axes[p.name] = p
+        names = [n for p in axes.values() for n in p.names]
+        if _unknown(names, dims) or len(set(names)) < len(names):
+            raise TypeError(f"{name}_test: the @dim names {names} must be distinct dims of "
                             f"{_sig(name, 'test', test)}")
-        missing = [p.name for p in tps if p.default is p.empty and p.name not in grid]
-        if missing:
-            raise TypeError(f"{name}_test: parameter(s) {missing} need a default or a @dim")
         defaults = {p.name: p.default for p in tps if p.default is not p.empty}
-        for k, v in dict(test=test, dim_names=dims, _axes=axes, _test_defaults=defaults,
-                         _seeded=seed is not None, _dget=_getter(dims),
-                         _blank=dict.fromkeys(dims)).items():
+        for k, v in dict(test=test, dim_names=dims, _axes=types.MappingProxyType(axes),
+                         _test_defaults=defaults, _seeded=seed is not None,
+                         _dget=_getter(dims), _blank=dict.fromkeys(dims)).items():
             object.__setattr__(self, k, v)
 
     def _add_helper(self, role, f):
@@ -572,17 +582,42 @@ class Op:
                     raise TypeError(f"{self.name}_{imp.kind}: {vals} prints as {name!r}, which "
                                     f"reads back as {back}")
 
-    def cases(self):
-        """[(id, case)] of the ``<op>_test`` grid: ``case`` holds every ``<op>_test``
-        argument (defaults filled in), ``id`` joins the axes' ids with "-"."""
-        if self.test is None:
-            return []
+    def problems(self, *axes):
+        """[(id, problem)]: the Cartesian product of ``axes``, the first outermost. An axis
+        is the name of a ``@dim`` of ``<op>_test`` (all its values), (name, [ids]) (those
+        values, in that order) or a ``dim(...)`` (ad hoc). A problem holds every dim: the
+        axes' values, else the ``<op>_test`` default, else None. The id joins the axes'
+        ids with "-"."""
+        pts, seen = [], []
+        for a in axes:
+            if isinstance(a, dim):
+                p = a
+                pts.append(p.points())
+            else:
+                key, ids = (a, None) if isinstance(a, str) else a
+                p = self._axes.get(key)
+                if p is None:
+                    raise KeyError(f"{self.name}: no @dim {key!r} on {self.name}_test; axes: "
+                                   f"{list(self._axes)}")
+                got = dict(p.points())
+                if ids is not None:
+                    ids = [str(i) for i in ([ids] if isinstance(ids, (str, int)) else ids)]
+                    bad = [i for i in ids if i not in got]
+                    if bad:
+                        raise KeyError(f"{self.name}: {key!r} has no value {bad}; ids: "
+                                       f"{list(got)}")
+                pts.append([(i, got[i]) for i in (ids if ids is not None else got)])
+            seen += p.names
+        bad = _unknown(seen, self.dim_names)
+        if bad or len(set(seen)) < len(seen):
+            raise TypeError(f"{self.name}: the axes set {seen}: each a dim of {self.name}_test "
+                            f"{list(self.dim_names)} at most once")
         out = []
-        for combo in itertools.product(*(p.points() for p in self._axes)):
-            case = dict(self._test_defaults)
+        for combo in itertools.product(*pts):
+            prob = dict(self._test_defaults)
             for _, vals in combo:
-                case.update(vals)
-            out.append(("-".join(tok for tok, _ in combo), case))
+                prob.update(vals)
+            out.append(("-".join(tok for tok, _ in combo), {**self._blank, **prob}))
         return out
 
     def _split(self, cfg):
@@ -824,32 +859,20 @@ class Registry(Mapping):
     to it.
 
     ``name``: for reports. ``table`` / ``bucket`` / ``relax``: the tuned table of the
-    ops, its bucketed dim and the key substitutions tried when a key has no
-    rows (dispatch, see the module docstring). For ``kit.tune``: ``points``, the bucket
-    values to tune; ``unkeyed``, dims the table does not store (they do
-    not change which config is fastest, e.g. a seed); ``rotate``, the interface
-    arguments the timed calls cycle through copies of (``kit.timing.copies``)."""
+    ops, its bucketed dim and the key substitutions tried when a key has no rows
+    (dispatch, see the module docstring). Tuning is declared apart: ``kit.tune.Tuning``."""
 
-    def __init__(self, name=None, *, table=None, bucket=None, relax=None, points=None,
-                 unkeyed=(), rotate=()):
+    def __init__(self, name=None, *, table=None, bucket=None, relax=None):
         if relax is not None and not isinstance(relax, dict):
             raise TypeError(f"Registry: relax is a dict {{name: value}}, got {relax!r}")
-        for k, v in (("unkeyed", unkeyed), ("rotate", rotate)):
-            if isinstance(v, str) or not all(isinstance(n, str) for n in v):
-                raise TypeError(f"Registry: {k} is a sequence of names, got {v!r}")
         self._ops = {}
         self._name, self._table, self._bucket = name, table, bucket
         self._relax = dict(relax or {})
-        self._points = tuple(points) if points is not None else None
-        self._unkeyed, self._rotate = tuple(unkeyed), tuple(rotate)
 
     name = property(lambda self: self._name)
     table = property(lambda self: self._table)
     bucket = property(lambda self: self._bucket)
     relax = property(lambda self: self._relax)
-    points = property(lambda self: self._points)
-    unkeyed = property(lambda self: self._unkeyed)
-    rotate = property(lambda self: self._rotate)
 
     def register(self, f):
         """Add ``f`` to its op, by its name (see the module docstring); return ``f``."""

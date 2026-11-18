@@ -1,17 +1,17 @@
 """A/B timing and correctness of an op's configs by name (torch; ``python -m pyhip.kit``).
 
-    python -m pyhip.kit ab    a8w4:moe ep8-silu -t 1024 4096 -v "ep3k m64" "pf1=ep3k m64:g2.pf=1"
-    python -m pyhip.kit check a8w4:moe tp8-silu -t 1 77 4096 -v @table "tp1k bcm2 ks1" --graph
+    python -m pyhip.kit ab    a8w4.tune:TUNING ep8-silu -t 1024 4096 -v "ep3k m64" "pf1=ep3k m64:g2.pf=1"
+    python -m pyhip.kit check a8w4.tune:TUNING tp8-silu -t 1 77 4096 -v @table "tp1k bcm2 ks1" --graph
 
-The case and the inputs are ``kit.tune``'s: a tune case (``--set`` overrides), the bucket
-value per ``-t``, ``<op>_test`` with seed ``--seed`` + value (+ 1000 * sample). The
-answer is ``<op>_ref``, the comparison ``<op>_check`` (its first metric is the column
-reported, e.g. cos). The timed calls cycle through copies of the registry's ``rotate``
-inputs (``kit.timing``).
+The problem and the inputs are ``kit.tune``'s (a ``Tuning``): a tune problem (``--set``
+overrides), the bucket value per ``-t``, ``<op>_test`` with seed ``--seed`` + value
+(+ 1000 * sample). The answer is ``<op>_ref``, the comparison ``<op>_check`` (its first
+metric is the column reported, e.g. cos). The timed calls cycle through copies of the
+tuning's ``rotate`` inputs (``kit.timing``).
 
 variant spec: [label=]<base>[:<k>=<v>,...]  or  [label=]py:<module | file.py>:<func>
-  base      a config name (``python -m pyhip.kit candidates <op> <case>``) or "@table" (the
-            tuned table's pick at each bucket value)
+  base      a config name (``python -m pyhip.kit candidates <spec> <problem>``) or
+            "@table" (the tuned table's pick at each bucket value)
   k=v       overrides passed to a solver with ``**over`` (v: int, float, true /
             false, none, a/b/c a tuple, "-", anything else a string)
   py        func(**the interface arguments) -> the output: any pipeline, e.g. an
@@ -49,7 +49,7 @@ import torch
 
 from .timing import MIN_COPIES, MIN_NOISE, NCOPIES, PROTOCOLS, Timer, copies, interleaved
 from .timing import noise_band, verdict
-from .tune import _bucket, _check, _inputs, case, resolve as resolve_op
+from .tune import _check, _inputs, resolve as resolve_tuning
 
 __all__ = ["Variant", "Resolved", "parse_variant", "resolve", "check_protocols", "ab", "check",
            "run_meta", "meta_line", "Recorder", "md_table", "fmt", "main"]
@@ -153,7 +153,7 @@ def resolve(op, v, dims):
         return Resolved(v.label, v.spec, v.spec, lambda inputs: f(**inputs))
     try:
         cfg = op.pick(dims) if v.base == "@table" else op.parse(v.base)
-    except ValueError as e:  # no tuned config for the case
+    except ValueError as e:  # no tuned config for the problem
         return str(e)
     cfg = {**cfg, **v.overrides}
     try:
@@ -298,22 +298,21 @@ def _same(a, b):
 
 
 class _Inputs:
-    """inputs(value, seed) -> the interface arguments: ``<op>_test`` on the case with the
-    bucket set, or the caller's function."""
+    """inputs(value, seed) -> the interface arguments: ``<op>_test`` on the problem with
+    the bucket set, or the caller's function."""
 
-    def __init__(self, op, c, fn=None):
-        self.op, self.c, self.fn, self.b = op, c, fn, _bucket(op)
+    def __init__(self, t, c, fn=None):
+        self.op, self.c, self.fn, self.b = t.op, c, fn, t.bucket
 
-    def dims(self, t):
-        return dict(self.c, **{self.b: t})
+    def dims(self, v):
+        return dict(self.c, **{self.b: v})
 
-    def __call__(self, t, seed):
-        return self.fn(t, seed) if self.fn else _inputs(self.op, self.dims(t), seed)
+    def __call__(self, v, seed):
+        return self.fn(v, seed) if self.fn else _inputs(self.op, self.dims(v), seed)
 
 
-def _rotated(op, inputs, n):
-    """[{name: copy}] of the registry's rotate inputs (the first: the inputs' own)."""
-    names = op.registry.rotate
+def _rotated(names, inputs, n):
+    """[{name: copy}] of the ``names`` inputs (the first: the inputs' own)."""
     cs = {k: copies(inputs[k], n) for k in names}
     return [{k: cs[k][i] for k in names} for i in range(n)]
 
@@ -351,15 +350,17 @@ def _correctness(op, res, inputs, ref, bitwise):
     return ok, notes, name
 
 
-def ab(op, c, points, specs, *, protocols=("coldrot",), rounds=5, iters=16, samples=1, seed=7,
+def ab(t, c, points, specs, *, protocols=("coldrot",), rounds=5, iters=16, samples=1, seed=7,
        dup=True, allow_biased=False, ref=True, bitwise=False, diff_tol=None, ncopies=NCOPIES,
        rec=None, inputs=None, annotate=None, alias=None, unit=None, describe=None):
-    """A/B timing of the variants ``specs`` on case ``c`` (see the module docstring).
-    Hooks: ``inputs(value, seed)`` -> interface arguments (default ``<op>_test``);
-    ``annotate(inputs, resolved)`` -> (heading text, record fields) of a sample;
-    ``alias`` for base names; ``unit``: the bucket's name in headings."""
+    """A/B timing of the variants ``specs`` on problem ``c`` of the ``Tuning`` ``t`` (see
+    the module docstring). Hooks: ``inputs(value, seed)`` -> interface arguments
+    (default ``<op>_test``); ``annotate(inputs, resolved)`` -> (heading text, record
+    fields) of a sample; ``alias`` for base names; ``unit``: the bucket's name in
+    headings."""
+    op = t.op
     rec = rec or Recorder(None, None, run_meta("ab"))
-    gen = _Inputs(op, c, inputs)
+    gen = _Inputs(t, c, inputs)
     unit = unit or gen.b
     variants = [parse_variant(op, s, alias) for s in specs]
     labels = [v.label for v in variants]
@@ -378,7 +379,7 @@ def ab(op, c, points, specs, *, protocols=("coldrot",), rounds=5, iters=16, samp
                         allow_biased)
     rot = [p for p in protocols if p in ("coldrot", "rotate")]
     rec.text((describe or f"{op.name} {c}") + f"\n\nprotocol {', '.join(protocols)}"
-             + (f" ({ncopies} copies of {list(op.registry.rotate)})" if rot else "")
+             + (f" ({ncopies} copies of {list(t.rotate)})" if rot else "")
              + f", {rounds} rounds x {iters} calls; us = median of the round medians; "
              f"verdict only beyond the noise band (max(|{dup_label or 'copy'} delta|, half the "
              f"base's round spread, {MIN_NOISE}%))\n")
@@ -388,8 +389,8 @@ def ab(op, c, points, specs, *, protocols=("coldrot",), rounds=5, iters=16, samp
             sd = seed + T + 1000 * s
             inp = gen(T, sd)
             if timer is None:  # the rotated inputs are the same objects at every value
-                timer = Timer(_rotated(op, inp, ncopies) if rot
-                              else [{k: inp[k] for k in op.registry.rotate}])
+                timer = Timer(_rotated(t.rotate, inp, ncopies) if rot
+                              else [{k: inp[k] for k in t.rotate}])
             res = [r for r in plan[T] if not isinstance(r, str)]
             ok, notes, mname = _correctness(op, res, inp, ref, bitwise)
             fns = {r.label: (lambda Wc, r=r: r.run({**inp, **Wc})) for r in ok}
@@ -496,12 +497,13 @@ def _graph_replay(op, fn, inputs, replays=5):
     return worst
 
 
-def check(op, c, points, specs, *, seed=7, repeats=5, graph=False, bitwise=False,
+def check(t, c, points, specs, *, seed=7, repeats=5, graph=False, bitwise=False,
           diff_tol=None, rec=None, inputs=None, alias=None, unit=None, describe=None):
-    """Correctness of the variants ``specs`` on case ``c`` (see the module docstring).
-    Returns the number of failed (value, variant) items."""
+    """Correctness of the variants ``specs`` on problem ``c`` of the ``Tuning`` ``t`` (see
+    the module docstring). Returns the number of failed (value, variant) items."""
+    op = t.op
     rec = rec or Recorder(None, None, run_meta("check"))
-    gen = _Inputs(op, c, inputs)
+    gen = _Inputs(t, c, inputs)
     unit = unit or gen.b
     variants = [parse_variant(op, s, alias) for s in specs]
     rec.text((describe or f"{op.name} {c}") + "\n")
@@ -567,8 +569,8 @@ def parser(prog="python -m pyhip.kit"):
     ap = argparse.ArgumentParser(prog=prog, description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("cmd", choices=["ab", "check"])
-    ap.add_argument("op", help="<module>:<op>")
-    ap.add_argument("case", help="a tune case (python -m pyhip.kit cases <op>)")
+    ap.add_argument("spec", help="<module>:<Tuning name>")
+    ap.add_argument("problem", help="a tune problem (python -m pyhip.kit problems <spec>)")
     ap.add_argument("-t", "--points", nargs="+", required=True, help="bucket values")
     ap.add_argument("-v", "--variants", nargs="+", default=["@table"],
                     help="variant specs; the first is the base (default: @table)")
@@ -601,15 +603,15 @@ def main(argv=None, prog="python -m pyhip.kit"):
     a = parser(prog).parse_args(argv)
     from . import _guess
 
-    op = resolve_op(a.op)
-    c = case(op, a.case, a.set)
+    t = resolve_tuning(a.spec)
+    c = t.problem(a.problem, a.set)
     pts = [_guess(v) for v in a.points]
     rec = Recorder(a.out, a.name or a.cmd, run_meta(a.cmd, a, prog))
-    desc = f"{op.name} case {a.case}: {({k: v for k, v in c.items() if v is not None})}"
+    desc = f"{t.op.name} problem {a.problem}: {({k: v for k, v in c.items() if v is not None})}"
     if a.cmd == "ab":
-        return ab(op, c, pts, a.variants, protocols=a.protocol, rounds=a.rounds, iters=a.iters,
+        return ab(t, c, pts, a.variants, protocols=a.protocol, rounds=a.rounds, iters=a.iters,
                   samples=a.samples, seed=a.seed, dup=not a.no_dup, allow_biased=a.allow_biased,
                   ref=not a.no_ref, bitwise=a.bitwise, diff_tol=a.diff_tol, ncopies=a.copies,
                   rec=rec, describe=desc)
-    return 1 if check(op, c, pts, a.variants, seed=a.seed, repeats=a.repeats, graph=a.graph,
+    return 1 if check(t, c, pts, a.variants, seed=a.seed, repeats=a.repeats, graph=a.graph,
                       bitwise=a.bitwise, diff_tol=a.diff_tol, rec=rec, describe=desc) else 0

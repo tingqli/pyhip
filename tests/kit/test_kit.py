@@ -332,29 +332,37 @@ def test_tune(tmp_path, monkeypatch):
     from pyhip.kit import table
     from pyhip.kit import tune as kt
 
-    src = TOY.replace("ops = Registry()", "ops = Registry(table=TABLE, bucket='n', points=(4, 6))")
+    src = TOY.replace("ops = Registry()", "ops = Registry(table=TABLE, bucket='n')") + (
+        "\nfrom pyhip.kit.tune import Tuning\n"
+        "TUNING = Tuning(ops.axpy, problems=ops.axpy.problems('alpha'), bucket='n', "
+        "points=(4, 6))\n")
     mod = types.ModuleType("kit_toy_tune")
     mod.TABLE = str(tmp_path / "tuned.csv")
     exec(compile(src, "toy.py", "exec"), mod.__dict__)
     monkeypatch.setitem(sys.modules, "kit_toy_tune", mod)
-    op = kt.resolve("kit_toy_tune:axpy")
-    assert op is mod.ops.axpy
-    with pytest.raises(SystemExit, match="no op 'nope'"):
-        kt.resolve("kit_toy_tune:nope")
-    with pytest.raises(SystemExit, match="expected <module>:<op>"):
+    t = kt.resolve("kit_toy_tune:TUNING")
+    op = t.op
+    assert t is mod.TUNING and op is mod.ops.axpy and t.table == mod.TABLE
+    with pytest.raises(SystemExit, match="not a pyhip.kit.tune.Tuning"):
+        kt.resolve("kit_toy_tune:ops")
+    with pytest.raises(SystemExit, match="expected <module>:<Tuning name>"):
         kt.resolve("axpy")
-    cases = kt.cases(op)  # the n axis (the bucket) is dropped
-    assert list(cases) == ["a1", "a2"] and cases["a2"] == dict(n=None, alpha=2.0)
-    assert kt.case(op, "a1", ["alpha=3"]) == dict(n=None, alpha=3)
+    assert list(t.problems) == ["a1", "a2"] and t.problems["a2"] == dict(n=None, alpha=2.0)
+    assert t.problem("a1", ["alpha=3"]) == dict(n=None, alpha=3)
     with pytest.raises(SystemExit, match="name in \\['n', 'alpha'\\]"):
-        kt.case(op, "a1", ["seed=5"])  # not a dim
-    with pytest.raises(SystemExit, match="no tune case"):
-        kt.case(op, "a3")
-    assert kt.fields(op, ["err"]) == ["alpha", "n", "config", "us", "err"]
+        t.problem("a1", ["seed=5"])  # not a dim
+    with pytest.raises(SystemExit, match="no tune problem"):
+        t.problem("a3")
+    assert t.fields(["err"]) == ["alpha", "n", "config", "us", "err"]
+    for kw, match in ((dict(bucket="x"), "not a dim"), (dict(keys=("n",)), "keys"),
+                      (dict(rotate=("z",)), "rotate"), (dict(bucket="alpha"), "dispatch"),
+                      (dict(problems=[("p", {}), ("p", {})]), "two problems")):
+        with pytest.raises(TypeError, match=match):
+            kt.Tuning(op, **{**dict(problems=[], bucket="n", points=()), **kw})
     assert kt.gpu_list("0-2,5") == [0, 1, 2, 5]
     monkeypatch.setattr(kt, "time_cold", lambda fn, iters: (fn(), 1.5)[1])
     logs = []
-    kt.tune(op, cases["a1"], [4, 6], mod.TABLE, rounds=2, iters=1, log=logs.append, cid="a1")
+    kt.tune(t, t.problems["a1"], [4, 6], mod.TABLE, rounds=2, iters=1, log=logs.append, pid="a1")
     fields, rows = table.read(mod.TABLE)
     assert fields == ("alpha", "n", "config", "us", "err")
     got = [(r["n"], r["config"]) for r in rows]
@@ -362,7 +370,7 @@ def test_tune(tmp_path, monkeypatch):
         + [("6", c) for c in ("loop", "tiled b2", "queue fast", "queue slow")]  # b4 can't run 6
     assert rows[0]["us"] == "1.5" and rows[0]["alpha"] == "1.0" and float(rows[0]["err"]) == 0
     assert "(1 n/a: AssertionError)" in logs[-1]
-    assert [op.name_of(c) for c in op.tuned(dict(cases["a1"], n=5))] == [
+    assert [op.name_of(c) for c in op.tuned(dict(t.problems["a1"], n=5))] == [
         "loop", "tiled b2", "queue fast", "queue slow"]  # the dispatch reads what tune wrote
 
 
@@ -373,14 +381,16 @@ def test_bench(tmp_path, monkeypatch):
     import torch
 
     from pyhip.kit import bench as kb
+    from pyhip.kit import tune as kt
 
-    src = TOY.replace("ops = Registry()", "ops = Registry(table=TABLE, bucket='n', points=(4, 6))")
+    src = TOY.replace("ops = Registry()", "ops = Registry(table=TABLE, bucket='n')")
     mod = types.ModuleType("kit_toy_bench")
     mod.TABLE = str(tmp_path / "tuned.csv")
     with open(mod.TABLE, "w") as f:
         f.write("alpha,n,config,us,err\n1.0,4,loop,2.0,0\n1.0,4,tiled b4,1.0,0\n")
     exec(compile(src, "toy.py", "exec"), mod.__dict__)
     op = mod.ops.axpy
+    t = kt.Tuning(op, problems=op.problems("alpha"), bucket="n", points=(4, 6))
     case = dict(n=None, alpha=1.0)
 
     # variants: [label=]base[:k=v,...] and py:<file>:<func>
@@ -422,14 +432,14 @@ def test_bench(tmp_path, monkeypatch):
 
     # check: FAIL for a config the impl can't run (the first variant that runs is the base),
     # n/a (not a failure) for @table without a tuned config
-    bad = kb.check(op, case, [4, 6], ["@table", "loop", "tiled b4"], diff_tol=1e-9,
+    bad = kb.check(t, case, [4, 6], ["@table", "loop", "tiled b4"], diff_tol=1e-9,
                    rec=kb.Recorder(str(tmp_path / "out"), "check", meta))
     assert bad == 2
     got = [(r["T"], r["variant"], r["result"][:19]) for r in records("check")]
     assert got == [(4, "@table", "OK"), (4, "loop", "OK"), (4, "tiled b4", "OK"),
                    (6, "@table", "FAIL AssertionError"), (6, "loop", "OK"),
                    (6, "tiled b4", "FAIL AssertionError")]
-    assert kb.check(op, dict(case, alpha=3.0), [4], ["loop", "@table"],
+    assert kb.check(t, dict(case, alpha=3.0), [4], ["loop", "@table"],
                     rec=kb.Recorder(None, None, meta)) == 0
 
     # ab: timing stubbed; the base timed twice; the verdict beyond the noise band
@@ -442,13 +452,13 @@ def test_bench(tmp_path, monkeypatch):
 
     monkeypatch.setattr(kb, "Timer", lambda Ws: None)
     monkeypatch.setattr(kb, "interleaved", interleaved)
-    kb.ab(op, case, [4], ["tiled b4", "loop", "tiled b2"], rounds=2, diff_tol=1e-9,
+    kb.ab(t, case, [4], ["tiled b4", "loop", "tiled b2"], rounds=2, diff_tol=1e-9,
           rec=kb.Recorder(str(tmp_path / "out"), "ab", meta))
     got = {r["variant"]: (r["verdict"], r["err_ref"], r["err_base"]) for r in records("ab")}
     assert got == {"tiled b4": ("base", 0.0, 0.0), "tiled b4#2": ("noise floor", 0.0, 0.0),
                    "loop": ("slower", 0.0, 0.0), "tiled b2": ("~", 0.0, 0.0)}
     with pytest.raises(SystemExit, match="the base at n 4: axpy: no tuned config"):
-        kb.ab(op, dict(case, alpha=3.0), [4], ["@table", "loop"],
+        kb.ab(t, dict(case, alpha=3.0), [4], ["@table", "loop"],
               rec=kb.Recorder(None, None, meta))
 
 
@@ -472,11 +482,28 @@ def test_marks_return_the_function_in_written_order():
         a(b)
 
 
-def test_cases(toy):
-    cases = toy["ops"]["axpy"].cases()
-    assert [cid for cid, _ in cases] == ["n4-a1", "n4-a2", "n6-a1", "n6-a2"]
-    assert cases[1][1] == dict(n=4, alpha=2.0)
-    assert toy["ops"]["axpy_dyn"].cases() == []
+def test_problems(toy):
+    op = toy["ops"]["axpy"]
+    probs = op.problems("n", "alpha")  # the @dim values of axpy_test, by axis name
+    assert [pid for pid, _ in probs] == ["n4-a1", "n4-a2", "n6-a1", "n6-a2"]
+    assert probs[1][1] == dict(n=4, alpha=2.0)
+    assert op.problems(("alpha", ["a2"]), dim("n", (8,), id="n{}")) == [("a2-n8", dict(n=8, alpha=2.0))]
+    assert op.problems(("alpha", "a1")) == [("a1", dict(n=None, alpha=1.0))]
+    with pytest.raises(KeyError, match="no @dim 'm'"):
+        op.problems("m")
+    with pytest.raises(KeyError, match=r"no value \['a3'\]"):
+        op.problems(("alpha", ["a3"]))
+    for axes in (("n", dim("n", (1,))), (dim("m", (1,)),)):
+        with pytest.raises(TypeError, match="at most once"):
+            op.problems(*axes)
+    assert toy["ops"]["axpy_dyn"].problems() == [("", {})]
+    named = _ops("def f_ref(x): pass\n@dim('m, n', {'sq': (2, 2)}, name='shape')\n"
+                 "def f_test(m, n, k=1): pass").f
+    assert named.problems("shape") == [("sq", dict(m=2, n=2, k=1))]
+    _raises("def f_ref(x): pass\n@dim('m, n', {'sq': (2, 2)})\ndef f_test(m, n): pass",
+            "needs name=")
+    _raises("def f_ref(x): pass\n@dim('m', (1,), name='a')\n@dim('n', (1,), name='a')\n"
+            "def f_test(m, n): pass", "two @dim axes named 'a'")
 
 
 def test_axis_forms():
@@ -547,7 +574,6 @@ def test_convention_errors():
     _raises(ref + "@knob('b', lambda q: (1,))\ndef f_k(x, *, a=1, b=1): pass",
             "outside the dims")
     _raises(ref + "@dim('b', (1,))\ndef f_k(x, *, a=1, b=1): pass", "@dim describes the problem")
-    _raises(ref + "def f_test(n, m=1): pass", r"\['n'\] need a default or a @dim")
     _raises(ref + "@dim('q', (1,))\ndef f_test(n=1): pass", "must be distinct dims")
     _raises(ref + "@dim('n', lambda: (1,))\ndef f_test(n): pass", "a sequence or a dict")
     _raises(ref + "@no_capture('r')\ndef f_test(n=1): pass", "only @dim marks")
@@ -589,9 +615,11 @@ def _toy_project(pytester, src=TOY):
         "import os\nops = Registry(table=os.path.join(os.path.dirname(__file__), 'tuned.csv'), "
         "bucket='n')"))
     pytester.makefile(".csv", tuned=TUNED_TOY)
-    pytester.makepyfile(test_toy="from pyhip.kit.testing import op_tests\n"
-                                 "from toy import ops\n"
-                                 "test_ops = op_tests(ops)\n")
+    pytester.makepyfile(test_toy=TEST_TOY)
+
+
+TEST_TOY = ("from pyhip.kit.testing import op_tests\nfrom toy import ops\n"
+            "test_ops = op_tests(ops.axpy, ops.axpy.problems('n', 'alpha'))\n")
 
 
 def test_generated_tests(pytester):
@@ -607,9 +635,7 @@ def test_generated_tests(pytester):
 
 def test_generated_tests_without_table(pytester):
     pytester.makepyfile(toy=TOY)
-    pytester.makepyfile(test_toy="from pyhip.kit.testing import op_tests\n"
-                                 "from toy import ops\n"
-                                 "test_ops = op_tests(ops)\n")
+    pytester.makepyfile(test_toy=TEST_TOY)
     res = pytester.runpytest("-q", "-p", "no:cacheprovider")
     # every grid point must run: tiled b4 fails on the n6 cases
     res.assert_outcomes(passed=4 * 6 - 2, failed=2)
@@ -623,8 +649,12 @@ def test_generated_tests_report_failures(pytester):
 
 
 def test_toy_runs_without_pytest_helpers(toy):
+    from pyhip.kit.testing import op_tests
+
     op = toy["ops"]["axpy"]
-    for _, case in op.cases():
+    with pytest.raises(TypeError, match=r"dims \['n'\] unset"):
+        op_tests(op, op.problems("alpha"))
+    for _, case in op.problems("n", "alpha"):
         inputs = op.test(**case)
         assert op.dims(**inputs) == {k: case[k] for k in ("n", "alpha")}
         expected = op.ref(**inputs)
