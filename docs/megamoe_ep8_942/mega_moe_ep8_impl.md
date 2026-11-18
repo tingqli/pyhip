@@ -100,7 +100,7 @@ global expert 32d .. 32d+31（本地 expert e = 0..31）。每卡 4096 个 token
 | `recv_w` | [73728] FP32 | 对称堆 | producer | 每行的路由权重，Down 乘到结果上再加回源 rank（第 1.3 节） |
 | `gu_ids` | [73728] i32 | 本地 | `ep_plan` | GateUp 的行表：有效行 r 写 r，padding 行写 −1。GateUp 据此读 `recv_a` 第 r 行，padding 行补 0 |
 | `expert_ids` | [288] i32 | 本地 | `ep_plan` | 每个 block 的本地 expert，GateUp / Down 据此选 W1[e] / W2[e] |
-| `num_valid` | [1] i32 | 本地 | `ep_prep` | 本卡实际行数（不超过 `s_cap`）；mega kernel 用它算 block 数和队列划分 |
+| `num_valid` | [1] i32 | 本地 | `ep_prep` | 本卡补齐后的行数 Σ_e ⌈n_e/256⌉·256（不超过 `s_cap`；随机路由 rank 0 是 37888，实际路由 33204）；mega kernel 用它算 block 数和队列划分 |
 | `a2` | [73728, 2048] FP8（151 MB） | 本地 | GateUp 任务 | GateUp 的输出 SiLU(gate)·up（FP8），也是 Down 的 A；行号和 `recv_a` 一一对应 |
 | `a2_scale_t` | [16, 73728] FP32（4.7 MB） | 本地 | GateUp 任务 | `a2` 每行每 128 列的 scale，按列组转置存：Down 读 scale 时一条 load 只碰一个 cache line |
 | `out` | [4096, 4096] BF16（33.5 MB） | 对称堆 | 各 rank 的 Down 任务（远端原子加） | 本卡 token 的 MoE 输出；调用前清零，`forward()` 返回 `out[:T]` |
