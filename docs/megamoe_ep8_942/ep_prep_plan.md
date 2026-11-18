@@ -194,6 +194,8 @@ T = 4096 时 s_cap = 2 × 4096 × 8 + 32 × 256 = 73728（288 个 block）。`pl
   - 例（随机路由，rank 0 发给 expert 0 的 132 条，8 个源的计数是 [132, 140, 132, 134, 123, 122, 118, 136]，fewest = 118）：
     idx = 117 在第 936 行（8 × 117）；idx = 119 在第 951 行而不是 952（rank 6 只有 118 条，已经用完）；最后一条 idx = 131
     在第 1018 行。expert 0 共 1037 行，第 5 个 block（行 1024–1036，13 行）只有 rank 1、3、7 的路由，rank 0 不往那里发。
+  - 有源一条都没发给 g 时 fewest[g] = 0，全部走慢路径。例：只有 s0、s1、s2 发给 g，条数 5、2、6：第 0–1 轮
+    三个源各一条（行 0–5），第 2–4 轮只剩 s0、s2（行 6–11），第 5 轮只剩 s2（行 12），共 13 行，不留空行。
 - **qstart**：每个目标 rank 的有效 block 平分成 8 段，队列 q 是 [qstart[q], qstart[q+1])，和 mega kernel 的 XCD 队列
   一致。均匀路由下是 [0, 16, 32, …, 128]，随机路由下 rank 0 是 [0, 18, 37, 55, 74, 92, 111, 129, 148]。
 - **`route_key(g, row)`**：行超出 s_cap 时是 63（这条路由不发）；否则是 row / 256 这个 block 在目标 rank（g / 32）的队列
@@ -302,17 +304,22 @@ chunk = 2 条。公式和代码完全一样，只是 8 换成 2（快路径行�
 2. **③–⑥ 交换**：rank 0 把 hist = [4, 2, 3, 3] 写到两个 rank 的 C[0]，rank 1 把 [2, 5, 2, 3] 写到 C[1]，各自发 CFLAG。
    两边都看到两个 CFLAG 以后，手里是同一个 C。
 3. **⑦ 表**：total = [6, 7, 5, 6]，fewest = [2, 2, 2, 3]。e0 在 rank 0 从行 0 开始，占 ⌈6 / 4⌉ · 4 = 8 行，所以 e1 从行 8
-   开始；rank 1 上 e2 从行 0、e3 从行 8。两个 rank 都是 16 行、4 个 block，qstart = [0, 2, 4]。
+   开始；rank 1 上 e2 从行 0、e3 从行 8。两个 rank 都是 16 行、4 个 block，qstart = [0, 2, 4]：队列 q 是 block
+   [qstart[q], qstart[q+1])，最后一项是有效 block 数，只作终点（`route_key` 不读它）。
 4. **行号**（`mega_row`，图 (b)）：
    - 快路径（idx < fewest）：行 = base + 2·idx + s。rank 0 的 r3（e0 #1）→ 0 + 2 + 0 = 2；rank 1 的 r2（e0 #0）→ 1。
    - 慢路径：rank 0 的 r5（e0 #2）→ 0 + min(4, 2) + min(2, 2) = 4，r8（e0 #3）→ min(4, 3) + min(2, 3) = 5。rank 1 已经
      没有 e0 的路由了，所以 rank 0 的这两条紧挨着放，不留空行。rank 1 的 r11（e1 #4）→ 8 + min(2, 4 + 1) + min(5, 4) = 14。
    - e0 的 6 行之后是 2 行 padding（行 6、7），e1 的 7 行之后是 1 行（行 15）。
+   - 计数只决定“源 s 的第 i 条”放第几行；第 i 条是哪个 token，由源 rank 自己的 `route_idx` 定，`ep_plan` 把两者拼成
+     `send_route` / `send_info`。producer 写数据时把（源 rank, token, slot）写进这一行的 `down_ids`，接收端从这里才知道
+     每行是哪个 token（图 (b) 里的 t）。
 5. **key**：block 0、1 是队列 0 的第 0、1 个，block 2、3 是队列 1 的第 0、1 个，所以 block 0、2 的路由是 key 0，block 1、3
    的是 key 1。rank 0 的 12 条里 8 条 key 0，4 条 key 1。
 6. **⑨ key 直方图**（rank 0，按段算）：e0 的 #0–#1 在 block 0（公式 hi = ⌈(4 − 0 − 0) / 2⌉ = 2），#2–#3 在 block 1
    （fewest 之后，二分）；e1 的 #0–#1 在 block 2；e2 的 #0–#1 在 block 0、#2 在 block 1；e3 的 #0–#1 在 block 2、#2 在
-   block 3。key 0 = 2 + 2 + 2 + 2 = 8，key 1 = 2 + 1 + 1 = 4，key_base = [0, 8]。
+   block 3。key 0 = 2 + 2 + 2 + 2 = 8，key 1 = 2 + 1 + 1 = 4，key_base = [0, 8]。block 号是各自目标 rank 上的（e0、e1 在
+   rank 0，e2、e3 在 rank 1）；key 是 block 在目标队列里的位置，可以跨 rank 比较。
 7. **⑪–⑮ `ep_plan`**（图 (c)）：WG 0 管 r0–r5（key 0 有 5 条，key 1 有 1 条），WG 1 管 r6–r11（key 0 有 3 条，key 1 有
    3 条）。key 0 上 WG 1 的原子加先到：WG 1 占位置 0–2，WG 0 占 3–7；key 1 上 WG 0 先到：WG 0 占 8，WG 1 占 9–11。
    换一个先后，key 里的顺序会变，每条路由的目标行不变。

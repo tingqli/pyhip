@@ -123,6 +123,8 @@ global expert 32d .. 32d+31（本地 expert e = 0..31）。每卡 4096 个 token
   - 其余行：结果 × `recv_w[r]` → BF16，原子加到 `out_table[token >> 12]`（源 rank 的 `out` 基址）里第 `token & 4095`
     行的第 256n .. 256n+255 列；
   - FP8 combine 时改为写到源 rank `comb` 的第 `(token & 4095) × 8 + slot` 行。
+- slot 只有 FP8 combine 用到（选 `comb` 的槽位），BF16 combine 只用源 rank 和 token。格式沿用 aiter sorted_ids 的
+  `token | slot << 24`：Down 的代码和单独跑的 MoE 共用，那边 A2 按 token × topk + slot 取行。
 - GateUp 不读这两个 buffer，它用 `gu_ids` 区分有效行和 padding 行。
 
 ### 1.4 `ws`：跨卡的计数和 flag（对称堆，int32）
@@ -181,7 +183,8 @@ global expert 32d .. 32d+31（本地 expert e = 0..31）。每卡 4096 个 token
 - 一个 expert 的行里，源 rank s 的第 i 条路由放在第 8i + s 行（某个源的路由用完以后往前压紧，见下图）。所以每个 block 里
   8 个源 rank 各 32 行，所有源都要发到，block 才完整；但每个源只需要发自己那 32 条。
 - 行号由源 rank 自己算（`ep_plan` 里的 `mega_row`），它需要全部 8 个源的计数矩阵，这就是 `ep_prep` 先交换计数的原因。
-  接收端不再排序：`recv_a` 第 r 行就是 GateUp 的第 r 个 sorted 行（`gu_ids[r] = r`）。
+  接收端不再排序：`recv_a` 第 r 行就是 GateUp 的第 r 个 sorted 行（`gu_ids[r] = r`）。所以 `gu_ids` 只用来标出 padding 行
+  （和 t < expected[b] 等价），留着是为了和单独跑的 GateUp 共用代码；prologue 不读行号试过，没有收益（ATT 文档第 5.3 节）。
 - 每行 4096 B，block b 是 `recv_a` 的字节 [b·1 MiB, (b+1)·1 MiB)。expert 起点按 256 行对齐，一个 block 的数据不会和
   别的 expert 共用 cache line。
 
