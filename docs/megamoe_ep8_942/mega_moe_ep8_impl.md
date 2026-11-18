@@ -415,8 +415,10 @@ K 循环、LDS 布局、两组 wave 错开一个 barrier 的流水线和单独�
   之后它们已经落在目标显存，再发计数或 flag。
 - 等待方读计数用系统 / 设备范围的原子 load（sc1），读到以后只失效 L1：被等的数据都在本卡显存里，同一次调用里在它
   写好之前没人读过。
-- epoch 让 CFLAG、FFLAG 不用清零；`arrived`、`done`、票计数每次调用由 `ep_prep` 清零，`expected` 由 `ep_plan` 重写。
-  这些都在 device 上做，整个调用可以被 CUDA graph 捕获。
+- epoch 让 CFLAG、FFLAG 不用清零；`arrived`、`done`、票计数每次调用由 `ep_prep` 清零，`expected` 由 `ep_plan` 重写，
+  都在 device 上做。但 epoch 本身是 host 传进来的 kernel 参数，CUDA graph 会把它固定成捕获时的值：第二次重放起 flag
+  已经等于它，等待直接通过。所以现在不能被 graph 捕获（sglang 接入时 decode 的 graph 不走 mega，
+  [设计文档](mega_moe_ep8_design.md)第 9.2 节）；要支持得把 epoch 放到 device 上。
 - gfx942 上 load 和 store / 原子共用 `vmcnt`：Down 任务 epilogue 发出的远端原子加，会让下一个任务第一次等 `vmcnt` 时一起等完。
 
 ## 6. 代码流程

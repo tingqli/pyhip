@@ -239,7 +239,8 @@ T = 4096 时 s_cap = 2 × 4096 × 8 + 32 × 256 = 73728（288 个 block）。`pl
 3. **交换协议的延迟**：先加时间戳把 ③ 的 store、④ 的 fence、⑤ 的 release、⑥ 的轮询分开测，再决定要不要改（比如轮询不
    `s_sleep`）。最慢的 rank 也要 5 µs，这一段直接在关键路径上。
 4. **`ep_plan` 到 mega kernel 的 6.7 µs**：用 `rocprofv3 --hip-runtime-trace` 看 host 什么时候下发 mega kernel；如果是
-   host 慢，用 HIP graph 捕获整个调用（所有状态都在 device 上，可以捕获）就能去掉。
+   host 慢，用 HIP graph 捕获整个调用就能去掉。前提是先把 epoch 改成 device 上的计数：现在它是 host 传的 kernel 参数，
+   graph 会把它固定住。
 
 ## 4. `ep_plan`
 
