@@ -80,28 +80,29 @@ Conventions:
 A config is a dict ``{"kind": kind, knob: value, ...}``. Its name joins the kind and the
 ``@knob`` ids with spaces (``"tiled b64"``), overrides appended as ``":k=v,k=v"``.
 
-Dispatch: ``Registry(name, table=path, bucket=name, relax={name: value})`` declares a
-tuned table for its ops. ``op(*args, **kwargs)`` reads the dims of the call
-(``<op>_dims``, plus keyword arguments that are dim names: hints such as ``routing=``),
-picks a config (``op.pick``) and runs it; ``config=`` forces one, ``table=`` another
-table (None: none). ``op.pick(dims, table=, capturing=)``:
+Dispatch: ``Registry(name, table=path)`` names the tuned table of its ops (written by
+``kit.tune``). ``op(*args, **kwargs)`` reads the dims of the call (``<op>_dims``, plus
+keyword arguments that are dim names: hints such as ``routing=``), picks a config
+(``op.pick``) and runs it; ``config=`` forces one, ``table=`` another table (None:
+none). ``op.pick(dims, table=, capturing=)``:
 
-* The table is a CSV. Columns that are dim names are keys, except the bucket column;
-  ``config`` holds a config name, ``us`` its time; other columns are ignored. Rows of
-  kinds that are not solvers of the op are skipped. A key that is None in ``dims``
-  matches the ``<op>_test`` default.
-* The rows of the key of ``dims`` (if none: the key with ``relax`` substituted), at the
-  first tuned point of the bucket >= ``dims[bucket]`` (the largest point beyond): these
-  are ``op.tuned(dims)``, fastest first. ``pick`` returns the first, skipping
-  ``@no_capture`` solvers when ``capturing``; no rows: ValueError (tune the key or pass
-  ``config=``).
+* The table is a CSV. Its columns that are dims are the key, matched exactly; the
+  bucket column, marked ``~<dim>`` (``~num_tokens``), is matched inexactly: the first
+  tuned point >= the call's value (the largest point beyond). ``config`` holds a config
+  name, ``us`` its time; other columns are ignored. Rows of kinds that are not solvers
+  of the op are skipped. A key dim that is None in ``dims`` matches the ``<op>_test``
+  default.
+* The rows of the key and the point of ``dims`` are ``op.tuned(dims)``, fastest first.
+  ``pick`` returns the first, skipping ``@no_capture`` solvers when ``capturing``; no
+  rows: ValueError (tune the key or pass ``config=``).
 * Memoized per (table, its mtime, dim values, capturing): the returned dict is shared,
   do not modify it; ``op(...)`` memoizes its pick per (table, its mtime, capturing, the
   ``<op>_dims`` values and hints of the call). The mtime is read at most once a second
   per table: an edited table is used within a second.
 
 The decorators only record themselves in ``f.kit_marks`` (in written order) and return
-``f`` unchanged. ``pyhip.kit.testing`` turns the ops into pytest tests.
+``f`` unchanged. Tests: ``pyhip.kit.testing.op_tests(op, problems)``; tuning:
+``pyhip.kit.tune.Tuning``.
 """
 
 import functools
@@ -767,7 +768,7 @@ class Op:
 
     def points(self, dims, *, table=_DEFAULT):
         """[(bucket value, [(us, cfg), ...] fastest first)] of the table rows of
-        the key of ``dims`` (no relax; [] without rows)."""
+        the key of ``dims`` ([] without rows)."""
         path = self._registry.table if table is _DEFAULT else table
         version = _version(path)
         if version is None:
@@ -789,9 +790,11 @@ class Op:
         if "config" not in header or "us" not in header:
             raise ValueError(f"{path}: a tuned table has the columns config and us; this one "
                              f"has {list(header)}")
-        reg, d = self._registry, self._test_defaults
-        bucket = reg.bucket if reg.bucket in header and reg.bucket in self.dim_names else None
-        cols = tuple(n for n in self.dim_names if n in header and n != bucket)
+        d = self._test_defaults
+        bucket = _table.bucket(header)
+        bucket = bucket if bucket in self.dim_names else None
+        bcol = _table.BUCKET + bucket if bucket else None
+        cols = tuple(n for n in self.dim_names if n in header)
         pts = {}
         for i, r in enumerate(rows, 2):
             name = r["config"]
@@ -802,7 +805,7 @@ class Op:
             except ValueError as e:
                 raise ValueError(f"{path}:{i}: {e}") from None
             key = tuple(_cell(r[c], d.get(c)) for c in cols)
-            b = _cell(r[bucket], d.get(bucket)) if bucket else None
+            b = _cell(r[bcol], d.get(bucket)) if bucket else None
             pts.setdefault(key, {}).setdefault(b, []).append((float(r["us"]), cfg))
         index = {k: sorted((b, sorted(c, key=lambda t: t[0])) for b, c in v.items())
                  for k, v in pts.items()}
@@ -816,11 +819,7 @@ class Op:
         if version is None:
             return []
         cols, bucket, index = self._index(path, version)
-        key = self._key(cols, dims)
-        pts = index.get(key)
-        relax = self._registry.relax
-        if not pts and relax:
-            pts = index.get(tuple(relax.get(c, v) for c, v in zip(cols, key)))
+        pts = index.get(self._key(cols, dims))
         if not pts:
             return []
         if bucket is not None:
@@ -858,21 +857,15 @@ class Registry(Mapping):
     ``Op`` is the same object from its ref's registration on; later registrations add
     to it.
 
-    ``name``: for reports. ``table`` / ``bucket`` / ``relax``: the tuned table of the
-    ops, its bucketed dim and the key substitutions tried when a key has no rows
-    (dispatch, see the module docstring). Tuning is declared apart: ``kit.tune.Tuning``."""
+    ``name``: for reports. ``table``: the tuned table the ops dispatch from (see the
+    module docstring). Tuning is declared apart: ``kit.tune.Tuning``."""
 
-    def __init__(self, name=None, *, table=None, bucket=None, relax=None):
-        if relax is not None and not isinstance(relax, dict):
-            raise TypeError(f"Registry: relax is a dict {{name: value}}, got {relax!r}")
+    def __init__(self, name=None, *, table=None):
         self._ops = {}
-        self._name, self._table, self._bucket = name, table, bucket
-        self._relax = dict(relax or {})
+        self._name, self._table = name, table
 
     name = property(lambda self: self._name)
     table = property(lambda self: self._table)
-    bucket = property(lambda self: self._bucket)
-    relax = property(lambda self: self._relax)
 
     def register(self, f):
         """Add ``f`` to its op, by its name (see the module docstring); return ``f``."""

@@ -21,6 +21,7 @@ import pytest
 import pyhip.contrib.flydsl.a8w4 as A
 from pyhip.contrib.flydsl.a8w4 import ref
 from pyhip.contrib.flydsl.a8w4.moe import shape_dims
+from pyhip.kit import table as ktable
 
 TP8 = (4096, 256, 256, 256, 8)
 EP8 = (4096, 2048, 32, 256, 8)
@@ -59,7 +60,7 @@ def test_registry():
     assert list(MOE.impls) == list(KINDS)
     assert list(MOE_DYN.impls) == ["ep3k"]
     assert A.ops.table == A.DEFAULT_CSV and os.path.isfile(A.DEFAULT_CSV)
-    assert A.ops.bucket == "num_tokens"
+    assert ktable.bucket(ktable.read(A.DEFAULT_CSV)[0]) == "num_tokens"  # ~num_tokens
     assert [MOE.capturable(dict(kind=k)) for k in KINDS] == [True, True, False, True, True]
 
 

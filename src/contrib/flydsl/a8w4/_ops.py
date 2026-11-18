@@ -7,10 +7,10 @@
 with ``@op_register`` as its outermost decorator.
 
 Dispatch (``ops.moe(...)``, ``ops.moe.pick(dims)``): the tuned table ``DEFAULT_CSV``
-(written by ``pyhip.kit.tune``), bucketed by ``num_tokens`` (the first tuned point >= the
-call's token count); an activation without rows of its own uses the SiLU rows (the configs
-rank alike, README 7.8). A key without rows raises ValueError: tune it first. How the
-table is tuned: ``tune.TUNING``.
+(written by ``pyhip.kit.tune``): keyed by the shape, routing and act, bucketed by
+``num_tokens`` (its column ``~num_tokens``: the first tuned point >= the call's token
+count). A key without rows raises ValueError: tune it first. How the table is tuned:
+``tune.TUNING``.
 """
 
 import os
@@ -19,5 +19,5 @@ from pyhip.kit import Registry
 
 DEFAULT_CSV = os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs",
                            "a8w4_moe_tuned.csv")
-ops = Registry("a8w4", table=DEFAULT_CSV, bucket="num_tokens", relax={"act": "silu"})
+ops = Registry("a8w4", table=DEFAULT_CSV)
 op_register = ops.register

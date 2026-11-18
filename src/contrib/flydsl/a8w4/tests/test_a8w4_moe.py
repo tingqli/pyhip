@@ -193,11 +193,11 @@ def test_situv2_dispatch(case, tokens):
 
 
 def test_table_act(tmp_path):
-    """The act column keys the table; an act without rows of its own uses the SiLU rows,
-    and so do tables written before the column existed."""
+    """The act column keys the table (exactly: an act without rows of its own has no
+    tuned config); a table without the column serves every act."""
     shape = SHAPES["ep8"][:5]
     row = dict(zip(("model_dim", "inter_dim", "experts", "experts_global", "topk"), shape),
-               routing="uniform", num_tokens=64, cos="0")
+               routing="uniform", cos="0", **{"~num_tokens": 64})
     rows = [dict(row, act=act, config=name, us=us) for act, name, us in (
         ("silu", "ep3k t16", 10), ("silu", "ep3k s32", 11),
         ("situv2", "ep3k s32", 10), ("situv2", "ep3k t16", 11))]
@@ -217,9 +217,10 @@ def test_table_act(tmp_path):
         assert pick(op, "silu", both)["cfg"] == "t16"
         assert pick(op, "situv2", both)["cfg"] == "s32"
     silu = rows[:2]
-    old = write(tmp_path / "old.csv", [f for f in FIELDS if f != "act"], silu)
-    for path in (write(tmp_path / "silu.csv", FIELDS, silu), old):
-        assert pick(MOE, "situv2", path)["cfg"] == "t16"
+    with pytest.raises(ValueError, match="no tuned config"):
+        pick(MOE, "situv2", write(tmp_path / "silu.csv", FIELDS, silu))
+    no_act = write(tmp_path / "no_act.csv", [f for f in FIELDS if f != "act"], silu)
+    assert pick(MOE, "situv2", no_act)["cfg"] == "t16"
 
 
 def test_dyn_cuda_graph():

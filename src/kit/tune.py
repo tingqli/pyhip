@@ -63,15 +63,13 @@ class Tuning:
         where = f"Tuning({op.name})"
         if bucket not in op.dim_names:
             raise TypeError(f"{where}: bucket {bucket!r} is not a dim {list(op.dim_names)}")
-        if op.registry.bucket not in (None, bucket):
-            raise TypeError(f"{where}: bucket {bucket!r}, but the dispatch buckets "
-                            f"{op.registry.bucket!r} (Registry(bucket=))")
         keys = tuple(n for n in op.dim_names if n != bucket) if keys is None else tuple(keys)
         if _unknown(keys, op.dim_names) or bucket in keys or len(set(keys)) < len(keys):
             raise TypeError(f"{where}: keys {list(keys)}: distinct dims, not the bucket")
         if isinstance(rotate, str) or _unknown(rotate, op._ref_names):
             raise TypeError(f"{where}: rotate {rotate!r}: names of {op.name}_ref's parameters")
         self.op, self.bucket, self.points = op, bucket, tuple(points)
+        self.column = _table.BUCKET + bucket  # the bucket's column: ~<dim>
         self.keys, self.rotate = keys, tuple(rotate)
         self.table = op.registry.table if table is _DEFAULT else table
         self.problems = {}
@@ -85,8 +83,9 @@ class Tuning:
                 f"{len(self.points)} points)")
 
     def fields(self, metrics):
-        """The table header: key columns, bucket, config, us, the check's metrics."""
-        return [*self.keys, self.bucket, "config", "us", *metrics]
+        """The table header: key columns, the bucket column (``~<dim>``), config, us, the
+        check's metrics."""
+        return [*self.keys, self.column, "config", "us", *metrics]
 
     def problem(self, pid, sets=()):
         """Problem ``pid`` with ``sets`` ("name=value") applied."""
@@ -187,12 +186,12 @@ def tune(t, c, points, out, *, rounds=3, iters=20, ncopies=NCOPIES, log=print, p
             if name in bad or name in na:
                 continue
             us = sorted(times[name])[len(times[name]) // 2]
-            rows.append(dict({k: dims[k] for k in t.keys}, **{b: p}, config=name,
+            rows.append(dict({k: dims[k] for k in t.keys}, **{t.column: p}, config=name,
                              us=f"{us:.1f}", **{k: f"{v:.1e}" for k, v in metrics[name].items()}))
         rows.sort(key=lambda r: float(r["us"]))
         if rows:
             _table.merge(out, rows, t.fields([k for k in rows[0] if k not in
-                                              (*t.keys, b, "config", "us")]))
+                                              (*t.keys, t.column, "config", "us")]))
         top = " | ".join(f"{r['config']} {r['us']}" for r in rows[:3])
         msgs = [f"{n}: {m}" for n, m in bad.items()]
         kinds = sorted(set(na.values()))

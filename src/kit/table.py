@@ -1,13 +1,15 @@
 """Tuned tables: CSV files of measured configs. ``kit.tune`` writes them, the dispatch
 (``Op.pick``) reads them.
 
-A row holds the key columns (dims), the bucket column, ``config``, then the
-measurements: ``us`` and any metrics (e.g. ``cos``), i.e. every column after
+A row holds the key columns (dims, matched exactly by the dispatch), the bucket column
+(the dim matched inexactly, marked ``~<dim>``, e.g. ``~num_tokens``), ``config``, then
+the measurements: ``us`` and any metrics (e.g. ``cos``), i.e. every column after
 ``config``. The columns up to ``config`` are the row's identity: writing a row replaces
 the row with the same identity. Rows are kept sorted by their identity without the
 config (numbers as numbers), then by ``us``: the configs of a point fastest first.
 
     fields, rows = read(path)              # header, rows as {column: str}
+    bucket(fields)                         # the bucket dim ("num_tokens") or None
     merge(path, rows)                      # replace / add rows, keep the order
     compare(old_path, new_path)            # per point: the winners of two tables
 """
@@ -15,7 +17,9 @@ config (numbers as numbers), then by ``us``: the configs of a point fastest firs
 import csv
 import os
 
-__all__ = ["read", "write", "merge", "identity", "compare"]
+__all__ = ["BUCKET", "read", "write", "merge", "identity", "bucket", "compare"]
+
+BUCKET = "~"  # marks the bucket column: ~<dim>
 
 
 def read(path):
@@ -31,6 +35,14 @@ def identity(fields):
     if "config" not in fields:
         raise ValueError(f"a tuned table has a config column; header {list(fields)}")
     return tuple(fields[:list(fields).index("config") + 1])
+
+
+def bucket(fields):
+    """The bucket dim of a header (its column is ``~<dim>``), or None."""
+    got = [f[len(BUCKET):] for f in fields if f.startswith(BUCKET)]
+    if len(got) > 1:
+        raise ValueError(f"a tuned table has at most one bucket column; header {list(fields)}")
+    return got[0] if got else None
 
 
 def _num(s):

@@ -185,8 +185,6 @@ def test_registration_rules():
             reg.register(f)
         assert "kit_op" not in f.__dict__ and list(reg.g.impls) == ["k"]  # left no trace
     _raises("def f_ref(x, *, config=None): pass", r"\['config'\] are reserved")
-    with pytest.raises(TypeError, match="relax is a dict"):
-        Registry(relax=["act"])
     assert repr(Registry("lib")) == "Registry('lib', [])"
 
 
@@ -213,7 +211,7 @@ def f_k3(x, *, dt="a"):
     return ("k3",)
 '''
 
-TABLE = """dt,mode,n,config,us,err
+TABLE = """dt,mode,~n,config,us,err
 a,s,4,k2,2.0,0
 a,s,4,k1 b2,1.0,0
 a,s,4,k3,3.0,0
@@ -230,7 +228,7 @@ c,s,4,k3,2.0,0
 def test_dispatch(tmp_path):
     path = tmp_path / "tuned.csv"
     path.write_text(TABLE)
-    op = _ops(DISPATCH, table=str(path), bucket="n", relax={"mode": "s"}).f
+    op = _ops(DISPATCH, table=str(path)).f
 
     def pick(capturing=False, table=str(path), **v):
         return op.name_of(op.pick(dict(op._blank, **v), table=table, capturing=capturing))
@@ -242,11 +240,12 @@ def test_dispatch(tmp_path):
         pick(n=4, dt="b", capturing=True)  # only k2 is tuned there
     assert pick(n=5, dt="a") == "k3" and pick(n=100, dt="a") == "k3"  # point 16, the largest
     assert pick(n=4, dt="a", mode="t") == "k3"
-    assert pick(n=4, dt="a", mode="u") == "k1 b2"  # no rows: relax mode -> s
     assert pick(n=4, dt="b") == "k2"
     with pytest.raises(ValueError, match=r"no tuned config for \{'n': 4, 'dt': 'd'\} in .*"
                                          r"tuned.csv: tune it, or pass config="):
-        pick(n=4, dt="d")  # no rows, none after relax
+        pick(n=4, dt="d")  # no rows of this key
+    with pytest.raises(ValueError, match="no tuned config"):
+        pick(n=4, dt="a", mode="u")  # every key dim matches exactly
     with pytest.raises(ValueError, match=r"\(no table\)"):
         pick(n=4, dt="a", table=None)
     with pytest.raises(ValueError, match="no tuned config"):
@@ -280,10 +279,12 @@ def test_dispatch(tmp_path):
     kit._seen[str(path)] = (0.0, kit._seen[str(path)][1])  # a second later
     assert pick(n=4, dt="a") == "k2"
     assert op(x4) == ("k2",)  # the memo of calls too
-    # a table without the mode column: mode is no key
+    # a table without the mode column: mode is no key; n not marked ~: an exact key
     old = tmp_path / "old.csv"
     old.write_text("dt,n,config,us\na,4,k3,1.0\n")
     assert pick(n=4, dt="a", mode="t", table=str(old)) == "k3"
+    with pytest.raises(ValueError, match="no tuned config"):
+        pick(n=3, dt="a", table=str(old))
     bad = tmp_path / "bad.csv"
     bad.write_text("dt,n,config,us\na,4,k1 bx,1.0\n")
     with pytest.raises(ValueError, match=r"bad.csv:2: .*'k1 bx'"):
@@ -314,6 +315,9 @@ def test_table(tmp_path):
     assert [(r["config"], r["us"], r["err"]) for r in got[:2]] == [("k2", "0.5", "1"),
                                                                    ("k1", "1.0", "0")]
     assert len(got) == 4 and table.identity(fields) == ("dt", "n", "config")
+    assert table.bucket(fields) is None and table.bucket(("dt", "~n", "config")) == "n"
+    with pytest.raises(ValueError, match="at most one bucket"):
+        table.bucket(("~a", "~n", "config"))
     with pytest.raises(ValueError, match="config column"):
         table.identity(("dt", "us"))
     new = str(tmp_path / "new.csv")
@@ -332,7 +336,7 @@ def test_tune(tmp_path, monkeypatch):
     from pyhip.kit import table
     from pyhip.kit import tune as kt
 
-    src = TOY.replace("ops = Registry()", "ops = Registry(table=TABLE, bucket='n')") + (
+    src = TOY.replace("ops = Registry()", "ops = Registry(table=TABLE)") + (
         "\nfrom pyhip.kit.tune import Tuning\n"
         "TUNING = Tuning(ops.axpy, problems=ops.axpy.problems('alpha'), bucket='n', "
         "points=(4, 6))\n")
@@ -353,9 +357,9 @@ def test_tune(tmp_path, monkeypatch):
         t.problem("a1", ["seed=5"])  # not a dim
     with pytest.raises(SystemExit, match="no tune problem"):
         t.problem("a3")
-    assert t.fields(["err"]) == ["alpha", "n", "config", "us", "err"]
+    assert t.fields(["err"]) == ["alpha", "~n", "config", "us", "err"]
     for kw, match in ((dict(bucket="x"), "not a dim"), (dict(keys=("n",)), "keys"),
-                      (dict(rotate=("z",)), "rotate"), (dict(bucket="alpha"), "dispatch"),
+                      (dict(rotate=("z",)), "rotate"),
                       (dict(problems=[("p", {}), ("p", {})]), "two problems")):
         with pytest.raises(TypeError, match=match):
             kt.Tuning(op, **{**dict(problems=[], bucket="n", points=()), **kw})
@@ -364,8 +368,8 @@ def test_tune(tmp_path, monkeypatch):
     logs = []
     kt.tune(t, t.problems["a1"], [4, 6], mod.TABLE, rounds=2, iters=1, log=logs.append, pid="a1")
     fields, rows = table.read(mod.TABLE)
-    assert fields == ("alpha", "n", "config", "us", "err")
-    got = [(r["n"], r["config"]) for r in rows]
+    assert fields == ("alpha", "~n", "config", "us", "err")
+    got = [(r["~n"], r["config"]) for r in rows]
     assert got == [("4", c) for c in ("loop", "tiled b2", "tiled b4", "queue fast", "queue slow")] \
         + [("6", c) for c in ("loop", "tiled b2", "queue fast", "queue slow")]  # b4 can't run 6
     assert rows[0]["us"] == "1.5" and rows[0]["alpha"] == "1.0" and float(rows[0]["err"]) == 0
@@ -383,11 +387,11 @@ def test_bench(tmp_path, monkeypatch):
     from pyhip.kit import bench as kb
     from pyhip.kit import tune as kt
 
-    src = TOY.replace("ops = Registry()", "ops = Registry(table=TABLE, bucket='n')")
+    src = TOY.replace("ops = Registry()", "ops = Registry(table=TABLE)")
     mod = types.ModuleType("kit_toy_bench")
     mod.TABLE = str(tmp_path / "tuned.csv")
     with open(mod.TABLE, "w") as f:
-        f.write("alpha,n,config,us,err\n1.0,4,loop,2.0,0\n1.0,4,tiled b4,1.0,0\n")
+        f.write("alpha,~n,config,us,err\n1.0,4,loop,2.0,0\n1.0,4,tiled b4,1.0,0\n")
     exec(compile(src, "toy.py", "exec"), mod.__dict__)
     op = mod.ops.axpy
     t = kt.Tuning(op, problems=op.problems("alpha"), bucket="n", points=(4, 6))
@@ -603,7 +607,7 @@ def test_default_check():
     assert_close(torch.ones(3), torch.ones(3), out=None, expected=None)
 
 
-TUNED_TOY = ("n,config,us\n" + "".join(f"4,{c},1.0\n" for c in ("loop", "tiled b2", "tiled b4",
+TUNED_TOY = ("~n,config,us\n" + "".join(f"4,{c},1.0\n" for c in ("loop", "tiled b2", "tiled b4",
                                                                 "queue fast", "queue slow"))
              + "".join(f"6,{c},1.0\n" for c in ("loop", "tiled b2", "queue fast")))
 
@@ -612,8 +616,7 @@ def _toy_project(pytester, src=TOY):
     """The toy with a tuned table (tiled b4 does not run n=6: not tuned there)."""
     pytester.makepyfile(toy=src.replace(
         "ops = Registry()",
-        "import os\nops = Registry(table=os.path.join(os.path.dirname(__file__), 'tuned.csv'), "
-        "bucket='n')"))
+        "import os\nops = Registry(table=os.path.join(os.path.dirname(__file__), 'tuned.csv'))"))
     pytester.makefile(".csv", tuned=TUNED_TOY)
     pytester.makepyfile(test_toy=TEST_TOY)
 

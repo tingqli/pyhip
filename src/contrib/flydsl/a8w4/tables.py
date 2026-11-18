@@ -28,6 +28,7 @@ from .moe import DEFAULT_CSV, MOE, shape_dims
 README = os.path.join(os.path.dirname(os.path.abspath(__file__)), "README.md")
 H, TOPK = 4096, 8
 README_SHAPES = {"tp8": (256, 256, 256), "tp4": (512, 256, 256), "ep8": (2048, 32, 256)}
+TOKENS_COL = "~num_tokens"  # the bucket column (tune.TUNING.column)
 
 
 def _shape_name(inter, experts, experts_global):
@@ -42,9 +43,9 @@ def compare(old_path, new_path):
     return table.compare(
         old_path, new_path,
         label=lambda p: (f"{_shape_name(p['inter_dim'], p['experts'], p['experts_global'])} "
-                         f"{p['act']:6s} {int(p['num_tokens']):5d}"),
+                         f"{p['act']:6s} {int(p[TOKENS_COL]):5d}"),
         order=lambda p: (_shape_name(p["inter_dim"], p["experts"], p["experts_global"]),
-                         p["routing"], p["act"], int(p["num_tokens"])))
+                         p["routing"], p["act"], int(p[TOKENS_COL])))
 
 
 # =============================================================================
@@ -60,7 +61,7 @@ def _silu_points(table):
                 continue
             for name, (i, e, eg) in README_SHAPES.items():
                 if (int(r["inter_dim"]), int(r["experts"]), int(r["experts_global"])) == (i, e, eg):
-                    t[(name, int(r["num_tokens"]))][r["config"]] = float(r["us"])
+                    t[(name, int(r[TOKENS_COL]))][r["config"]] = float(r["us"])
     return t
 
 
@@ -215,7 +216,7 @@ def stats(table=DEFAULT_CSV):
             key = tuple(int(r[k]) for k in ("model_dim", "inter_dim", "experts",
                                             "experts_global", "topk"))
             rows.setdefault((key, r.get("act") or "silu"), {}).setdefault(
-                int(r["num_tokens"]), {})[r["config"]] = float(r["us"])
+                int(r[TOKENS_COL]), {})[r["config"]] = float(r["us"])
     for (shape, act) in sorted(rows):
         if act != "silu" or (shape, "situv2") not in rows:
             continue
