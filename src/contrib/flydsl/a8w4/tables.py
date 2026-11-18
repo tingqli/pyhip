@@ -21,7 +21,7 @@ import statistics
 import sys
 from collections import defaultdict
 
-from pyhip.kit import table
+from kernelkit import table
 
 from .moe import DEFAULT_CSV, MOE, shape_problem
 
@@ -39,7 +39,7 @@ def _shape_name(inter, experts, experts_global):
 
 
 def compare(old_path, new_path):
-    """``kit.table.compare``, points named and ordered by shape, act and tokens."""
+    """``kernelkit.table.compare``, points named and ordered by shape, act and tokens."""
     return table.compare(
         old_path, new_path,
         label=lambda p: (f"{_shape_name(p['inter_dim'], p['experts'], p['experts_global'])} "

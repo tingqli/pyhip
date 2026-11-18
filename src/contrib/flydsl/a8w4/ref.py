@@ -10,22 +10,21 @@ References: ``moe_ref`` / ``moe_dyn_ref`` take the same arguments as ``a8w4_moe`
 ``a8w4_moe_dyn`` (the prepared weights, decoded by ``decode_fd2``); ``ref_moe`` is the
 older form on the unshuffled mxfp4 tensors. All share one fp32 core.
 
-The problem side of the ops ``moe`` and ``moe_dyn`` (``pyhip.kit``, registered into
+The problem side of the ops ``moe`` and ``moe_dyn`` (``kernelkit``, registered into
 ``_ops.ops``; the kernels are the solvers in ``moe.py``): ``<op>_ref`` the interface and
 the answer, ``<op>_problem`` the inputs of one problem (its parameters but ``seed``: the
 dims), ``<op>_check`` the tolerance, ``<op>_dims`` the dims of a call. Cold-cache timing
 (``flush_cache``, ``weight_copies``,
-``time_cold``, ``WCOPIES``) is ``pyhip.kit.timing``, re-exported here.
+``time_cold``, ``WCOPIES``) is ``kernelkit.timing``, re-exported here.
 """
 
 import functools
 
 import torch
-
-from pyhip.kit import dim
-from pyhip.kit.timing import NCOPIES as WCOPIES  # noqa: F401 - re-exported for the tools
-from pyhip.kit.timing import copies as weight_copies  # noqa: F401
-from pyhip.kit.timing import flush_cache, time_cold  # noqa: F401
+from kernelkit import dim
+from kernelkit.timing import NCOPIES as WCOPIES  # noqa: F401 - re-exported for the tools
+from kernelkit.timing import copies as weight_copies  # noqa: F401
+from kernelkit.timing import flush_cache, time_cold  # noqa: F401
 
 from ._ops import op_register
 from .weights import prepare_weights, shuffle_mxfp4, weight_shape

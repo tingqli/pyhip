@@ -345,7 +345,7 @@ def _git_head():
 
 
 def snapshot(argv):
-    from pyhip.kit.tune import busy_gpus, gpu_list
+    from kernelkit.tune import busy_gpus, gpu_list
 
     ap = argparse.ArgumentParser(prog="prof isa-snapshot")
     ap.add_argument("--out", required=False)

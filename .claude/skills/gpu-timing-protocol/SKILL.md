@@ -5,10 +5,11 @@ description: How to time GPU kernels on MI300X-class AMD GPUs so that A/B result
 
 # Timing GPU kernels so the result holds in the model
 
-Reference implementation: pyhip `src/kit/timing.py` (`pyhip.kit.timing`: `flush_cache`,
+Reference implementation: [kernelkit](https://github.com/tingqli/kernelkit)
+`kernelkit/timing.py` (`kernelkit.timing`: `flush_cache`,
 `copies`, `time_cold`, `Timer`, `interleaved`, `noise_band`, `verdict`; it times only the
-way section 1 describes), used by the tuner (`pyhip.kit.tune`) and the A/B tool
-(`pyhip.kit.bench`: `ab`, `check_copies`; a8w4: `python -m a8w4.bench ab`). Evidence:
+way section 1 describes), used by the tuner (`kernelkit.tune`) and the A/B tool
+(`kernelkit.bench`: `ab`, `check_copies`; a8w4: `python -m a8w4.bench ab`). Evidence:
 `a8w4/experiments/log_20261115.md` §3.3.
 
 ## 1. Cold caches: flush L2 AND do not let the MALL keep the weights

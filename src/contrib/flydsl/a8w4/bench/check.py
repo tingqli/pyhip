@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Correctness of variants (``pyhip.kit.bench.check`` on an a8w4 case), and helpers for
+"""Correctness of variants (``kernelkit.bench.check`` on an a8w4 case), and helpers for
 experiment scripts.
 
     python -m a8w4.bench check --case tp8 -t 1 77 600 4096 -v @table "tp1k bcm2 ks1" --graph
@@ -21,8 +21,7 @@ to write stand out), ``stability``, ``graph_replay``.
 import argparse
 
 import torch
-
-from pyhip.kit import bench as kb
+from kernelkit import bench as kb
 
 from .. import ref as R
 from ..tune import TUNING

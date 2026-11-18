@@ -6,7 +6,12 @@ build-backend = "setuptools.build_meta"
 name = "pyhip"
 dynamic = ["version"]
 requires-python = ">=3.8"
-dependencies = ["filelock", "numpy"]
+dependencies = [
+    "filelock",
+    "numpy",
+    # op registry, table dispatch, tests, tuner and A/B tools of the contrib ops (a8w4)
+    "kernelkit @ git+https://github.com/tingqli/kernelkit.git@v0.1.0",
+]
 description = "Python AMDGPU kernel developing tool"
 readme = "README.md"
 license = "MIT"
@@ -22,7 +27,6 @@ fallback_version = "1.0.0"
 packages = [
     "pyhip",
     "pyhip.core",
-    "pyhip.kit",
     "pyhip.contrib",
     "pyhip.contrib.common",
     "pyhip.contrib.gluon",

@@ -1,6 +1,6 @@
 # configs：a8w4 调优表
 
-`a8w4_moe_tuned.csv` 是 `a8w4_moe` / `a8w4_moe_dyn` 选配置时查的表，由 `pyhip.kit.tune`（`python -m a8w4.tune`）生成。查表和计时的机制见上级 README 第 6 节；本文件记录表里有什么，以及生成它的命令。
+`a8w4_moe_tuned.csv` 是 `a8w4_moe` / `a8w4_moe_dyn` 选配置时查的表，由 `kernelkit.tune`（`python -m a8w4.tune`）生成。查表和计时的机制见上级 README 第 6 节；本文件记录表里有什么，以及生成它的命令。
 
 ## 格式
 
@@ -9,13 +9,13 @@
 - **key**：`(model_dim, inter_dim, experts, experts_global, topk, routing, act)`，精确匹配。其中 `experts` 是本卡的专家数，`experts_global` 是全局专家数。
 - **分桶列** `~num_tokens`（`~` 标出分桶维）：调用时取第一个 ≥ token 数的点。
 - **每个 token 点保存全部配置**，不只保存最快的那个：
-  - `us` 是各轮的中位数（冷 cache，每次调用换一份权重，不计 host 开销，见 `pyhip.kit.timing`）；
+  - `us` 是各轮的中位数（冷 cache，每次调用换一份权重，不计 host 开销，见 `kernelkit.timing`）；
   - `cos` 是各轮与 fp32 参考之间最大的 cos 差；
   - cos ≥ 5e-3 或运行时抛异常（kernel 不支持）的配置不写入。
 - **查表**：
   - 只用调用时那个 `act` 的行；没调过的 act 抛 `ValueError`（先 tune）；
   - 没有 `act` 列的表里 act 不是 key。
-- **行的顺序**：按 (shape, routing, act, ~num_tokens, us) 排序，每次 `merge` 都会重新排（`pyhip.kit.table`）。
+- **行的顺序**：按 (shape, routing, act, ~num_tokens, us) 排序，每次 `merge` 都会重新排（`kernelkit.table`）。
 
 ## 当前内容
 

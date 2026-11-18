@@ -17,11 +17,11 @@ import inspect
 import os
 
 import pytest
+from kernelkit import table as ktable
 
 import pyhip.contrib.flydsl.a8w4 as A
 from pyhip.contrib.flydsl.a8w4 import ref
 from pyhip.contrib.flydsl.a8w4.moe import shape_problem
-from pyhip.kit import table as ktable
 
 TP8 = (4096, 256, 256, 256, 8)
 EP8 = (4096, 2048, 32, 256, 8)

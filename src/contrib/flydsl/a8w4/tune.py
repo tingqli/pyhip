@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Tuner of ``a8w4_moe``: ``python -m a8w4.tune <cmd> ...`` is ``python -m pyhip.kit <cmd>
-a8w4.tune:TUNING ...`` (``pyhip.kit.tune``: every config of every solver, per
+"""Tuner of ``a8w4_moe``: ``python -m a8w4.tune <cmd> ...`` is ``python -m kernelkit <cmd>
+a8w4.tune:TUNING ...`` (``kernelkit.tune``: every config of every solver, per
 token count, ALL results stored; the dispatch picks the fastest one allowed in its
 context), plus the a8w4 reports on the table (``tables.py``).
 
@@ -36,7 +36,7 @@ if __package__ in (None, ""):  # run as a script: make the package importable
 
     __package__ = "a8w4"
 
-from pyhip.kit import tune as kit_tune  # noqa: E402
+from kernelkit import tune as kit_tune  # noqa: E402
 
 from ._ops import DEFAULT_CSV  # noqa: E402
 from .moe import MOE  # noqa: E402

@@ -2,7 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """The tuned configs of every problem (what the dispatch can pick) vs the reference, on
 the problems below (``ref.moe_problem`` / ``moe_dyn_problem`` turn them into inputs), generated
-by ``pyhip.kit``:
+by ``kernelkit``:
 
     pytest a8w4/tests/test_a8w4_ops.py -q -k "ep8 and ep3k"   # from the directory holding a8w4/
 """
@@ -12,9 +12,8 @@ import sys
 
 import pytest
 import torch
-
-from pyhip.kit import dim
-from pyhip.kit.testing import op_tests
+from kernelkit import dim
+from kernelkit.testing import op_tests
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from a8w4 import ops  # noqa: E402

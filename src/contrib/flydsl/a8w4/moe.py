@@ -23,7 +23,7 @@ README.md). ``@op_register`` adds them, after the problem side of ``ref.py``
 ``ops.moe``, ``MOE_DYN`` = ``ops.moe_dyn``. A config is ``{"solver": name, knob: value,
 ...}``, the knobs' values are the ``@knob``s; a config that cannot run a call raises (the
 kernels' asserts). ``MOE(...)`` / ``MOE.pick(problem)`` pick one from the tuned table
-(``pyhip.kit`` dispatch): only tuned keys are guaranteed, an untuned one raises
+(``kernelkit`` dispatch): only tuned keys are guaranteed, an untuned one raises
 ValueError.
   tp2k   prep -> gemm1 (q8s epilogue) -> gemm2 (atomic scatter)
   tp1k   prep -> one fused gemm1 + gemm2 kernel (BM 64)
@@ -38,8 +38,7 @@ expert_mask + quantize_rows.
 import copy
 
 import torch
-
-from pyhip.kit import knob, meta, no_capture, stack
+from kernelkit import knob, meta, no_capture, stack
 
 from . import ref as _ref  # noqa: F401 - registers the ops' ref / problem / check / dims first
 from ._ops import DEFAULT_CSV, op_register, ops  # noqa: F401 - DEFAULT_CSV re-exported

@@ -80,7 +80,7 @@ E 是 `W` 中的本地专家数，e0 = `expert_offset`。
 | `**dispatch` | 交给 `ops.moe(...)`：`config=` 强制使用某个配置（dict 或名字，例如 `"ep3k l128"`；不查表，kernel 跑不了时抛它的 `AssertionError`），`table=` 另一张调优表的路径，`routing=` 调优表的 key（默认 `"uniform"`）。其他名字抛 `TypeError` |
 | 返回 | 新分配的 bf16 [M, H] |
 
-`a8w4_moe` 只处理 M == 0（返回空张量：kernel 至少要一行），其余交给算子 `ops.moe(...)`（`pyhip.kit`）：`ref.moe_dims` 检查输入并读出 problem 的 dim（shape、token 数、act），按调优表选配置（6.2 节），调用该配置的 solver 函数。
+`a8w4_moe` 只处理 M == 0（返回空张量：kernel 至少要一行），其余交给算子 `ops.moe(...)`（`kernelkit`）：`ref.moe_dims` 检查输入并读出 problem 的 dim（shape、token 数、act），按调优表选配置（6.2 节），调用该配置的 solver 函数。
 
 ### 2.2 其他接口
 
@@ -90,7 +90,7 @@ E 是 `W` 中的本地专家数，e0 = `expert_offset`。
 | `shuffle_mxfp4(w1q, w1s, w2q, w2s)` | 未 shuffle 的 checkpoint 张量 → `prepare_weights` 的输入（调用 `aiter.ops.shuffle`） |
 | `a8w4_moe_dyn(x, W, tw, ti, m_valid, x_scale=, ...)` | EP all-to-all 接收缓冲区（有效行数在 device 上），见 2.4 |
 | `weight_shape(W)` | 返回 (E, H, I) |
-| `ops`、`DEFAULT_CSV` | 算子注册表（`ops.moe`、`ops.moe_dyn`，`pyhip.kit.Op`）和默认调优表的路径 |
+| `ops`、`DEFAULT_CSV` | 算子注册表（`ops.moe`、`ops.moe_dyn`，`kernelkit.Op`）和默认调优表的路径 |
 | `ops.moe(x, W, tw, ti, ..., config=, table=, routing=)` | 同 `a8w4_moe`，但不处理 M == 0 |
 | `ops.moe.pick(problem, table=, capturing=)` | 查表得到配置（6.2 节）；`problem` 是 dim 值的 dict，可用 `moe.shape_problem(shape, tokens, act, routing)` 由 `shape = (H, I, E, E_global, topk)` 构造；表里没有该 key 时抛 `ValueError` |
 | `ops.moe_dyn.pick(problem, ...)` | `a8w4_moe_dyn` 用的配置（只有 ep3k）；表里该 key 没有 ep3k 的行（例如 TP8 shape）时抛 `ValueError` |
@@ -152,14 +152,14 @@ out = a8w4_moe_dyn(x, W, topk_weights, topk_ids, m_valid, x_scale=None,
 ```
 a8w4/
   __init__.py                  公开接口；另导出 ops（算子注册表，ops.moe / ops.moe_dyn）和 DEFAULT_CSV
-  _ops.py                      本包的算子注册表 ops = pyhip.kit.Registry("a8w4", table=DEFAULT_CSV) 和装饰器 op_register；ref.py 注册问题定义，moe.py 注册 solver
+  _ops.py                      本包的算子注册表 ops = kernelkit.Registry("a8w4", table=DEFAULT_CSV) 和装饰器 op_register；ref.py 注册问题定义，moe.py 注册 solver
   moe.py                       a8w4_moe / a8w4_moe_dyn（只处理 M == 0，其余交给算子）；各 solver 函数 moe_<solver>（@op_register 注册；@knob 取值、@meta，tp1kq 另有 @no_capture；限制由 kernel 的 assert 检查），算子 MOE = ops.moe、MOE_DYN = ops.moe_dyn（9.3 节）；shape_problem（工具用：由 shape 元组构造 problem）
   weights.py                   prepare_weights（fd2 权重）、shuffle_mxfp4、weight_shape
-  tune.py                      调优：TOKENS 和 TUNING（pyhip.kit.tune.Tuning：problem、分桶维、调优点、key、轮换的权重，6.3 节）；CLI `python -m a8w4.tune <cmd>` 就是 `python -m pyhip.kit <cmd> a8w4.tune:TUNING`（problems / configs / tune / merge / show / verify / tune-all），另有 a8w4 的报告 compare / readme / stats；表的读、写、合并、比较在 `pyhip.kit.table`（分派和 tune 共用）
-  tables.py                    调优表报告：compare（`kit.table.compare`，按 shape / act / tokens 列出两张表逐点的 winner）、readme（重新生成 / 检查 README 7.2–7.4）、stats（situv2 与 silu）
+  tune.py                      调优：TOKENS 和 TUNING（kernelkit.tune.Tuning：problem、分桶维、调优点、key、轮换的权重，6.3 节）；CLI `python -m a8w4.tune <cmd>` 就是 `python -m kernelkit <cmd> a8w4.tune:TUNING`（problems / configs / tune / merge / show / verify / tune-all），另有 a8w4 的报告 compare / readme / stats；表的读、写、合并、比较在 `kernelkit.table`（分派和 tune 共用）
+  tables.py                    调优表报告：compare（`kernelkit.table.compare`，按 shape / act / tokens 列出两张表逐点的 winner）、readme（重新生成 / 检查 README 7.2–7.4）、stats（situv2 与 silu）
   ref.py                       测试与调优用：算子的问题定义（moe_ref 参考实现、moe_problem 由 problem 生成输入（@dim shape / act / routing）、moe_check 判定、moe_dims 由输入读出 dim 并检查；moe_dyn_* 同理）、随机权重和路由、模拟 fp8 量化的 fp32 参考、冷 cache 计时
   megamoe.py                   MegaMoeEpA8W4：EP8 整层（dispatch + 专家 + combine）的单 persistent kernel 封装，用于大 batch
-  bench/                       实验工具 python -m a8w4.bench：ab（A/B 计时）、breakdown（每个 kernel 的耗时）、check（正确性）、dist（megamoe 8 卡变体）；core.py 是 a8w4 的用例、输入和变体别名（变体解析、A/B 和 check 的引擎、运行记录在 `pyhip.kit.bench`，冷 cache 计时、ABBA、噪声带在 `pyhip.kit.timing`），dist.py 也是 8 卡测试共用的 helper
+  bench/                       实验工具 python -m a8w4.bench：ab（A/B 计时）、breakdown（每个 kernel 的耗时）、check（正确性）、dist（megamoe 8 卡变体）；core.py 是 a8w4 的用例、输入和变体别名（变体解析、A/B 和 check 的引擎、运行记录在 `kernelkit.bench`，冷 cache 计时、ABBA、噪声带在 `kernelkit.timing`），dist.py 也是 8 卡测试共用的 helper
   prof.py                      python -m a8w4.prof：counters（rocprofv3 计数器汇总）、isa（VGPR / spill / LDS）
   exp.py                       python a8w4/exp.py：实验登记 experiments/index.csv 的 grep / ls / add / new / lint / clean
   experiments/                 历次实验：index.csv（一行一个实验）、log_YYYYMMDD.md、各实验目录；_launch.py 是旧实验脚本用的 _run_compiled
@@ -198,6 +198,7 @@ kernel 文件之间不互相 import（只有 `ep_gemm` 的 host 入口调用 `ep
 |---|---|---|
 | GPU | gfx942（MI300X / MI325X） | fp8 FNUZ MFMA；硬件假设见 9.2 |
 | torch | ROCm 版，测试用 2.9.1+rocm7.2.0 | |
+| kernelkit | [tingqli/kernelkit](https://github.com/tingqli/kernelkit) v0.1.0（pyhip 的依赖，随 pyhip 安装） | 算子注册表、查表分派、测试生成、调优器和 A/B 工具（`_ops.py`、`ref.py`、`moe.py`、`tune.py`、`bench/`、`tests/`） |
 | FlyDSL | **0.3.2**（用到 0.3 的新 API，0.1.x 导入时就会失败） | 全部 kernel |
 | aiter | 测试用 tq/mimo-moe 分支 | 运行时只有 TP 族在专家切片（EP 形状）上用 `aiter.fused_moe.moe_sorting`；`shuffle_mxfp4` 用 `aiter.ops.shuffle`（纯 torch 重排）；`ref.py` 和测试用 `aiter.get_torch_quant` 生成权重 |
 
@@ -205,11 +206,10 @@ EP 族（`ep3k` / `ep1k`）和 `prepare_weights` 在运行时都不需要 aiter�
 
 **复制到其他工程**：
 
-- 整个目录复制过去即可，也可以放进别的包里。包内的绝对导入只有两处，其余全部是相对 import：
-  - kernel 文件的 `from pyhip.contrib.flydsl.host_launch import flydsl_kernel`；
-  - `_ops.py`、`moe.py`、`ref.py` 的 `from pyhip.kit import ...`，以及 `tests/test_a8w4_ops.py` 的 `pyhip.kit.testing`。
+- 整个目录复制过去即可，也可以放进别的包里。包内对 pyhip 的绝对导入只有一处，其余全部是相对 import：
+  - kernel 文件的 `from pyhip.contrib.flydsl.host_launch import flydsl_kernel`。
 
-  用 `grep -rn "pyhip\.\(contrib\|kit\)" --include=*.py . | grep -v experiments/` 列出它们。不带 pyhip 时，把 `host_launch.py` 和 `pyhip.kit`（仓库里的 `src/kit/`：两个文件，只依赖标准库；`testing.py` 另需 pytest）一起复制过去并改这些 import。只有 `tests/` 和 `tune.py` 的命令行入口按顶层包名 `a8w4` 导入，改了包名要同步修改。
+  用 `grep -rn "pyhip\.contrib" --include=*.py . | grep -v experiments/` 列出它们。不带 pyhip 时，把 `host_launch.py` 一起复制过去并改这些 import，另外 `pip install "kernelkit @ git+https://github.com/tingqli/kernelkit.git@v0.1.0"`（`_ops.py`、`moe.py`、`ref.py`、`tune.py`、`bench/`、`tests/` 用它）。只有 `tests/` 和 `tune.py` 的命令行入口按顶层包名 `a8w4` 导入，改了包名要同步修改。
 - 调优表按 shape 存放，其他模型要先调优（第 6 节）。
 - 换了机器（不同 SKU 或功耗墙）要先跑 `verify`，必要时重新调优。
 
@@ -436,7 +436,7 @@ ARB 是每个 K-tile 每行 A 的字节数，默认 256。`t16` 的 gemm2 用窄
 
 ### 6.2 查表规则（`ops.moe.pick`）
 
-规则在 `pyhip.kit`（`Op.pick`），a8w4 只说明表在哪里（`_ops.py` 的 `Registry("a8w4", table=DEFAULT_CSV)`）；key 和分桶列由表头说明。只保证表里有的 key：
+规则在 `kernelkit`（`Op.pick`），a8w4 只说明表在哪里（`_ops.py` 的 `Registry("a8w4", table=DEFAULT_CSV)`）；key 和分桶列由表头说明。只保证表里有的 key：
 
 1. key 是表头里是 dim 名的列：(H, I, E, E_global, topk, routing, act)，精确匹配。dim 值为 None 的 key（例如没传 `routing`）按 `ref.moe_problem` 的默认值匹配（`"uniform"`）。没有 act 列的表里 act 不是 key。
 2. 分桶列 `~num_tokens`：取第一个 ≥ M 的点；M 超过最大点时取最大点。
@@ -446,9 +446,9 @@ ARB 是每个 K-tile 每行 A 的字节数，默认 256。`t16` 的 gemm2 用窄
 
 表按文件路径和 mtime 缓存，mtime 每张表最多一秒读一次：文件更新后一秒内重新读取。`ops.moe(...)` 的选择按（表、mtime、capture 状态、`moe_dims` 的值）缓存。
 
-### 6.3 tuner（`pyhip.kit.tune`，`python -m a8w4.tune`）
+### 6.3 tuner（`kernelkit.tune`，`python -m a8w4.tune`）
 
-调优是通用的（`pyhip.kit.tune`），a8w4 的全部调优设置在 `tune.py` 的 `TUNING` 里：分桶维 `num_tokens`（`set_bucket`），每个 MiMo-V2.6-Flash shape 一组 problem（`add_problem("mimo-flash2.6-tp8", num_tokens=TOKENS, model_dim=4096, ...)`，组 `mimo-flash2.6-tp8`、`mimo-flash2.6-tp4`、`mimo-flash2.6-ep8`，EP8 用 rank 3 的 expert_offset 96）。act 没给，取 `moe_problem` 上 `@dim` act 的全部取值，所以每组有 `<组名>-silu`、`<组名>-situv2` 两个 problem，各在 `TOKENS` 的 35 个点上调。表的 key 是 (H, I, E, E_global, topk, routing, act)（`expert_offset` 只是给 expert 改编号，不进表），计时时轮换权重 `W`。命令行里 problem 参数可以给组名（组里的每个 problem）。`--set name=value` 改 problem 的 dim（新 shape、routing）。表头由 `TUNING` 写出：key 列、`~num_tokens`、`config`、`us`、`moe_check` 返回的 `cos`。
+调优是通用的（`kernelkit.tune`），a8w4 的全部调优设置在 `tune.py` 的 `TUNING` 里：分桶维 `num_tokens`（`set_bucket`），每个 MiMo-V2.6-Flash shape 一组 problem（`add_problem("mimo-flash2.6-tp8", num_tokens=TOKENS, model_dim=4096, ...)`，组 `mimo-flash2.6-tp8`、`mimo-flash2.6-tp4`、`mimo-flash2.6-ep8`，EP8 用 rank 3 的 expert_offset 96）。act 没给，取 `moe_problem` 上 `@dim` act 的全部取值，所以每组有 `<组名>-silu`、`<组名>-situv2` 两个 problem，各在 `TOKENS` 的 35 个点上调。表的 key 是 (H, I, E, E_global, topk, routing, act)（`expert_offset` 只是给 expert 改编号，不进表），计时时轮换权重 `W`。命令行里 problem 参数可以给组名（组里的每个 problem）。`--set name=value` 改 problem 的 dim（新 shape、routing）。表头由 `TUNING` 写出：key 列、`~num_tokens`、`config`、`us`、`moe_check` 返回的 `cos`。
 
 - **配置**（`configs <problem>`，即 `MOE.configs`：各 solver 的全部配置。kernel 跑不了的配置运行时抛异常，记为 n/a，不进表）：
   - tp2k：bm × g1bcm × g2，共 8 个；
@@ -464,9 +464,9 @@ ARB 是每个 K-tile 每行 A 的字节数，默认 256。`t16` 的 gemm2 用窄
   - 同一轮内各配置交错执行，时钟和功耗的漂移会均匀落到每个配置上。
   
   每个配置最终取各轮的中位数。每测完一个 token 数就写一次文件（同 key 的行覆盖）。
-- **计时**（`pyhip.kit.timing.time_cold`，`ref.time_cold` 是同一个函数）：
+- **计时**（`kernelkit.timing.time_cold`，`ref.time_cold` 是同一个函数）：
   - 每次迭代前读一遍 512 MB，用干净行挤掉 L2。用读而不是读改写，是为了不留下 dirty 行，否则写回会抢 HBM 带宽；
-  - 刷 cache 挤不掉 MALL 里每次调用都读的权重（读 2 GB 也一样），所以每次调用换一份权重：`kit.timing.copies` 复制 8 份（`--copies`，EP8 / TP8 约 3.3 GB），轮流使用，和模型里相邻各层读不同的权重一样。只用一份权重时，W 走 cache 的配置会显得快 5–13%（10 节第 15 条）；
+  - 刷 cache 挤不掉 MALL 里每次调用都读的权重（读 2 GB 也一样），所以每次调用换一份权重：`kernelkit.timing.copies` 复制 8 份（`--copies`，EP8 / TP8 约 3.3 GB），轮流使用，和模型里相邻各层读不同的权重一样。只用一份权重时，W 走 cache 的配置会显得快 5–13%（10 节第 15 条）；
   - 再让 GPU 空转约 1 ms（`torch.cuda._sleep`），这段时间里 host 已经把本次调用的所有 launch 入队，因此 host 开销不计入，和 graph 回放的情况一致；
   - 用 event 包住调用，每次迭代都同步，最后取中位数。
 
@@ -657,7 +657,7 @@ profile 中的 kernel 名：
 ## 8. 正确性与测试
 
 - **参考实现**：`ref.moe_ref` / `moe_dyn_ref` 是 fp32 参考，参数与 `a8w4_moe` / `a8w4_moe_dyn` 相同（读 prepare 后的权重，用 `decode_fd2` 解码）；`ref_moe` 是读未 shuffle 的 mxfp4 张量的旧接口，三者共用一个 fp32 核心。它们按 kernel 的方式模拟 fp8 量化：x 每行量化一次，中间结果每（行, 128 列）量化一次。剩下的差别只来自累加顺序和 bf16 输出。阈值是 cos 差 < 5e-3，实测 1e-5 到 3.5e-4。
-- **`tests/test_a8w4_ops.py`**：由算子生成（`op_tests`，`pyhip.kit.testing`），要测的 problem 写在这个文件里：`moe` 取 `tune.TUNING` 的每个 problem，`moe_dyn` 用 `MOE_DYN.problems(...)`。每个 problem × 它在调优表里那个点的全部配置（`ops.moe.tuned`，即分派可能选到的配置）跑一项：`MOE.run(cfg, **inputs)` 对 `moe_ref` / `moe_dyn_ref`，用 `moe_check` / `moe_dyn_check` 判（bf16、shape、cos 差 < 5e-3）。本机 360 项（含每个 problem 的 dims 项），全部通过，首次约 3 分钟（编译），之后约 20 秒。
+- **`tests/test_a8w4_ops.py`**：由算子生成（`op_tests`，`kernelkit.testing`），要测的 problem 写在这个文件里：`moe` 取 `tune.TUNING` 的每个 problem，`moe_dyn` 用 `MOE_DYN.problems(...)`。每个 problem × 它在调优表里那个点的全部配置（`ops.moe.tuned`，即分派可能选到的配置）跑一项：`MOE.run(cfg, **inputs)` 对 `moe_ref` / `moe_dyn_ref`，用 `moe_check` / `moe_dyn_check` 判（bf16、shape、cos 差 < 5e-3）。本机 360 项（含每个 problem 的 dims 项），全部通过，首次约 3 分钟（编译），之后约 20 秒。
   - `test_moe`：`TUNING` 的每个 problem（tp8 / tp4 / ep8 三个 shape × silu / situv2，EP 用 rank 3、全局专家 id）× tokens 1 / 77 / 600；
   - `test_moe_dyn`：EP8 接收缓冲区，容量 512 时有效行数 0 / 1 / 37 / 300，容量 2048 时 1500（TR epilogue）；无效行填 NaN 和随机 id；× bf16 / fp8 分组 scale 输入 × silu / situv2，表里该点的 ep3k 预设；
   - 每个 problem 另有一项 `...-dims`：`moe_dims(**inputs)` 与 problem 一致；
@@ -696,7 +696,7 @@ profile 中的 kernel 名：
   - topk=1 时每个输出元素只被 atomic 加一次，tp2k / tp1k / tp1kq / ep3k 全部配置在 1 / 300 / 3000 tokens 下与原 kernel 逐位相同；
   - topk=8 时，新旧 kernel 之间的 cos 差与原 kernel 自身两次运行之间的差在同一量级（1e-7 – 1e-5）。
 - **与 sglang PR #45 的 `ep8_moe_dyn` 一致**：topk=1 时 t16 / s32 / l128、bf16 / fp8 输入逐位相同；topk=8 时 cos 差约 3e-7，与 PR 版自身两次运行之间的差相同。
-- **单个配置或实验变体的检查**：`python -m a8w4.bench check --case tp8 -t 1 77 4096 -v @table "tp1k bcm2 ks1" --graph`，逐个变体查对参考、对第一个变体、重复调用的稳定性和 graph 回放（`--bitwise` 配合 topk 1 的 `--shape` 查逐位一致）。kernel 跑不了的变体记为 FAIL 并写出异常；ep3k 带覆盖项的变体（`m64:g2.pf=1`）按覆盖后的配置检查（`bench ab` 把这些变体列在 dropped 里）。`bench ab` / `check` 是通用的 `pyhip.kit.bench` 套上 a8w4 的用例；`python -m pyhip.kit check a8w4:moe tp8-silu -t 1 77 -v @table "tp1k bcm2 ks1" --graph` 用调优的 case 跑同一个检查（`--diff-tol` 设对 base 的阈值）。三个 8 卡测试的进程组、计时和 megamoe 参考检查共用 `bench/dist.py`。
+- **单个配置或实验变体的检查**：`python -m a8w4.bench check --case tp8 -t 1 77 4096 -v @table "tp1k bcm2 ks1" --graph`，逐个变体查对参考、对第一个变体、重复调用的稳定性和 graph 回放（`--bitwise` 配合 topk 1 的 `--shape` 查逐位一致）。kernel 跑不了的变体记为 FAIL 并写出异常；ep3k 带覆盖项的变体（`m64:g2.pf=1`）按覆盖后的配置检查（`bench ab` 把这些变体列在 dropped 里）。`bench ab` / `check` 是通用的 `kernelkit.bench` 套上 a8w4 的用例；`python -m kernelkit check a8w4.tune:TUNING mimo-flash2.6-tp8-silu -t 1 77 -v @table "tp1k bcm2 ks1" --graph` 用调优的 case 跑同一个检查（`--diff-tol` 设对 base 的阈值）。三个 8 卡测试的进程组、计时和 megamoe 参考检查共用 `bench/dist.py`。
 
 ### 8.1 整层测试与性能（MORI EP8）
 
@@ -920,7 +920,7 @@ TP kernel（`tp_gemm1`、`tp_gemm2`、`tp_fmoe`、`tp_fmoe_q`）里走不到的�
 14. **ATT 每个 dispatch 的 `realtime.json` 换算出的时钟不可靠**：同一 kernel 两次 trace 的 cycle 数能差 2 倍，只能比较 cycle 数。
 15. **计时要排除几种干扰。**
     - 刚 JIT 完的第一次计时偏慢；
-    - 刷 cache 只挤得掉 L2：每次调用都读的权重会留在 256 MB 的 MALL 里，读 512 MB 甚至 2 GB 都挤不掉（MALL 看起来不让一次性扫过的数据替换反复读的行）。W 走 nt 的配置不受影响，W 走 cache 的（bcm 0 / 1）因此显得快 5–13%；rocprof 的 L2 命中率和 HBM 读请求数在两种 cache 策略下完全相同，差别只在 L2 之后。旧调优表因此在 TP 6–128 tokens 选了 `g1bcm1`，实际慢 5–7.7%。计时要让每次调用读一份最近没读过的权重（`ref.weight_copies`，≥8 份；2 份不够）。`pyhip.kit.timing` 只提供这一种计时方式（调优器和 `python -m a8w4.bench` 都用它），W / A 走 cache 的变体在权重副本少于 8 份时会被 `bench ab` 拒绝；
+    - 刷 cache 只挤得掉 L2：每次调用都读的权重会留在 256 MB 的 MALL 里，读 512 MB 甚至 2 GB 都挤不掉（MALL 看起来不让一次性扫过的数据替换反复读的行）。W 走 nt 的配置不受影响，W 走 cache 的（bcm 0 / 1）因此显得快 5–13%；rocprof 的 L2 命中率和 HBM 读请求数在两种 cache 策略下完全相同，差别只在 L2 之后。旧调优表因此在 TP 6–128 tokens 选了 `g1bcm1`，实际慢 5–7.7%。计时要让每次调用读一份最近没读过的权重（`ref.weight_copies`，≥8 份；2 份不够）。`kernelkit.timing` 只提供这一种计时方式（调优器和 `python -m a8w4.bench` 都用它），W / A 走 cache 的变体在权重副本少于 8 份时会被 `bench ab` 拒绝；
     - 先刷 cache 再写一遍（读改写）也不对：W 走 cache 的读要先把 dirty 行写回才能占位，会显得慢 9–48%；
     - host 的 launch 开销要排除（GPU 先空转，再记开始 event）；
     - 单次测量有 ±3–5% 的抖动，配置之间要交错测量；

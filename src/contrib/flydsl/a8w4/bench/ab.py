@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""A/B timing of configs / variants on one GPU (``pyhip.kit.bench.ab`` on an a8w4 case).
+"""A/B timing of configs / variants on one GPU (``kernelkit.bench.ab`` on an a8w4 case).
 
     python -m a8w4.bench ab --case ep8 -t 1024 2048 -v "ep3k m64" "pf1=m64:g2.pf=1"
     python -m a8w4.bench ab --case ep8 -t 4096 -v l128 "sk=py:a8w4/experiments/X/run.py:moe" \\
@@ -14,12 +14,12 @@ call is cold (L2 flush, the next of ``--wcopies`` weight copies). The base also 
 "<base>#2": that copy's difference is the noise floor. A difference gets a verdict
 (faster / slower) only beyond the noise band, max(|copy's delta|, half the base's round
 spread, 0.3%); otherwise "~". Configs with cached W / A loads are refused with fewer
-than 8 weight copies (``kit.timing``).
+than 8 weight copies (``kernelkit.timing``).
 """
 
 import argparse
 
-from pyhip.kit import bench as kb
+from kernelkit import bench as kb
 
 from .. import ref as R
 from ..tune import TUNING

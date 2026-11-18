@@ -560,6 +560,7 @@ host 端（`moe._run_tp2k`，G1/G2 唯一的调用方）只用到 gemm1 的 `epi
 | 2026-11-17 | T1–T4 通用 tune / bench | `pyhip.kit.table`（表的读写、合并、比较）、`kit.timing`（冷 cache 协议、ABBA、噪声带）、`kit.tune` + `python -m pyhip.kit`（cases / candidates / tune / merge / show / verify / tune-all / compare）、`kit.bench`（ab / check）；a8w4 的 tune、bench 变成薄包装。表文件逐字节相同；tune 的候选、表头、选择相同，计时在噪声内；bench 新旧输出相同；ISA IDENTICAL；kit 18、单卡 413、8 卡 3 passed | `bebaff3` `3637665` `ef107ba` `712fc05` |
 | 2026-11-18 | V 术语 dim / knob，测试和调优集中声明 | `@dim`（problem 的取值）/ `@knob`（solver 的网格）；`op.problems`、`op_tests(op, problems)`、`Tuning`；表头 `~num_tokens` 标出 bucket，`Registry(name, table)`；去掉 relax，补调 tp4-situv2。测试 ID、候选、show 不变；分派只在 tp4-situv2 上变；ISA IDENTICAL；kit 18、单卡 413、8 卡 3 passed | `af50811` `9adc2f0` `893e3f2` |
 | 2026-11-18 | W 一个概念一个名字 | kind → solver（配置键、`Op.solvers`）；`<op>_test` → `<op>_problem`；dict 参数 `dims` → `problem`；data → inputs；CLI `candidates` → `configs`。测试 ID、分派、CLI 输出不变；ISA IDENTICAL；kit 18、单卡 413、8 卡 3 passed | 见 git log |
+| 2026-11-18 | kit 迁出 pyhip | `pyhip.kit` 迁到独立仓库 [tingqli/kernelkit](https://github.com/tingqli/kernelkit)（包 `kernelkit`，CLI `python -m kernelkit`，v0.1.0）；pyhip 删掉 `src/kit`、`tests/kit`，`pyproject.toml` 依赖 `kernelkit @ git+https://github.com/tingqli/kernelkit.git@v0.1.0`；a8w4 的 import 和文档改指 kernelkit。测试 ID 不变；单卡 413 passed；kernelkit 18 passed | 见 git log |
 
 **I4 的经验**：
 

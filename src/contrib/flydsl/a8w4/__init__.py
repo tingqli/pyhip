@@ -8,7 +8,7 @@
     # EP on an all-to-all receive buffer (valid row count on device, e.g. MORI):
     out = a8w4_moe_dyn(x, W, topk_weights, topk_ids, m_valid, x_scale=..., ...)
 
-``ops.moe`` / ``ops.moe_dyn``: the ops (``pyhip.kit``) behind them: ``ops.moe(...)``
+``ops.moe`` / ``ops.moe_dyn``: the ops (``kernelkit``) behind them: ``ops.moe(...)``
 runs the config the tuned table picks (``ops.moe.pick(problem)``), ``ops.moe.run(cfg, ...)``
 a given one; tests, tune and bench use them. See README.md.
 """
