@@ -61,7 +61,7 @@ global expert 32d .. 32d+31（本地 expert e = 0..31）。每卡 4096 个 token
 | Down 任务 | 128 × 16 = 2048 | N tile = 256 个 hidden 列，H / 256 = 16 个 |
 | producer 任务 | 16 | 每个 XCD 队列 2 个，每个 8 个 wave |
 | 每个队列的票 | 2 + 256 + 256 = 514 | 共 4112 |
-| dispatch 发送量 | 约 139 MB | 每条路由 4096 B FP8 行 + 128 B scale + 8 B id/权重 |
+| dispatch 发送量 | 约 139 MB | 每条路由 4232 B：4096 B FP8 行 + 128 B scale（32 个 FP32）+ 4 B `down_ids` + 4 B 路由权重（`recv_w`）。后两个是 lane 0 的两条 4 B store；另外每条路由还有一次 4 B 的 `arrived` 原子加，没有算在内 |
 | combine 发送量 | 约 268 MB | 每条路由一行 BF16（4096 × 2 B），远端原子加；FP8 combine 约 138 MB（第 9 节） |
 | 计算量 | 1.65 TFLOP | GateUp 2048 × 2·256·256·4096 + Down 2048 × 2·256·256·2048 |
 
