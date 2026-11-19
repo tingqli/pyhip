@@ -1,0 +1,149 @@
+fiona gfx942 mode: MMA fp8=True UNPACK=reuse OPERANDS=native_ab_early id=4102 PROFILE=register_pressure
+[aiter.ops.flydsl.kernels.flydsl_dispatch_combine_intranode_op] Tuning file /tmp/fiona_aiter/aiter/configs/tuned_dispatch_combine_intranode.csv has no rule matching shape (dtype=fp8_ocp, hidden=4096, topk=8, local_experts=32, zero_copy=False); using static geometry defaults.
+[aiter.ops.flydsl.kernels.flydsl_dispatch_combine_intranode_op] Tuning file /tmp/fiona_aiter/aiter/configs/tuned_dispatch_combine_intranode.csv has no rule matching shape (dtype=fp8_ocp, hidden=4096, topk=8, local_experts=32, zero_copy=False); using static geometry defaults.
+[aiter.ops.flydsl.kernels.flydsl_dispatch_combine_intranode_op] Tuning file /tmp/fiona_aiter/aiter/configs/tuned_dispatch_combine_intranode.csv has no rule matching shape (dtype=fp8_ocp, hidden=4096, topk=8, local_experts=32, zero_copy=False); using static geometry defaults.
+[aiter.ops.flydsl.kernels.flydsl_dispatch_combine_intranode_op] Tuning file /tmp/fiona_aiter/aiter/configs/tuned_dispatch_combine_intranode.csv has no rule matching shape (dtype=fp8_ocp, hidden=4096, topk=8, local_experts=32, zero_copy=False); using static geometry defaults.
+[aiter.ops.flydsl.kernels.flydsl_dispatch_combine_intranode_op] Tuning file /tmp/fiona_aiter/aiter/configs/tuned_dispatch_combine_intranode.csv has no rule matching shape (dtype=fp8_ocp, hidden=4096, topk=8, local_experts=32, zero_copy=False); using static geometry defaults.
+weights + 8 copies of both layouts: 1 s
+[aiter.ops.flydsl.kernels.flydsl_dispatch_combine_intranode_op] Tuning file /tmp/fiona_aiter/aiter/configs/tuned_dispatch_combine_intranode.csv has no rule matching shape (dtype=fp8_ocp, hidden=4096, topk=8, local_experts=32, zero_copy=False); using static geometry defaults.
+[aiter.ops.flydsl.kernels.flydsl_dispatch_combine_intranode_op] Tuning file /tmp/fiona_aiter/aiter/configs/tuned_dispatch_combine_intranode.csv has no rule matching shape (dtype=fp8_ocp, hidden=4096, topk=8, local_experts=32, zero_copy=False); using static geometry defaults.
+[aiter.ops.flydsl.kernels.flydsl_dispatch_combine_intranode_op] Tuning file /tmp/fiona_aiter/aiter/configs/tuned_dispatch_combine_intranode.csv has no rule matching shape (dtype=fp8_ocp, hidden=4096, topk=8, local_experts=32, zero_copy=False); using static geometry defaults.
+instances: 0 s
+
+=== M 12/rank (96 tokens): warm-up 1 s; fiona cfg s1 bm32 tn256 wpe1 dcu64 bnt3; s2 bm32 bn128; mega None
+accuracy vs fp32 ref (max over ranks): fiona: cos 1.08e-03 relL2 0.0464; mega_small(t1024): cos 9.29e-04 relL2 0.0431
+cold (us, slowest rank, median [p10, p90]): fiona 402.9 [396.1, 406.5]; mega_small(t1024) 159.0 [157.0, 161.5]; fiona#2 403.5 [397.0, 406.3]
+graph8 (us per call, slowest rank, median [min, max] over rounds): fiona 404.7 [403.7, 506.3]; mega_small(t1024) 153.8 [151.0, 154.6]; fiona#2 405.5 [401.5, 511.8]
+graph8w (us per call, slowest rank, median [min, max] over rounds): fiona 405.7 [401.5, 408.7]; mega_small(t1024) 152.4 [151.0, 155.4]; fiona#2 408.3 [401.9, 409.9]
+warning: <unknown>:0:0: failed to meet occupancy target given by 'amdgpu-waves-per-eu' in 'megamoe_small_stage1_t32x128x256_w4_gm1_dcu64_pw1ma0sw1aa0_tr1wpe2_bnt3_fused256_256_4096_256_decode4102': desired occupancy was 2, final occupancy is 1
+warning: <unknown>:0:0: failed to meet occupancy target given by 'amdgpu-waves-per-eu' in 'megamoe_small_stage1_t32x128x256_w4_gm1_dcu64_pw1ma0sw1aa0_tr1wpe2_bnt3_fused256_256_4096_256_decode4102': desired occupancy was 2, final occupancy is 1
+warning: <unknown>:0:0: failed to meet occupancy target given by 'amdgpu-waves-per-eu' in 'megamoe_small_stage1_t32x128x256_w4_gm1_dcu64_pw1ma0sw1aa0_tr1wpe2_bnt3_fused256_256_4096_256_decode4102': desired occupancy was 2, final occupancy is 1
+warning: <unknown>:0:0: failed to meet occupancy target given by 'amdgpu-waves-per-eu' in 'megamoe_small_stage1_t32x128x256_w4_gm1_dcu64_pw1ma0sw1aa0_tr1wpe2_bnt3_fused256_256_4096_256_decode4102': desired occupancy was 2, final occupancy is 1
+warning: <unknown>:0:0: failed to meet occupancy target given by 'amdgpu-waves-per-eu' in 'megamoe_small_stage1_t32x128x256_w4_gm1_dcu64_pw1ma0sw1aa0_tr1wpe2_bnt3_fused256_256_4096_256_decode4102': desired occupancy was 2, final occupancy is 1
+warning: <unknown>:0:0: failed to meet occupancy target given by 'amdgpu-waves-per-eu' in 'megamoe_small_stage1_t32x128x256_w4_gm1_dcu64_pw1ma0sw1aa0_tr1wpe2_bnt3_fused256_256_4096_256_decode4102': desired occupancy was 2, final occupancy is 1
+warning: <unknown>:0:0: failed to meet occupancy target given by 'amdgpu-waves-per-eu' in 'megamoe_small_stage1_t32x128x256_w4_gm1_dcu64_pw1ma0sw1aa0_tr1wpe2_bnt3_fused256_256_4096_256_decode4102': desired occupancy was 2, final occupancy is 1
+warning: <unknown>:0:0: failed to meet occupancy target given by 'amdgpu-waves-per-eu' in 'megamoe_small_stage1_t32x128x256_w4_gm1_dcu64_pw1ma0sw1aa0_tr1wpe2_bnt3_fused256_256_4096_256_decode4102': desired occupancy was 2, final occupancy is 1
+
+=== M 24/rank (192 tokens): warm-up 26 s; fiona cfg s1 bm32 tn128 wpe2 dcu64 bnt3; s2 bm32 bn256; mega None
+accuracy vs fp32 ref (max over ranks): fiona: cos 1.08e-03 relL2 0.0465; mega_small(t1024): cos 9.20e-04 relL2 0.0429
+cold (us, slowest rank, median [p10, p90]): fiona 403.4 [402.2, 406.9]; mega_small(t1024) 165.9 [162.7, 167.7]; fiona#2 403.3 [401.5, 404.4]
+graph8 (us per call, slowest rank, median [min, max] over rounds): fiona 397.6 [396.2, 402.5]; mega_small(t1024) 159.2 [158.6, 159.4]; fiona#2 399.4 [395.9, 512.4]
+graph8w (us per call, slowest rank, median [min, max] over rounds): fiona 397.3 [395.6, 401.3]; mega_small(t1024) 157.9 [157.0, 160.8]; fiona#2 401.4 [395.7, 513.9]
+
+=== M 48/rank (384 tokens): warm-up 0 s; fiona cfg s1 bm32 tn128 wpe2 dcu64 bnt3; s2 bm32 bn256; mega None
+accuracy vs fp32 ref (max over ranks): fiona: cos 1.08e-03 relL2 0.0464; mega_small(t1024): cos 9.25e-04 relL2 0.0430
+cold (us, slowest rank, median [p10, p90]): fiona 418.6 [417.4, 421.2]; mega_small(t1024) 173.3 [171.8, 176.6]; fiona#2 418.9 [417.2, 422.2]
+graph8 (us per call, slowest rank, median [min, max] over rounds): fiona 414.0 [413.2, 420.6]; mega_small(t1024) 163.6 [162.3, 165.0]; fiona#2 419.2 [413.5, 421.3]
+graph8w (us per call, slowest rank, median [min, max] over rounds): fiona 417.6 [409.9, 502.0]; mega_small(t1024) 164.3 [163.3, 166.6]; fiona#2 416.7 [410.8, 419.1]
+
+=== M 80/rank (640 tokens): warm-up 0 s; fiona cfg s1 bm32 tn128 wpe2 dcu64 bnt3; s2 bm32 bn256; mega None
+accuracy vs fp32 ref (max over ranks): fiona: cos 1.08e-03 relL2 0.0464; mega_small(t1024): cos 9.23e-04 relL2 0.0430
+cold (us, slowest rank, median [p10, p90]): fiona 433.5 [431.0, 436.8]; mega_small(t1024) 193.3 [190.8, 197.2]; fiona#2 434.0 [431.6, 435.4]
+graph8 (us per call, slowest rank, median [min, max] over rounds): fiona 436.7 [430.4, 441.6]; mega_small(t1024) 182.5 [181.4, 183.8]; fiona#2 439.4 [431.0, 443.3]
+graph8w (us per call, slowest rank, median [min, max] over rounds): fiona 436.7 [431.6, 530.8]; mega_small(t1024) 183.3 [180.5, 185.7]; fiona#2 437.7 [430.4, 523.4]
+
+=== M 96/rank (768 tokens): warm-up 0 s; fiona cfg s1 bm32 tn128 wpe2 dcu64 bnt3; s2 bm32 bn256; mega None
+accuracy vs fp32 ref (max over ranks): fiona: cos 1.08e-03 relL2 0.0464; mega_small(t1024): cos 9.29e-04 relL2 0.0431
+cold (us, slowest rank, median [p10, p90]): fiona 457.5 [453.2, 460.3]; mega_small(t1024) 212.5 [211.0, 215.3]; fiona#2 458.4 [454.6, 462.8]
+graph8 (us per call, slowest rank, median [min, max] over rounds): fiona 454.1 [448.5, 464.5]; mega_small(t1024) 193.9 [192.5, 197.3]; fiona#2 453.0 [448.9, 461.0]
+graph8w (us per call, slowest rank, median [min, max] over rounds): fiona 452.3 [442.6, 553.4]; mega_small(t1024) 196.2 [195.0, 197.0]; fiona#2 452.5 [447.6, 457.7]
+
+=== M 128/rank (1024 tokens): warm-up 33 s; fiona cfg s1 bm32 tn128 wpe1 dcu64 bnt3; s2 bm32 bn256; mega p16 l2 bcm22
+accuracy vs fp32 ref (max over ranks): fiona: cos 1.07e-03 relL2 0.0463; mega_small(t1024): cos 9.21e-04 relL2 0.0429; mega: cos 9.27e-04 relL2 0.0430
+cold (us, slowest rank, median [p10, p90]): fiona 614.9 [611.7, 617.1]; mega_small(t1024) 230.2 [228.1, 232.3]; mega 246.0 [244.2, 249.9]; fiona#2 615.6 [613.0, 617.8]
+graph8 (us per call, slowest rank, median [min, max] over rounds): fiona 628.7 [620.4, 632.9]; mega_small(t1024) 218.7 [215.9, 220.5]; mega 235.8 [232.2, 236.3]; fiona#2 628.1 [621.8, 635.3]
+graph8w (us per call, slowest rank, median [min, max] over rounds): fiona 626.6 [622.9, 639.5]; mega_small(t1024) 217.0 [214.5, 220.6]; mega 236.5 [233.4, 330.8]; fiona#2 629.4 [616.6, 634.9]
+
+=== M 192/rank (1536 tokens): warm-up 10 s; fiona cfg s1 bm32 tn128 wpe1 dcu64 bnt3; s2 bm32 bn256; mega p16 l2 bcm22
+accuracy vs fp32 ref (max over ranks): fiona: cos 1.07e-03 relL2 0.0461; mega_small(t4096): cos 9.20e-04 relL2 0.0429; mega: cos 9.25e-04 relL2 0.0430
+cold (us, slowest rank, median [p10, p90]): fiona 780.7 [777.1, 785.4]; mega_small(t4096) 284.6 [282.2, 289.3]; mega 299.0 [296.4, 302.9]; fiona#2 781.6 [777.9, 785.4]
+graph8 (us per call, slowest rank, median [min, max] over rounds): fiona 822.2 [811.9, 915.9]; mega_small(t4096) 270.3 [269.5, 272.6]; mega 286.7 [276.4, 289.3]; fiona#2 817.8 [814.9, 830.3]
+graph8w (us per call, slowest rank, median [min, max] over rounds): fiona 820.8 [817.4, 828.4]; mega_small(t4096) 271.1 [263.9, 272.8]; mega 287.1 [279.8, 290.1]; fiona#2 815.3 [793.1, 827.3]
+
+=== M 256/rank (2048 tokens): warm-up 0 s; fiona cfg s1 bm32 tn128 wpe1 dcu64 bnt3; s2 bm32 bn256; mega p16 l2 bcm22
+accuracy vs fp32 ref (max over ranks): fiona: cos 1.07e-03 relL2 0.0462; mega_small(t4096): cos 9.19e-04 relL2 0.0429; mega: cos 9.24e-04 relL2 0.0430
+cold (us, slowest rank, median [p10, p90]): fiona 992.0 [988.9, 995.0]; mega_small(t4096) 369.2 [365.4, 377.3]; mega 368.2 [365.0, 372.4]; fiona#2 989.9 [986.7, 998.2]
+graph8 (us per call, slowest rank, median [min, max] over rounds): fiona 998.5 [983.1, 1035.6]; mega_small(t4096) 345.6 [332.0, 354.1]; mega 357.9 [351.4, 370.9]; fiona#2 1000.3 [980.7, 1030.5]
+graph8w (us per call, slowest rank, median [min, max] over rounds): fiona 984.2 [979.3, 991.3]; mega_small(t4096) 332.6 [330.8, 353.2]; mega 352.3 [332.3, 365.2]; fiona#2 986.3 [980.3, 1038.6]
+
+=== M 304/rank (2432 tokens): warm-up 9 s; fiona cfg s1 bm32 tn128 wpe1 dcu64 bnt3; s2 bm32 bn256; mega p16 l4 bcm01
+accuracy vs fp32 ref (max over ranks): fiona: cos 1.07e-03 relL2 0.0462; mega_small(t4096): cos 9.18e-04 relL2 0.0428; mega: cos 9.24e-04 relL2 0.0430
+cold (us, slowest rank, median [p10, p90]): fiona 1123.3 [1117.7, 1126.7]; mega_small(t4096) 419.2 [415.6, 422.4]; mega 426.2 [422.5, 430.5]; fiona#2 1124.0 [1121.0, 1127.0]
+graph8 (us per call, slowest rank, median [min, max] over rounds): fiona 1136.6 [1124.6, 1218.5]; mega_small(t4096) 389.6 [384.6, 400.2]; mega 415.7 [402.5, 423.3]; fiona#2 1135.7 [1121.3, 1250.3]
+graph8w (us per call, slowest rank, median [min, max] over rounds): fiona 1125.3 [1121.9, 1142.2]; mega_small(t4096) 388.4 [385.8, 397.6]; mega 407.1 [389.7, 427.8]; fiona#2 1136.2 [1122.1, 1235.0]
+
+=== M 418/rank (3344 tokens): warm-up 0 s; fiona cfg s1 bm32 tn128 wpe1 dcu64 bnt3; s2 bm32 bn256; mega p16 l4 bcm01
+accuracy vs fp32 ref (max over ranks): fiona: cos 1.07e-03 relL2 0.0463; mega_small(t4096): cos 9.18e-04 relL2 0.0428; mega: cos 9.24e-04 relL2 0.0430
+cold (us, slowest rank, median [p10, p90]): fiona 1368.2 [1364.1, 1375.8]; mega_small(t4096) 533.8 [527.7, 543.2]; mega 503.0 [498.7, 511.6]; fiona#2 1369.1 [1361.7, 1383.9]
+graph8 (us per call, slowest rank, median [min, max] over rounds): fiona 1436.3 [1433.1, 1450.9]; mega_small(t4096) 498.4 [482.2, 513.5]; mega 478.4 [471.7, 484.7]; fiona#2 1439.7 [1432.4, 1451.1]
+graph8w (us per call, slowest rank, median [min, max] over rounds): fiona 1438.6 [1424.9, 1442.5]; mega_small(t4096) 498.1 [483.4, 502.8]; mega 480.9 [476.0, 499.2]; fiona#2 1436.7 [1433.3, 1444.4]
+
+=== M 512/rank (4096 tokens): warm-up 0 s; fiona cfg s1 bm32 tn128 wpe1 dcu64 bnt3; s2 bm32 bn256; mega p16 l4 bcm01
+accuracy vs fp32 ref (max over ranks): fiona: cos 1.07e-03 relL2 0.0463; mega_small(t4096): cos 9.17e-04 relL2 0.0428; mega: cos 9.23e-04 relL2 0.0430
+cold (us, slowest rank, median [p10, p90]): fiona 1591.6 [1582.7, 1606.5]; mega_small(t4096) 629.6 [622.0, 638.5]; mega 557.0 [553.2, 564.5]; fiona#2 1590.1 [1582.3, 1603.2]
+graph8 (us per call, slowest rank, median [min, max] over rounds): fiona 1691.1 [1679.5, 1759.3]; mega_small(t4096) 592.0 [583.9, 597.7]; mega 510.5 [500.3, 529.5]; fiona#2 1684.9 [1675.6, 1696.8]
+graph8w (us per call, slowest rank, median [min, max] over rounds): fiona 1683.1 [1675.2, 1685.3]; mega_small(t4096) 587.8 [583.1, 598.9]; mega 508.1 [500.0, 530.5]; fiona#2 1679.9 [1672.5, 1695.9]
+
+### cold
+
+| M/rank | tokens | fiona | mega_small | mega | fiona / mega_small | fiona#2 delta |
+|---:|---:|---:|---:|---:|---:|---:|
+| 12 | 96 | 402.9 | 159.0 | nan | 2.53x | +0.1% |
+| 24 | 192 | 403.4 | 165.9 | nan | 2.43x | -0.0% |
+| 48 | 384 | 418.6 | 173.3 | nan | 2.42x | +0.1% |
+| 80 | 640 | 433.5 | 193.3 | nan | 2.24x | +0.1% |
+| 96 | 768 | 457.5 | 212.5 | nan | 2.15x | +0.2% |
+| 128 | 1024 | 614.9 | 230.2 | 246.0 | 2.67x | +0.1% |
+| 192 | 1536 | 780.7 | 284.6 | 299.0 | 2.74x | +0.1% |
+| 256 | 2048 | 992.0 | 369.2 | 368.2 | 2.69x | -0.2% |
+| 304 | 2432 | 1123.3 | 419.2 | 426.2 | 2.68x | +0.1% |
+| 418 | 3344 | 1368.2 | 533.8 | 503.0 | 2.56x | +0.1% |
+| 512 | 4096 | 1591.6 | 629.6 | 557.0 | 2.53x | -0.1% |
+
+### graph8
+
+| M/rank | tokens | fiona | mega_small | mega | fiona / mega_small | fiona#2 delta |
+|---:|---:|---:|---:|---:|---:|---:|
+| 12 | 96 | 404.7 | 153.8 | nan | 2.63x | +0.2% |
+| 24 | 192 | 397.6 | 159.2 | nan | 2.50x | +0.5% |
+| 48 | 384 | 414.0 | 163.6 | nan | 2.53x | +1.2% |
+| 80 | 640 | 436.7 | 182.5 | nan | 2.39x | +0.6% |
+| 96 | 768 | 454.1 | 193.9 | nan | 2.34x | -0.2% |
+| 128 | 1024 | 628.7 | 218.7 | 235.8 | 2.87x | -0.1% |
+| 192 | 1536 | 822.2 | 270.3 | 286.7 | 3.04x | -0.5% |
+| 256 | 2048 | 998.5 | 345.6 | 357.9 | 2.89x | +0.2% |
+| 304 | 2432 | 1136.6 | 389.6 | 415.7 | 2.92x | -0.1% |
+| 418 | 3344 | 1436.3 | 498.4 | 478.4 | 2.88x | +0.2% |
+| 512 | 4096 | 1691.1 | 592.0 | 510.5 | 2.86x | -0.4% |
+
+### graph8w
+
+| M/rank | tokens | fiona | mega_small | mega | fiona / mega_small | fiona#2 delta |
+|---:|---:|---:|---:|---:|---:|---:|
+| 12 | 96 | 405.7 | 152.4 | nan | 2.66x | +0.6% |
+| 24 | 192 | 397.3 | 157.9 | nan | 2.52x | +1.0% |
+| 48 | 384 | 417.6 | 164.3 | nan | 2.54x | -0.2% |
+| 80 | 640 | 436.7 | 183.3 | nan | 2.38x | +0.2% |
+| 96 | 768 | 452.3 | 196.2 | nan | 2.31x | +0.0% |
+| 128 | 1024 | 626.6 | 217.0 | 236.5 | 2.89x | +0.4% |
+| 192 | 1536 | 820.8 | 271.1 | 287.1 | 3.03x | -0.7% |
+| 256 | 2048 | 984.2 | 332.6 | 352.3 | 2.96x | +0.2% |
+| 304 | 2432 | 1125.3 | 388.4 | 407.1 | 2.90x | +1.0% |
+| 418 | 3344 | 1438.6 | 498.1 | 480.9 | 2.89x | -0.1% |
+| 512 | 4096 | 1683.1 | 587.8 | 508.1 | 2.86x | -0.2% |
+
+### accuracy vs fp32 (cos diff / rel L2, max over ranks)
+
+| M/rank | fiona | mega_small | mega |
+|---:|---|---|---|
+| 12 | 1.08e-03 / 0.0464 | 9.29e-04 / 0.0431 | - |
+| 24 | 1.08e-03 / 0.0465 | 9.20e-04 / 0.0429 | - |
+| 48 | 1.08e-03 / 0.0464 | 9.25e-04 / 0.0430 | - |
+| 80 | 1.08e-03 / 0.0464 | 9.23e-04 / 0.0430 | - |
+| 96 | 1.08e-03 / 0.0464 | 9.29e-04 / 0.0431 | - |
+| 128 | 1.07e-03 / 0.0463 | 9.21e-04 / 0.0429 | 9.27e-04 / 0.0430 |
+| 192 | 1.07e-03 / 0.0461 | 9.20e-04 / 0.0429 | 9.25e-04 / 0.0430 |
+| 256 | 1.07e-03 / 0.0462 | 9.19e-04 / 0.0429 | 9.24e-04 / 0.0430 |
+| 304 | 1.07e-03 / 0.0462 | 9.18e-04 / 0.0428 | 9.24e-04 / 0.0430 |
+| 418 | 1.07e-03 / 0.0463 | 9.18e-04 / 0.0428 | 9.24e-04 / 0.0430 |
+| 512 | 1.07e-03 / 0.0463 | 9.17e-04 / 0.0428 | 9.23e-04 / 0.0430 |

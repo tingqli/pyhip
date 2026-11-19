@@ -1,0 +1,82 @@
+fiona gfx942 mode: MMA fp8=True UNPACK=reuse OPERANDS=legacy id=102 PROFILE=original
+[aiter.ops.flydsl.kernels.flydsl_dispatch_combine_intranode_op] Tuning file /tmp/fiona_aiter/aiter/configs/tuned_dispatch_combine_intranode.csv has no rule matching shape (dtype=fp8_ocp, hidden=4096, topk=8, local_experts=32, zero_copy=False); using static geometry defaults.
+[aiter.ops.flydsl.kernels.flydsl_dispatch_combine_intranode_op] Tuning file /tmp/fiona_aiter/aiter/configs/tuned_dispatch_combine_intranode.csv has no rule matching shape (dtype=fp8_ocp, hidden=4096, topk=8, local_experts=32, zero_copy=False); using static geometry defaults.
+weights + 8 copies of both layouts: 1 s
+[aiter.ops.flydsl.kernels.flydsl_dispatch_combine_intranode_op] Tuning file /tmp/fiona_aiter/aiter/configs/tuned_dispatch_combine_intranode.csv has no rule matching shape (dtype=fp8_ocp, hidden=4096, topk=8, local_experts=32, zero_copy=False); using static geometry defaults.
+[aiter.ops.flydsl.kernels.flydsl_dispatch_combine_intranode_op] Tuning file /tmp/fiona_aiter/aiter/configs/tuned_dispatch_combine_intranode.csv has no rule matching shape (dtype=fp8_ocp, hidden=4096, topk=8, local_experts=32, zero_copy=False); using static geometry defaults.
+[aiter.ops.flydsl.kernels.flydsl_dispatch_combine_intranode_op] Tuning file /tmp/fiona_aiter/aiter/configs/tuned_dispatch_combine_intranode.csv has no rule matching shape (dtype=fp8_ocp, hidden=4096, topk=8, local_experts=32, zero_copy=False); using static geometry defaults.
+[aiter.ops.flydsl.kernels.flydsl_dispatch_combine_intranode_op] Tuning file /tmp/fiona_aiter/aiter/configs/tuned_dispatch_combine_intranode.csv has no rule matching shape (dtype=fp8_ocp, hidden=4096, topk=8, local_experts=32, zero_copy=False); using static geometry defaults.
+[aiter.ops.flydsl.kernels.flydsl_dispatch_combine_intranode_op] Tuning file /tmp/fiona_aiter/aiter/configs/tuned_dispatch_combine_intranode.csv has no rule matching shape (dtype=fp8_ocp, hidden=4096, topk=8, local_experts=32, zero_copy=False); using static geometry defaults.
+[aiter.ops.flydsl.kernels.flydsl_dispatch_combine_intranode_op] Tuning file /tmp/fiona_aiter/aiter/configs/tuned_dispatch_combine_intranode.csv has no rule matching shape (dtype=fp8_ocp, hidden=4096, topk=8, local_experts=32, zero_copy=False); using static geometry defaults.
+instances: 0 s
+
+=== M 12/rank (96 tokens): warm-up 26 s; fiona cfg s1 bm32 tn256 wpe1 dcu64 bnt3; s2 bm32 bn128; mega None
+accuracy vs fp32 ref (max over ranks): fiona: cos 1.08e-03 relL2 0.0464; mega_small(t1024): cos 9.29e-04 relL2 0.0431
+cold (us, slowest rank, median [p10, p90]): fiona 456.1 [451.3, 460.5]; mega_small(t1024) 159.9 [158.5, 161.9]; fiona#2 455.6 [451.0, 459.3]
+graph8w (us per call, slowest rank, median [min, max] over rounds): fiona 454.5 [453.9, 459.4]; mega_small(t1024) 152.6 [149.8, 155.3]; fiona#2 457.7 [452.8, 461.9]
+warning: <unknown>:0:0: failed to meet occupancy target given by 'amdgpu-waves-per-eu' in 'megamoe_small_stage1_t32x128x256_w4_gm1_dcu64_pw1ma0sw1aa0_tr1wpe2_bnt3_fused256_256_4096_256_decode102': desired occupancy was 2, final occupancy is 1
+warning: <unknown>:0:0: failed to meet occupancy target given by 'amdgpu-waves-per-eu' in 'megamoe_small_stage1_t32x128x256_w4_gm1_dcu64_pw1ma0sw1aa0_tr1wpe2_bnt3_fused256_256_4096_256_decode102': desired occupancy was 2, final occupancy is 1
+warning: <unknown>:0:0: failed to meet occupancy target given by 'amdgpu-waves-per-eu' in 'megamoe_small_stage1_t32x128x256_w4_gm1_dcu64_pw1ma0sw1aa0_tr1wpe2_bnt3_fused256_256_4096_256_decode102': desired occupancy was 2, final occupancy is 1
+warning: <unknown>:0:0: failed to meet occupancy target given by 'amdgpu-waves-per-eu' in 'megamoe_small_stage1_t32x128x256_w4_gm1_dcu64_pw1ma0sw1aa0_tr1wpe2_bnt3_fused256_256_4096_256_decode102': desired occupancy was 2, final occupancy is 1
+warning: <unknown>:0:0: failed to meet occupancy target given by 'amdgpu-waves-per-eu' in 'megamoe_small_stage1_t32x128x256_w4_gm1_dcu64_pw1ma0sw1aa0_tr1wpe2_bnt3_fused256_256_4096_256_decode102': desired occupancy was 2, final occupancy is 1
+warning: <unknown>:0:0: failed to meet occupancy target given by 'amdgpu-waves-per-eu' in 'megamoe_small_stage1_t32x128x256_w4_gm1_dcu64_pw1ma0sw1aa0_tr1wpe2_bnt3_fused256_256_4096_256_decode102': desired occupancy was 2, final occupancy is 1
+warning: <unknown>:0:0: failed to meet occupancy target given by 'amdgpu-waves-per-eu' in 'megamoe_small_stage1_t32x128x256_w4_gm1_dcu64_pw1ma0sw1aa0_tr1wpe2_bnt3_fused256_256_4096_256_decode102': desired occupancy was 2, final occupancy is 1
+warning: <unknown>:0:0: failed to meet occupancy target given by 'amdgpu-waves-per-eu' in 'megamoe_small_stage1_t32x128x256_w4_gm1_dcu64_pw1ma0sw1aa0_tr1wpe2_bnt3_fused256_256_4096_256_decode102': desired occupancy was 2, final occupancy is 1
+
+=== M 48/rank (384 tokens): warm-up 23 s; fiona cfg s1 bm32 tn128 wpe2 dcu64 bnt3; s2 bm32 bn256; mega None
+accuracy vs fp32 ref (max over ranks): fiona: cos 1.08e-03 relL2 0.0464; mega_small(t1024): cos 9.25e-04 relL2 0.0430
+cold (us, slowest rank, median [p10, p90]): fiona 474.3 [470.3, 479.1]; mega_small(t1024) 172.0 [170.6, 175.2]; fiona#2 474.7 [471.0, 478.1]
+graph8w (us per call, slowest rank, median [min, max] over rounds): fiona 479.3 [475.2, 484.7]; mega_small(t1024) 163.6 [161.9, 827.6]; fiona#2 483.6 [477.0, 485.4]
+
+=== M 96/rank (768 tokens): warm-up 0 s; fiona cfg s1 bm32 tn128 wpe2 dcu64 bnt3; s2 bm32 bn256; mega None
+accuracy vs fp32 ref (max over ranks): fiona: cos 1.08e-03 relL2 0.0464; mega_small(t1024): cos 9.29e-04 relL2 0.0431
+cold (us, slowest rank, median [p10, p90]): fiona 524.2 [517.8, 531.1]; mega_small(t1024) 211.7 [210.0, 214.1]; fiona#2 523.5 [520.2, 531.3]
+graph8w (us per call, slowest rank, median [min, max] over rounds): fiona 522.0 [516.1, 527.2]; mega_small(t1024) 192.0 [190.3, 195.8]; fiona#2 521.0 [515.4, 617.9]
+warning: <unknown>:0:0: failed to meet occupancy target given by 'amdgpu-waves-per-eu' in 'megamoe_small_stage1_t64x128x256_w4_gm1_dcu128_pw1ma0sw1aa0_tr1wpe2_bnt3_fused128_256_4096_256_decode102': desired occupancy was 2, final occupancy is 1
+warning: <unknown>:0:0: failed to meet occupancy target given by 'amdgpu-waves-per-eu' in 'megamoe_small_stage1_t64x128x256_w4_gm1_dcu128_pw1ma0sw1aa0_tr1wpe2_bnt3_fused128_256_4096_256_decode102': desired occupancy was 2, final occupancy is 1
+warning: <unknown>:0:0: failed to meet occupancy target given by 'amdgpu-waves-per-eu' in 'megamoe_small_stage1_t64x128x256_w4_gm1_dcu128_pw1ma0sw1aa0_tr1wpe2_bnt3_fused128_256_4096_256_decode102': desired occupancy was 2, final occupancy is 1
+warning: <unknown>:0:0: failed to meet occupancy target given by 'amdgpu-waves-per-eu' in 'megamoe_small_stage1_t64x128x256_w4_gm1_dcu128_pw1ma0sw1aa0_tr1wpe2_bnt3_fused128_256_4096_256_decode102': desired occupancy was 2, final occupancy is 1
+warning: <unknown>:0:0: failed to meet occupancy target given by 'amdgpu-waves-per-eu' in 'megamoe_small_stage1_t64x128x256_w4_gm1_dcu128_pw1ma0sw1aa0_tr1wpe2_bnt3_fused128_256_4096_256_decode102': desired occupancy was 2, final occupancy is 1
+warning: <unknown>:0:0: failed to meet occupancy target given by 'amdgpu-waves-per-eu' in 'megamoe_small_stage1_t64x128x256_w4_gm1_dcu128_pw1ma0sw1aa0_tr1wpe2_bnt3_fused128_256_4096_256_decode102': desired occupancy was 2, final occupancy is 1
+warning: <unknown>:0:0: failed to meet occupancy target given by 'amdgpu-waves-per-eu' in 'megamoe_small_stage1_t64x128x256_w4_gm1_dcu128_pw1ma0sw1aa0_tr1wpe2_bnt3_fused128_256_4096_256_decode102': desired occupancy was 2, final occupancy is 1
+warning: <unknown>:0:0: failed to meet occupancy target given by 'amdgpu-waves-per-eu' in 'megamoe_small_stage1_t64x128x256_w4_gm1_dcu128_pw1ma0sw1aa0_tr1wpe2_bnt3_fused128_256_4096_256_decode102': desired occupancy was 2, final occupancy is 1
+
+=== M 192/rank (1536 tokens): warm-up 23 s; fiona cfg s1 bm64 tn128 wpe2 dcu128 bnt3; s2 bm64 bn128; mega None
+accuracy vs fp32 ref (max over ranks): fiona: cos 1.07e-03 relL2 0.0461; mega_small(t4096): cos 9.20e-04 relL2 0.0429
+cold (us, slowest rank, median [p10, p90]): fiona 852.1 [843.8, 860.4]; mega_small(t4096) 285.2 [282.4, 287.1]; fiona#2 850.6 [842.7, 857.4]
+graph8w (us per call, slowest rank, median [min, max] over rounds): fiona 880.1 [878.5, 982.5]; mega_small(t4096) 267.9 [266.1, 271.9]; fiona#2 882.0 [874.6, 885.9]
+
+=== M 512/rank (4096 tokens): warm-up 0 s; fiona cfg s1 bm64 tn128 wpe2 dcu128 bnt3; s2 bm64 bn128; mega None
+accuracy vs fp32 ref (max over ranks): fiona: cos 1.07e-03 relL2 0.0463; mega_small(t4096): cos 9.17e-04 relL2 0.0428
+cold (us, slowest rank, median [p10, p90]): fiona 1940.8 [1908.1, 1954.9]; mega_small(t4096) 620.9 [613.1, 631.0]; fiona#2 1941.1 [1905.9, 1951.6]
+graph8w (us per call, slowest rank, median [min, max] over rounds): fiona 2069.2 [2067.7, 2078.1]; mega_small(t4096) 585.0 [581.8, 587.6]; fiona#2 2071.7 [2065.8, 2083.5]
+
+### cold
+
+| M/rank | tokens | fiona | mega_small | mega | fiona / mega_small | fiona#2 delta |
+|---:|---:|---:|---:|---:|---:|---:|
+| 12 | 96 | 456.1 | 159.9 | nan | 2.85x | -0.1% |
+| 48 | 384 | 474.3 | 172.0 | nan | 2.76x | +0.1% |
+| 96 | 768 | 524.2 | 211.7 | nan | 2.48x | -0.1% |
+| 192 | 1536 | 852.1 | 285.2 | nan | 2.99x | -0.2% |
+| 512 | 4096 | 1940.8 | 620.9 | nan | 3.13x | +0.0% |
+
+### graph8w
+
+| M/rank | tokens | fiona | mega_small | mega | fiona / mega_small | fiona#2 delta |
+|---:|---:|---:|---:|---:|---:|---:|
+| 12 | 96 | 454.5 | 152.6 | nan | 2.98x | +0.7% |
+| 48 | 384 | 479.3 | 163.6 | nan | 2.93x | +0.9% |
+| 96 | 768 | 522.0 | 192.0 | nan | 2.72x | -0.2% |
+| 192 | 1536 | 880.1 | 267.9 | nan | 3.28x | +0.2% |
+| 512 | 4096 | 2069.2 | 585.0 | nan | 3.54x | +0.1% |
+
+### accuracy vs fp32 (cos diff / rel L2, max over ranks)
+
+| M/rank | fiona | mega_small | mega |
+|---:|---|---|---|
+| 12 | 1.08e-03 / 0.0464 | 9.29e-04 / 0.0431 | - |
+| 48 | 1.08e-03 / 0.0464 | 9.25e-04 / 0.0430 | - |
+| 96 | 1.08e-03 / 0.0464 | 9.29e-04 / 0.0431 | - |
+| 192 | 1.07e-03 / 0.0461 | 9.20e-04 / 0.0429 | - |
+| 512 | 1.07e-03 / 0.0463 | 9.17e-04 / 0.0428 | - |

@@ -1,0 +1,179 @@
+`python -m a8w4.prof isa --grep megamoe -- python a8w4/experiments/20261118_fiona_cmp/cmp_fiona.py -m 12 96 128 --protocols` (FionaZZ92 with the sglang env: OPERANDS native_ab_early, PROFILE register_pressure), then `loop_mix.py` on the dumped 21_final_isa.s
+
+| kernel | vgpr | agpr | sgpr | spills | LDS B | scratch B | WG size | waves/SIMD (VGPR) |
+|---|---|---|---|---|---|---|---|---|
+| a8w4_megamoe_ep_h4096_i2048_k8_t9_p16_l2_r32x64x128_ni128_no256_pf2 | 239 | 0 | 106 | 6 | 65536 | 0 | 512 | 2 |
+| a8w4_megamoe_finish | 5 | 0 | 18 | 0 | 0 | 0 | 64 | 8 |
+| a8w4_megamoe_plan | 42 | 0 | 58 | 0 | 3904 | 0 | 256 | 8 |
+| a8w4_megamoe_prep | 44 | 0 | 58 | 0 | 12320 | 0 | 1024 | 8 |
+| a8w4_megamoe_quant_h4096 | 20 | 0 | 24 | 0 | 0 | 0 | 256 | 8 |
+| a8w4_megamoe_small_h4096_i2048_k8_t1024_bm64_no256_a256_pf2_p16_w1 | 224 | 0 | 88 | 0 | 41568 | 0 | 512 | 2 |
+| megamoe_small_stage1_t32x128x256_w4_gm1_dcu64_pw1ma0sw1aa0_tr1wpe1_bnt3_fused256_256_4096_256_decode4102 | 388 | 0 | 96 | 3 | 37264 | 0 | 256 | 1 |
+| megamoe_small_stage1_t32x128x256_w4_gm1_dcu64_pw1ma0sw1aa0_tr1wpe2_bnt3_fused256_256_4096_256_decode4102 | 388 | 0 | 96 | 3 | 37264 | 0 | 256 | 1 |
+| megamoe_small_stage1_t32x256x256_w4_gm1_dcu64_pw1ma0sw1aa0_tr1wpe1_bnt3_fused128_256_4096_256_decode4102 | 476 | 0 | 92 | 0 | 29072 | 0 | 256 | 1 |
+
+a8w4_megamoe_ep_h4096_i2048_k8_t9_p16_l2_r32x64x128_ni128_no256_pf2: 6 spills
+megamoe_small_stage1_t32x128x256_w4_gm1_dcu64_pw1ma0sw1aa0_tr1wpe1_bnt3_fused256_256_4096_256_decode4102: 3 spills
+megamoe_small_stage1_t32x128x256_w4_gm1_dcu64_pw1ma0sw1aa0_tr1wpe2_bnt3_fused256_256_4096_256_decode4102: 3 spills
+
+== megamoe_small_stage1_t32x128x256_w4_gm1_dcu64_pw1ma0sw1aa0_tr1wpe1_bnt3_fused256_256_4096_256_decode4102/21_final_isa.s
+loop lines 33343-34345: 1003 instructions, 32 MFMA, VALU (all v_* but MFMA) 858 = 26.81 / MFMA
+   mfma                       32     1.00 / MFMA
+   v_perm                     98     3.06 / MFMA
+   v_fma/mul/add f32         147     4.59 / MFMA
+   v_bit/int                 523    16.34 / MFMA
+   v_mov/accvgpr              90     2.81 / MFMA
+   ds_bpermute                20     0.62 / MFMA
+   ds_read                    12     0.38 / MFMA
+   ds_write                    2     0.06 / MFMA
+   buffer/global load         19     0.59 / MFMA
+   s_waitcnt                  44     1.38 / MFMA
+   s_barrier                   1     0.03 / MFMA
+   s_other                    15     0.47 / MFMA
+loop lines 34426-35427: 1002 instructions, 32 MFMA, VALU (all v_* but MFMA) 857 = 26.78 / MFMA
+   mfma                       32     1.00 / MFMA
+   v_perm                     98     3.06 / MFMA
+   v_fma/mul/add f32         147     4.59 / MFMA
+   v_bit/int                 522    16.31 / MFMA
+   v_mov/accvgpr              90     2.81 / MFMA
+   ds_bpermute                20     0.62 / MFMA
+   ds_read                    12     0.38 / MFMA
+   ds_write                    2     0.06 / MFMA
+   buffer/global load         19     0.59 / MFMA
+   s_waitcnt                  44     1.38 / MFMA
+   s_barrier                   1     0.03 / MFMA
+   s_other                    15     0.47 / MFMA
+loop lines 38115-40272: 2158 instructions, 64 MFMA, VALU (all v_* but MFMA) 1755 = 27.42 / MFMA
+   mfma                       64     1.00 / MFMA
+   v_perm                    192     3.00 / MFMA
+   v_fma/mul/add f32         306     4.78 / MFMA
+   v_bit/int                 861    13.45 / MFMA
+   v_mov/accvgpr             197     3.08 / MFMA
+   v_other                   199     3.11 / MFMA
+   ds_bpermute                24     0.38 / MFMA
+   ds_read                     8     0.12 / MFMA
+   buffer/global load         35     0.55 / MFMA
+   s_waitcnt                  21     0.33 / MFMA
+   s_barrier                   1     0.02 / MFMA
+   s_other                   250     3.91 / MFMA
+loop lines 41098-43253: 2156 instructions, 64 MFMA, VALU (all v_* but MFMA) 1751 = 27.36 / MFMA
+   mfma                       64     1.00 / MFMA
+   v_perm                    192     3.00 / MFMA
+   v_fma/mul/add f32         303     4.73 / MFMA
+   v_bit/int                 861    13.45 / MFMA
+   v_mov/accvgpr             196     3.06 / MFMA
+   v_other                   199     3.11 / MFMA
+   ds_bpermute                24     0.38 / MFMA
+   ds_read                     8     0.12 / MFMA
+   buffer/global load         35     0.55 / MFMA
+   s_waitcnt                  23     0.36 / MFMA
+   s_barrier                   1     0.02 / MFMA
+   s_other                   250     3.91 / MFMA
+== megamoe_small_stage1_t32x256x256_w4_gm1_dcu64_pw1ma0sw1aa0_tr1wpe1_bnt3_fused128_256_4096_256_decode4102/21_final_isa.s
+loop lines 33496-35404: 1909 instructions, 64 MFMA, VALU (all v_* but MFMA) 1688 = 26.38 / MFMA
+   mfma                       64     1.00 / MFMA
+   v_perm                    194     3.03 / MFMA
+   v_fma/mul/add f32         292     4.56 / MFMA
+   v_bit/int                 877    13.70 / MFMA
+   v_mov/accvgpr             323     5.05 / MFMA
+   v_other                     2     0.03 / MFMA
+   ds_bpermute                24     0.38 / MFMA
+   ds_read                    12     0.19 / MFMA
+   ds_write                    2     0.03 / MFMA
+   buffer/global load         36     0.56 / MFMA
+   s_waitcnt                  52     0.81 / MFMA
+   s_barrier                   1     0.02 / MFMA
+   s_other                    30     0.47 / MFMA
+loop lines 35571-37476: 1906 instructions, 64 MFMA, VALU (all v_* but MFMA) 1691 = 26.42 / MFMA
+   mfma                       64     1.00 / MFMA
+   v_perm                    194     3.03 / MFMA
+   v_fma/mul/add f32         292     4.56 / MFMA
+   v_bit/int                 877    13.70 / MFMA
+   v_mov/accvgpr             326     5.09 / MFMA
+   v_other                     2     0.03 / MFMA
+   ds_bpermute                24     0.38 / MFMA
+   ds_read                    12     0.19 / MFMA
+   ds_write                    2     0.03 / MFMA
+   buffer/global load         36     0.56 / MFMA
+   s_waitcnt                  58     0.91 / MFMA
+   s_barrier                   1     0.02 / MFMA
+   s_other                    18     0.28 / MFMA
+loop lines 41400-42606: 1207 instructions, 32 MFMA, VALU (all v_* but MFMA) 966 = 30.19 / MFMA
+   mfma                       32     1.00 / MFMA
+   v_perm                     96     3.00 / MFMA
+   v_fma/mul/add f32         150     4.69 / MFMA
+   v_bit/int                 507    15.84 / MFMA
+   v_mov/accvgpr             104     3.25 / MFMA
+   v_other                   109     3.41 / MFMA
+   ds_bpermute                20     0.62 / MFMA
+   ds_read                     8     0.25 / MFMA
+   buffer/global load         18     0.56 / MFMA
+   s_waitcnt                  19     0.59 / MFMA
+   s_barrier                   1     0.03 / MFMA
+   s_other                   143     4.47 / MFMA
+loop lines 43135-44341: 1207 instructions, 32 MFMA, VALU (all v_* but MFMA) 965 = 30.16 / MFMA
+   mfma                       32     1.00 / MFMA
+   v_perm                     96     3.00 / MFMA
+   v_fma/mul/add f32         149     4.66 / MFMA
+   v_bit/int                 507    15.84 / MFMA
+   v_mov/accvgpr             104     3.25 / MFMA
+   v_other                   109     3.41 / MFMA
+   ds_bpermute                20     0.62 / MFMA
+   ds_read                     8     0.25 / MFMA
+   buffer/global load         18     0.56 / MFMA
+   s_waitcnt                  20     0.62 / MFMA
+   s_barrier                   1     0.03 / MFMA
+   s_other                   143     4.47 / MFMA
+== a8w4_megamoe_small_h4096_i2048_k8_t1024_bm64_no256_a256_pf2_p16_w1/21_final_isa.s
+loop lines 1192-8740: 7549 instructions, 899 MFMA, VALU (all v_* but MFMA) 4897 = 5.45 / MFMA
+   mfma                      899     1.00 / MFMA
+   v_perm                    864     0.96 / MFMA
+   v_fma/mul/add f32         531     0.59 / MFMA
+   v_bit/int                3187     3.55 / MFMA
+   v_mov/accvgpr              36     0.04 / MFMA
+   v_other                   279     0.31 / MFMA
+   ds_read                   389     0.43 / MFMA
+   ds_write                   97     0.11 / MFMA
+   buffer/global load        190     0.21 / MFMA
+   buffer/global store        14     0.02 / MFMA
+   s_waitcnt                 353     0.39 / MFMA
+   s_barrier                  39     0.04 / MFMA
+   s_other                   667     0.74 / MFMA
+   other                       4     0.00 / MFMA
+loop lines 9393-10585: 1193 instructions, 256 MFMA, VALU (all v_* but MFMA) 740 = 2.89 / MFMA
+   mfma                      256     1.00 / MFMA
+   v_perm                    144     0.56 / MFMA
+   v_fma/mul/add f32         136     0.53 / MFMA
+   v_bit/int                 443     1.73 / MFMA
+   v_mov/accvgpr              17     0.07 / MFMA
+   ds_read                    80     0.31 / MFMA
+   ds_write                    8     0.03 / MFMA
+   buffer/global load         32     0.12 / MFMA
+   s_waitcnt                  56     0.22 / MFMA
+   s_barrier                   4     0.02 / MFMA
+   s_other                    17     0.07 / MFMA
+loop lines 12405-13333: 929 instructions, 128 MFMA, VALU (all v_* but MFMA) 670 = 5.23 / MFMA
+   mfma                      128     1.00 / MFMA
+   v_perm                    144     1.12 / MFMA
+   v_fma/mul/add f32          64     0.50 / MFMA
+   v_bit/int                 439     3.43 / MFMA
+   v_mov/accvgpr               8     0.06 / MFMA
+   v_other                    15     0.12 / MFMA
+   ds_read                    40     0.31 / MFMA
+   ds_write                    4     0.03 / MFMA
+   buffer/global load         28     0.22 / MFMA
+   s_waitcnt                  34     0.27 / MFMA
+   s_barrier                   4     0.03 / MFMA
+   s_other                    21     0.16 / MFMA
+loop lines 14655-15480: 826 instructions, 64 MFMA, VALU (all v_* but MFMA) 633 = 9.89 / MFMA
+   mfma                       64     1.00 / MFMA
+   v_perm                    144     2.25 / MFMA
+   v_fma/mul/add f32          32     0.50 / MFMA
+   v_bit/int                 445     6.95 / MFMA
+   v_other                    12     0.19 / MFMA
+   ds_read                    24     0.38 / MFMA
+   ds_write                    3     0.05 / MFMA
+   buffer/global load         28     0.44 / MFMA
+   s_waitcnt                  28     0.44 / MFMA
+   s_barrier                   4     0.06 / MFMA
+   s_other                    42     0.66 / MFMA

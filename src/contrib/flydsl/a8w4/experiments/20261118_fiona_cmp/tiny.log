@@ -1,0 +1,50 @@
+fiona gfx942 mode: MMA fp8=True UNPACK=reuse OPERANDS=native_ab_early id=4102 PROFILE=register_pressure
+[aiter.ops.flydsl.kernels.flydsl_dispatch_combine_intranode_op] Tuning file /tmp/fiona_aiter/aiter/configs/tuned_dispatch_combine_intranode.csv has no rule matching shape (dtype=fp8_ocp, hidden=4096, topk=8, local_experts=32, zero_copy=False); using static geometry defaults.
+[aiter.ops.flydsl.kernels.flydsl_dispatch_combine_intranode_op] Tuning file /tmp/fiona_aiter/aiter/configs/tuned_dispatch_combine_intranode.csv has no rule matching shape (dtype=fp8_ocp, hidden=4096, topk=8, local_experts=32, zero_copy=False); using static geometry defaults.
+weights + 8 copies of both layouts: 1 s
+[aiter.ops.flydsl.kernels.flydsl_dispatch_combine_intranode_op] Tuning file /tmp/fiona_aiter/aiter/configs/tuned_dispatch_combine_intranode.csv has no rule matching shape (dtype=fp8_ocp, hidden=4096, topk=8, local_experts=32, zero_copy=False); using static geometry defaults.
+[aiter.ops.flydsl.kernels.flydsl_dispatch_combine_intranode_op] Tuning file /tmp/fiona_aiter/aiter/configs/tuned_dispatch_combine_intranode.csv has no rule matching shape (dtype=fp8_ocp, hidden=4096, topk=8, local_experts=32, zero_copy=False); using static geometry defaults.
+[aiter.ops.flydsl.kernels.flydsl_dispatch_combine_intranode_op] Tuning file /tmp/fiona_aiter/aiter/configs/tuned_dispatch_combine_intranode.csv has no rule matching shape (dtype=fp8_ocp, hidden=4096, topk=8, local_experts=32, zero_copy=False); using static geometry defaults.
+[aiter.ops.flydsl.kernels.flydsl_dispatch_combine_intranode_op] Tuning file /tmp/fiona_aiter/aiter/configs/tuned_dispatch_combine_intranode.csv has no rule matching shape (dtype=fp8_ocp, hidden=4096, topk=8, local_experts=32, zero_copy=False); using static geometry defaults.
+[aiter.ops.flydsl.kernels.flydsl_dispatch_combine_intranode_op] Tuning file /tmp/fiona_aiter/aiter/configs/tuned_dispatch_combine_intranode.csv has no rule matching shape (dtype=fp8_ocp, hidden=4096, topk=8, local_experts=32, zero_copy=False); using static geometry defaults.
+[aiter.ops.flydsl.kernels.flydsl_dispatch_combine_intranode_op] Tuning file /tmp/fiona_aiter/aiter/configs/tuned_dispatch_combine_intranode.csv has no rule matching shape (dtype=fp8_ocp, hidden=4096, topk=8, local_experts=32, zero_copy=False); using static geometry defaults.
+instances: 1 s
+
+=== M 1/rank (8 tokens): warm-up 0 s; fiona cfg s1 bm32 tn256 wpe1 dcu64 bnt3; s2 bm32 bn128; mega None
+accuracy vs fp32 ref (max over ranks): fiona: cos 1.12e-03 relL2 0.0474; mega_small(t1024): cos 9.87e-04 relL2 0.0444
+cold (us, slowest rank, median [p10, p90]): fiona 205.3 [204.3, 207.6]; mega_small(t1024) 71.7 [71.0, 74.1]; fiona#2 205.2 [204.1, 207.0]
+graph8 (us per call, slowest rank, median [min, max] over rounds): fiona 194.6 [194.4, 195.1]; mega_small(t1024) 61.7 [61.6, 61.8]; fiona#2 194.7 [194.4, 316.7]
+
+=== M 2/rank (16 tokens): warm-up 0 s; fiona cfg s1 bm32 tn256 wpe1 dcu64 bnt3; s2 bm32 bn128; mega None
+accuracy vs fp32 ref (max over ranks): fiona: cos 1.11e-03 relL2 0.0472; mega_small(t1024): cos 1.03e-03 relL2 0.0454
+cold (us, slowest rank, median [p10, p90]): fiona 214.6 [212.5, 216.9]; mega_small(t1024) 94.2 [92.9, 96.4]; fiona#2 214.1 [212.8, 215.8]
+graph8 (us per call, slowest rank, median [min, max] over rounds): fiona 212.0 [211.1, 215.6]; mega_small(t1024) 86.3 [85.5, 86.7]; fiona#2 212.6 [210.6, 215.7]
+
+=== M 4/rank (32 tokens): warm-up 0 s; fiona cfg s1 bm32 tn256 wpe1 dcu64 bnt3; s2 bm32 bn128; mega None
+accuracy vs fp32 ref (max over ranks): fiona: cos 1.12e-03 relL2 0.0474; mega_small(t1024): cos 9.56e-04 relL2 0.0437
+cold (us, slowest rank, median [p10, p90]): fiona 353.0 [351.2, 354.9]; mega_small(t1024) 125.7 [123.6, 130.6]; fiona#2 353.4 [351.9, 355.7]
+graph8 (us per call, slowest rank, median [min, max] over rounds): fiona 347.6 [345.7, 444.1]; mega_small(t1024) 117.8 [116.9, 220.3]; fiona#2 346.6 [344.7, 348.4]
+
+### cold
+
+| M/rank | tokens | fiona | mega_small | mega | fiona / mega_small | fiona#2 delta |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 8 | 205.3 | 71.7 | nan | 2.86x | -0.1% |
+| 2 | 16 | 214.6 | 94.2 | nan | 2.28x | -0.2% |
+| 4 | 32 | 353.0 | 125.7 | nan | 2.81x | +0.1% |
+
+### graph8
+
+| M/rank | tokens | fiona | mega_small | mega | fiona / mega_small | fiona#2 delta |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 8 | 194.6 | 61.7 | nan | 3.15x | +0.1% |
+| 2 | 16 | 212.0 | 86.3 | nan | 2.46x | +0.3% |
+| 4 | 32 | 347.6 | 117.8 | nan | 2.95x | -0.3% |
+
+### accuracy vs fp32 (cos diff / rel L2, max over ranks)
+
+| M/rank | fiona | mega_small | mega |
+|---:|---|---|---|
+| 1 | 1.12e-03 / 0.0474 | 9.87e-04 / 0.0444 | - |
+| 2 | 1.11e-03 / 0.0472 | 1.03e-03 / 0.0454 | - |
+| 4 | 1.12e-03 / 0.0474 | 9.56e-04 / 0.0437 | - |

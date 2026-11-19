@@ -1,0 +1,20 @@
+rocprofv3 --pmc (4 passes) around: cmp_fiona.py -m 48 --protocols cold --iters 2 --no-mega
+mean per dispatch over the profiled ranks; cycle counters are distorted by the profiler's
+per-dispatch serialization (the kernels spin on peers): use the instruction counts only.
+
+fiona SmallMRuntime
+   SQ_INSTS_VALU            135.72 M
+   SQ_INSTS_MFMA              3.15 M
+   SQ_INSTS_SALU             11.71 M
+   SQ_INSTS_LDS               3.05 M
+   SQ_INSTS_VMEM_RD          16.13 M
+   TCC_EA0_RDREQ_sum          3.40 M
+   VALU / MFMA 43.1; VALU per SIMD (304 CU x 4) 112 k
+pyhip mega_small
+   SQ_INSTS_VALU             20.86 M
+   SQ_INSTS_MFMA              1.68 M
+   SQ_INSTS_SALU              2.58 M
+   SQ_INSTS_LDS               0.95 M
+   SQ_INSTS_VMEM_RD           1.41 M
+   TCC_EA0_RDREQ_sum          3.44 M
+   VALU / MFMA 12.4; VALU per SIMD (304 CU x 4) 17 k
