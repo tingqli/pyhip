@@ -11,9 +11,9 @@ through LDS). ``ep_mega_comm.py`` (quant, prep, plan, finish) runs around it.
 
 Rows: every rank receives its routes sorted by local expert, each expert padded to
 ``BLOCK_M`` (128) rows = one m-block, the sources' routes interleaved inside an expert.
-Producers write a route's fp8 x row + its 1x128 scales, (source rank, token, slot) and
-weight straight into the destination's row (symmetric MORI heap), then add 1 to the
-destination's ``arrived[block]``.
+Producers write a route's fp8 x row + its 1x128 scales (QX 0: its row scale), (source rank,
+token, slot) and weight straight into the destination's row (symmetric MORI heap), then add
+1 to the destination's ``arrived[block]``.
 
 Workgroups (one per CU, 512 threads, 64 KB LDS) take tickets from 8 per-XCD queues (a
 contiguous share of the blocks each; an empty queue sends a workgroup to the next ones)
@@ -24,8 +24,9 @@ until all are empty. Each queue holds:
                       the gemm1 tiles of group u and the gemm2 tiles of group u - lag
                       (the combine traffic spreads over the whole kernel).
 gemm1(b, n): waits until arrived[b] = the routes block b receives; 128 rows x 128 inter
-cols (gate + up = 256 W rows); A = the received fp8 rows, rescaled per 128-K group (XG);
-SiLU / SiTUv2; fp8 a2 + one f32 scale per (row, 128 cols), written through; done[b] += 1.
+cols (gate + up = 256 W rows); A = the received fp8 rows, rescaled per 128-K group (XG;
+QX 0: one scale per row, applied in the epilogue); SiLU / SiTUv2; fp8 a2 + one f32 scale
+per (row, 128 cols), written through; done[b] += 1.
 gemm2(b, n): waits until done[b] = I / 128; 128 rows x 256 out cols; a2 rescaled per
 128-K group; times the route weight; BF16 atomics into out[token] of the source rank.
 A task only waits for producers (which never wait) or for lower tickets of its queue
@@ -75,11 +76,12 @@ ARB = 128  # A bytes per row per K tile (one 128-K group)
 
 @flydsl_kernel
 def ep_mega_kernel(*, H, I, TOPK, token_shift, producers=16, lag=2, ROWV=(32, 64, 128),
-                   NI=128, NO=256, NW=8, PF=2, ACT="silu", BCM1=2, BCM2=2):
+                   NI=128, NO=256, NW=8, PF=2, QX=1, ACT="silu", BCM1=2, BCM2=2):
     """The mega kernel for (H, I, top-k); ``token_shift``: bits of the source
-    token in a row's down id (max tokens per rank <= 1 << token_shift). ``BCM1`` /
+    token in a row's down id (max tokens per rank <= 1 << token_shift). ``QX``: x scales
+    (``mega_quant_kernel``), 1 one per (row, 128 cols), 0 one per row. ``BCM1`` /
     ``BCM2``: gemm1 / gemm2 W load cache modifier (2 = nt)."""
-    assert ACT in ("silu", "situv2"), ACT
+    assert ACT in ("silu", "situv2") and QX in (0, 1), (ACT, QX)
     BM = BLOCK_M
     NT = 64 * NW
     N2 = 2 * I
@@ -106,7 +108,7 @@ def ep_mega_kernel(*, H, I, TOPK, token_shift, producers=16, lag=2, ROWV=(32, 64
     kname = (f"a8w4_megamoe_ep_h{H}_i{I}_k{TOPK}_t{token_shift}_p{producers}_l{lag}"
              f"_r{'x'.join(map(str, ROWV))}_ni{NI}_no{NO}_pf{PF}"
              + ("" if (BCM1, BCM2) == (2, 2) else f"_bcm{BCM1}{BCM2}")
-             + ("" if ACT == "silu" else f"_{ACT}"))
+             + ("" if QX else "_xrow") + ("" if ACT == "silu" else f"_{ACT}"))
 
     @fx.struct
     class SharedStorage:
@@ -229,11 +231,11 @@ def ep_mega_kernel(*, H, I, TOPK, token_shift, producers=16, lag=2, ROWV=(32, 64
             rows_cap = a["nblk"] * fx.Int32(BM)
             n_routes = a["routes"]
             x_rs = _rsrc(a["x8"], fx.Int64(a["tokens"]) * fx.Int64(H))
-            xs_rs = _rsrc(a["xs"], fx.Int64(a["tokens"]) * fx.Int64(SCALE_LANES * 16))
+            xs_rs = _rsrc(a["xs"], fx.Int64(a["tokens"]) * fx.Int64(SCALE_LANES * 16 if QX else 4))
             w_rs = _rsrc(a["tw"], fx.Int64(n_routes) * fx.Int64(4))
             route_rs = _rsrc(a["route"], fx.Int64(n_routes) * fx.Int64(4))
             info_rs = _rsrc(a["info"], fx.Int64(n_routes) * fx.Int64(4))
-            scale_lane = lane < fx.Int32(SCALE_LANES)
+            scale_lane = lane < fx.Int32(SCALE_LANES if QX else 1)
             # lane r < NPES (and every lane, mod NPES): (lo, hi) of rank r's buffer bases
             peer = (lane & fx.Int32(NPES - 1)) * fx.Int32(2)
             bases = []
@@ -270,8 +272,11 @@ def ep_mega_kernel(*, H, I, TOPK, token_shift, producers=16, lag=2, ROWV=(32, 64
                     data = [_ld(x_rs, lane * fx.Int32(4) + fx.Int32(part * 256)
                                 + token * fx.Int32(H // 4), 4, ok)
                             for part in range_constexpr(H // 1024)]
-                    scales = _ld(xs_rs, lane * fx.Int32(4) + token * fx.Int32(SCALE_LANES * 4), 4,
-                                 ok & scale_lane)
+                    if const_expr(QX):
+                        scales = _ld(xs_rs, lane * fx.Int32(4) + token * fx.Int32(SCALE_LANES * 4),
+                                     4, ok & scale_lane)
+                    else:
+                        scales = _ld(xs_rs, token, 1, ok & scale_lane)
                     weight = _ld(w_rs, rt, 1, ok)
                     pending.append((rt, lane_value(infos, j), ok, token, data, scales, weight))
                 for rt, inf, ok, token, data, scales, weight in pending:
@@ -284,8 +289,9 @@ def ep_mega_kernel(*, H, I, TOPK, token_shift, producers=16, lag=2, ROWV=(32, 64
                             + row * fx.Int32(H // 4), mask=ok, cache_modifier=P2P_AUX)
                     buffer_store(
                         scales, peer_rsrc(1, dest, fx.Int64(rows_cap) * fx.Int64(SCALE_LANES * 16)),
-                        lane * fx.Int32(4) + row * fx.Int32(SCALE_LANES * 4), mask=ok & scale_lane,
-                        cache_modifier=P2P_AUX)
+                        (lane * fx.Int32(4) if QX else fx.Int32(0))
+                        + row * fx.Int32(SCALE_LANES * 4),
+                        mask=ok & scale_lane, cache_modifier=P2P_AUX)
                     first = ok & (lane == fx.Int32(0))
                     down_id = ((a["me"] << fx.Int32(token_shift)) | token) \
                         | ((rt & fx.Int32(TOPK - 1)) << fx.Int32(24))
@@ -429,9 +435,17 @@ def ep_mega_kernel(*, H, I, TOPK, token_shift, producers=16, lag=2, ROWV=(32, 64
                         spin_ge(a["ws"] + fx.Int64((fx.Int32(ARRIVED) + block) * fx.Int32(4)),
                                 n_valid, "one-as")
                     gpu.barrier()
-                    build_ratios(R)  # visible after the K loop's first barrier
+                    if const_expr(QX):
+                        build_ratios(R)  # visible after the K loop's first barrier
+                    else:  # LDS fin[r]: row r's x scale (the first of its G1N); padding: 1
+                        rs_rs = _rsrc(a["rs"], fx.Int64(rows_cap) * fx.Int64(G1N * 4))
+                        ok = tx < n_valid
+                        sc = fx.Int32(_ld(rs_rs, (bx_m + tx) * fx.Int32(G1N), mask=ok))
+                        _lds_f32_store_masked(lds_f32, fx.Int32(RATIO // 4 + G1N * BM) + tx,
+                                              ok.select(sc.bitcast(fx.Float32), fx.Float32(1.0)),
+                                              tx < fx.Int32(R))
 
-                acc = core(R, row_base16, hook, pre_a=pre_a)
+                acc = core(R, row_base16, hook if QX else None, pre_a=pre_a)
                 epilogue(R, acc)
                 rocdl.s_waitcnt(vmcnt=0)  # a2 written through
                 gpu.barrier()

@@ -12,10 +12,11 @@ streamed into VGPRs, fp8 A through LDS):
   straight into its expert's next row on the destination: one system-scope atomic on the
   destination's ``run[expert]`` gives the row. No count exchange, no plan kernel, no sort.
 - Producers (workgroups [0, P)): one wave per token (tokens striped over the producers
-  first): the bf16 row -> fp8 + one f32 scale per 128 columns in registers while the
-  token's routes take their rows (lanes [0, topk), one round trip), then the row, scales,
-  weight and source id go to each destination (written through). Each producer, once its
-  stores completed, adds DONE_UNIT / P to ``done[me]`` on every rank.
+  first): the bf16 row -> fp8 + f32 scales (QX 1: one per 128 columns, QX 0: one per row)
+  in registers while the token's routes take their rows (lanes [0, topk), one round
+  trip), then the row, scales, weight and source id go to each destination (written
+  through). Each producer, once its stores completed, adds DONE_UNIT / P to ``done[me]``
+  on every rank.
 - Plan: every workgroup waits for ``done`` of all ranks (epoch x DONE_UNIT), reads the 32
   ``run`` counts and derives the same tile list (BM-row m-tiles, expert order); nothing
   is published.
@@ -24,9 +25,10 @@ streamed into VGPRs, fp8 A through LDS):
   same m-tiles, so gemm2 mostly reads a2 rows its own XCD wrote (a2 is written through:
   at the slice ends, and for units taken from another XCD's counter once the own one is
   empty, another XCD reads them). gemm1 = ep_mega's (TR epilogue: act, fp8 a2 + one scale
-  per (row, 128 cols)); a gemm2 unit waits for the I/128 gemm1 units of its m-tile (W
-  prefetch already in flight), then writes every row (times the route weight, bf16) into
-  ``cin[token, slot]`` of the route's source rank: one wave per row.
+  per (row, 128 cols); QX 1 rescales the accumulator at every 128-K group, QX 0 applies
+  the row scale in the epilogue); a gemm2 unit waits for the I/128 gemm1 units of its
+  m-tile (W prefetch already in flight), then writes every row (times the route weight,
+  bf16) into ``cin[token, slot]`` of the route's source rank: one wave per row.
 - Combine: the last workgroup to finish (two-level count) resets the counters and sets
   ``cflag[me]`` = epoch on every rank; workgroup b < n (this rank's tokens) waits for
   ``cflag`` of all ranks and sums the topk rows of tokens b, b + GRID, ... into ``out``
@@ -113,13 +115,14 @@ def _addr(lo, hi):
 
 @flydsl_kernel
 def ep_mega_small_kernel(*, H, I, TOPK, TMAX, BM=64, NO=256, ARB=256, PF=2, P=16, WPC=1,
-                         ACT="silu", BCM1=2, BCM2=2):
+                         QX=1, ACT="silu", BCM1=2, BCM2=2):
     """The small megamoe kernel for (H, I, top-k) and batches of <= TMAX tokens over all
     ranks (fixed slots of TMAX rows per expert). ``BM``: rows of an m-tile (row variants
     16 .. BM); ``NO``: gemm2 output cols per unit; ``ARB`` / ``PF``: K bytes per A tile /
     W prefetch distance of both GEMMs; ``P``: producer workgroups; ``WPC``: workgroups per
-    CU; ``BCM1`` / ``BCM2``: gemm1 / gemm2 W load cache modifier (2 = nt)."""
-    assert ACT in ("silu", "situv2"), ACT
+    CU; ``QX``: x scales, 1 one per (row, 128 cols), 0 one per row; ``BCM1`` / ``BCM2``:
+    gemm1 / gemm2 W load cache modifier (2 = nt)."""
+    assert ACT in ("silu", "situv2") and QX in (0, 1), (ACT, QX)
     NW = 8
     NT = 64 * NW
     NI = 128
@@ -161,7 +164,7 @@ def ep_mega_small_kernel(*, H, I, TOPK, TMAX, BM=64, NO=256, ARB=256, PF=2, P=16
     assert LDS_BYTES <= LDS_BYTES_MAX // WPC, LDS_BYTES
     kname = (f"a8w4_megamoe_small_h{H}_i{I}_k{TOPK}_t{TMAX}_bm{BM}_no{NO}_a{ARB}_pf{PF}"
              f"_p{P}_w{WPC}" + ("" if (BCM1, BCM2) == (2, 2) else f"_bcm{BCM1}{BCM2}")
-             + ("" if ACT == "silu" else f"_{ACT}"))
+             + ("" if QX else "_xrow") + ("" if ACT == "silu" else f"_{ACT}"))
 
     @fx.struct
     class SharedStorage:
@@ -256,7 +259,9 @@ def ep_mega_small_kernel(*, H, I, TOPK, TMAX, BM=64, NO=256, ARB=256, PF=2, P=16
         def quant_row(raw, lane):
             """``load_row``'s chunks -> per lane: CH x 16 fp8 (i32x4) and, in lanes
             [0, H/128), the f32 scale of 128-col group ``lane`` (amax / 240, 1 for an all-zero
-            group; as mega_quant_kernel)."""
+            group; as mega_quant_kernel); QX 0: ``quant_row_xrow``."""
+            if const_expr(not QX):
+                return quant_row_xrow(raw)
             qs, ss = [], []
             for c in range_constexpr(CH):
                 vals = []
@@ -279,6 +284,28 @@ def ep_mega_small_kernel(*, H, I, TOPK, TMAX, BM=64, NO=256, ARB=256, PF=2, P=16
             for c in range_constexpr(CH):
                 sv = (lane // fx.Int32(8) == fx.Int32(c)).select(_bcast_lane(ss[c], src), sv)
             return qs, sv
+
+        def quant_row_xrow(raw):
+            """QX 0: ``load_row``'s chunks -> per lane: CH x 16 fp8 (i32x4) and the row's f32
+            scale (amax / 240 over the row, 1 for an all-zero row) in every lane."""
+            vals = []
+            am = fx.Float32(0.0)
+            for c in range_constexpr(CH):
+                vc = []
+                for h in range_constexpr(2):
+                    f = Vec(raw[c][h].bitcast(fx.BFloat16)).to(fx.Float32)
+                    vc.extend(fx.Float32(f[i]) for i in range(8))
+                for v in vc:
+                    am = fx.maxnumf(am, fx.absf(v))
+                vals.append(vc)
+            for s in range_constexpr(6):
+                am = fx.maxnumf(am, am.shuffle_xor(1 << s, 64))
+            sc = (am == fx.Float32(0.0)).select(fx.Float32(1.0), am / fx.Float32(240.0))
+            inv = fx.Float32(1.0) / sc
+            qs = [Vec.from_elements(
+                [_fp8x4_pack(*[vals[c][4 * j + i] * inv for i in range(4)]) for j in range(4)],
+                fx.Int32) for c in range(CH)]
+            return qs, sc.bitcast(fx.Int32)
 
         def produce(a, lane, wave):
             """Wave ``wave`` of producer ``bid``: tokens bid + P wave, + 8 P, ... (a small
@@ -321,7 +348,8 @@ def ep_mega_small_kernel(*, H, I, TOPK, TMAX, BM=64, NO=256, ARB=256, PF=2, P=16
                                          cache_modifier=P2P)
                         buffer_store(sv, _rsrc(db + fx.Int64(O_RS) + rk * fx.Int64(G1N * 4),
                                                G1N * 4),
-                                     lane, mask=lane < fx.Int32(G1N), cache_modifier=P2P)
+                                     lane, mask=lane < fx.Int32(G1N if QX else 1),
+                                     cache_modifier=P2P)
                         sid = fx.Int32((k << 24)) | (a["me"] << fx.Int32(16)) | t
                         first = lane == fx.Int32(0)
                         buffer_store(_readlane(wbits, k),
@@ -500,13 +528,22 @@ def ep_mega_small_kernel(*, H, I, TOPK, TMAX, BM=64, NO=256, ARB=256, PF=2, P=16
                 loaded = []
 
                 def pre_a():  # the W prefetch is in flight
-                    loaded.extend(ratio_issue(a["sym"] + fx.Int64(O_RS), ROWS * G1N * 4, G1N, R,
-                                              scale_row, tx))
+                    if const_expr(QX):
+                        loaded.extend(ratio_issue(a["sym"] + fx.Int64(O_RS), ROWS * G1N * 4, G1N,
+                                                  R, scale_row, tx))
+                    else:  # the rows' x scales (QX 0: the first of a row's G1N slots)
+                        rs_rs = _rsrc(a["sym"] + fx.Int64(O_RS), ROWS * G1N * 4)
+                        loaded.append(fx.Int32(_ld(rs_rs, scale_row(tx), mask=tx < n_valid)))
 
                 def post_a():  # the first A tile is in flight too
-                    ratio_finish(loaded, G1N)
+                    if const_expr(QX):
+                        ratio_finish(loaded, G1N)
+                    else:  # LDS fin[r]: row r's scale (padding rows: 1)
+                        sc = (tx < n_valid).select(loaded[0].bitcast(fx.Float32), fx.Float32(1.0))
+                        _lds_f32_store_masked(lds_f32, fx.Int32(RATIO // 4 + G1N * BM) + tx, sc,
+                                              tx < fx.Int32(R))
 
-                acc = core(R, row_base16, hook, pre_a=pre_a, post_a=post_a)
+                acc = core(R, row_base16, hook if QX else None, pre_a=pre_a, post_a=post_a)
                 epilogue(R, acc)
                 rocdl.s_waitcnt(vmcnt=0)  # a2 written through
                 gpu.barrier()

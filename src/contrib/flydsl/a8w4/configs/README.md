@@ -91,30 +91,40 @@ python -m pytest a8w4/tests/test_a8w4_moe.py -q -p no:cacheprovider
 
 ## a8w4_moe_ep_tuned.csv：EP 整层（`moe_ep`）
 
-`moe_ep`（`../moe_ep.py`）每个 rank 调用一次，在 solver `mega`、`mega_small`、`mori`、`mori_eager` 的全部配置里查这张表选一个。
+`moe_ep`（`../moe_ep.py`）每个 rank 调用一次，在 solver `mega`、`mega_small`、`mega_large`、`mori`、`mori_eager` 的全部配置里查这张表选一个。
 
-- **列**：`model_dim, inter_dim, experts_global, world, topk, routing, act, ~tokens, config, us, cos`。
-- **key**：`(model_dim, inter_dim, experts_global, world, topk, routing, act)`，本卡专家数由 `experts_global / world` 推出。
+- **列**：`model_dim, inter_dim, experts_global, world, topk, routing, act, x_quant, ~tokens, config, us, cos`。
+- **key**：`(model_dim, inter_dim, experts_global, world, topk, routing, act, x_quant)`，本卡专家数由 `experts_global / world` 推出。`x_quant` 是调用方给的 fp8 x 的 scale 粒度：`per_1x128`（每 (行, 128 列) 一个，MORI 的 blockwise fp8）或 `per_token`（每行一个，与 `a8w4_moe` 相同）；`moe_ep_ref` 按它量化 x，所以每个配置都和同一种量化的参考比。
 - **分桶列** `~tokens`：所有 rank 的 token 总数。
 - **`us`**：各 rank 对齐后最慢的那个 rank 的时间。
-- **当前内容**：`mimo-flash2.6-ep8-silu` 和 `-situv2` 两个 problem（4096/2048/256/EP8/topk 8，uniform），token 点为 `tune.EP_TOKENS`（64–32768），每点 32 个配置（mega 18、mega_small 2、mori 6、mori_eager 6）。`mega_small` 在 `tokens` > 1024 时报错（n/a，不写入表），共 620 行。
-- **来源**：20261118 用下面的命令生成，耗时 13.9 min，没有 BAD 配置。第一遍有两类异常，在空闲机器上重调这些点后 `merge` 进表：
-  - silu 512–4096、situv2 64 / 128：`mori` 或 `mori_eager` 的时间是重调后的 1.2–3.6 倍，同点的 mega 和 mega_small 不受影响；
-  - situv2 16384 / 32768：`mega` 比上一版表慢 4.1% / 3.0%。重调后 16384 恢复；32768 仍慢 3.8%（3268.9 vs 3150.2 us，原因未查；silu 同点与上一版表一致）。
-- **结果**（与上一版表比较：`../experiments/20261118_mega_small/tune_compare.txt`，记录在 `../experiments/log_20261118.md`）：
-  - 64–1024 tokens：都选 `mega_small`。比上一版表的最快配置快 15.5–19.1%（≤512 tokens）和 6.0–6.3%（1024 tokens）。≤512 tokens 时 bm32 与 bm64 相差不到 1%，1024 tokens 时 bm32 慢 14%。
-  - ≥2048 tokens：仍选 `mega`，与上一版表相差不到 0.5%。
-  - `mega` 在 64–512 tokens 的时间是 `mega_small` 的 1.21–1.28 倍，1024 tokens 时为 1.06 倍。
-  - `mori` 在每个点都不是最快，时间是最快配置的 1.18–1.34 倍；`mori_eager`（在主机上读收到的 token 数）的时间是 `mori` 的 1.02–2.8 倍。
+- **当前内容**：4 个 problem `mimo-flash2.6-ep8-{silu,situv2}-{per_1x128,per_token}`（4096/2048/256/EP8/topk 8，uniform），token 点为 `tune.EP_TOKENS`（64–32768）。
+  - per_1x128 每点 36 个配置：mega 18、mega_small 2、mega_large 4、mori 6、mori_eager 6。
+  - per_token 每点 24 个配置：mori 两族不支持 per_token，报错（n/a）。
+  - `mega_small` 在 `tokens` > 1024 时报错（n/a，不写入表）。
+  - 共 1160 行。
+- **来源**：20261119 `x_quant` 成为 dim 后，用下面的命令整表重新生成（23.6 min，无 BAD）。
+  - 第一遍里 silu per_1x128 在 128 / 512 / 1024 tokens 处 mori 两族的部分配置慢了 1.3–4.6 倍，是偶发的，别的族不受影响。这 3 个点重调后 merge 进表。
+  - 日志、逐点比较和每个 solver 的最快配置在 `../experiments/20261118_mega_large/tune_xq_*`，总结在 `../experiments/log_20261118c.md` 第 7 节。
+- **结果**（`tune_xq_compare.md`）：
+  - 两种 x_quant、两种 act 的交界相同：≤1024 tokens 选 `mega_small`，2048–16384 选 `mega_large`。32768 tokens 时 per_1x128 选 `mega_large`，per_token 选 `mega`（比 `mega_large` 快 3.0–3.6%）。
+  - `mega_large` 的 combine：2048 tokens 都选 `cadd`，4096 都选 `cfp8`，更大的点两种都出现。
+  - per_1x128 与上一版表里同样量化的最快配置相差 ±0.5%（situv2 32768 tokens −3.8%，属于单点波动），默认路径没有变慢。
+  - per_token 比 per_1x128 快：≤1024 tokens 快 1.2–4.9%，≥2048 tokens 快 4.8–7.3%。
+  - silu ≤512 tokens 的 per_token 比上一版表里唯一的逐行量化配置（`mega_large ... xrow`）快 9.0–12.1%，因为现在 `mega_small` 也支持 per_token。
+  - `mori` 在每个点都不是最快：per_1x128 时是最快配置的 1.17–1.39 倍。
+
+上一版（20261118，加入 `mega_large`；x 的量化方式还是 `mega_large` 的 knob `qx`）：silu ≥1024 tokens 选 `mega_large ... xrow`，situv2 ≥2048 选 `mega_large ... x128`（`../experiments/20261118_mega_large/tune_compare.txt`，log 第 4 节）。
+
+更早一版（20261118，加入 `mega_small`）：64–1024 tokens 换成 `mega_small`，≤512 tokens 比更早的表快 15.5–19.1%，1024 tokens 快 6.0–6.3%（`../experiments/20261118_mega_small/tune_compare.txt`，`../experiments/log_20261118.md`）。
 
 ```bash
 cd pyhip/src/contrib/flydsl
-# 每个 problem 是一个 8 rank 的任务，两个 problem 依次跑；tune-all 自己拿 GPU 锁
+# 每个 problem 是一个 8 rank 的任务，4 个 problem 依次跑；tune-all 自己拿 GPU 锁（tune / verify 不拿）
 python -m kernelkit tune-all a8w4.tune:EP_TUNING --gpus 0-7 --out /tmp/a8w4_ep
 cp /tmp/a8w4_ep/a8w4_moe_ep_tuned.new.csv a8w4/configs/a8w4_moe_ep_tuned.csv
 python -m kernelkit show   a8w4.tune:EP_TUNING mimo-flash2.6-ep8
 python -m kernelkit verify a8w4.tune:EP_TUNING mimo-flash2.6-ep8 -t 20 100 300 1000 3000 20000
 # 某些点的结果异常时，在空闲机器上重调这些点，再 merge 进表：
-python -m kernelkit tune  a8w4.tune:EP_TUNING mimo-flash2.6-ep8-situv2 -t 64 128 16384 32768 --out /tmp/re.csv
+python -m kernelkit tune  a8w4.tune:EP_TUNING mimo-flash2.6-ep8-situv2-per_1x128 -t 64 128 16384 32768 --out /tmp/re.csv
 python -m kernelkit merge a8w4.tune:EP_TUNING /tmp/re.csv
 ```

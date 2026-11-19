@@ -1,0 +1,554 @@
+--- kernels/ep_mega_large.py
++++ ep_mega_large_tl.py
+@@ -37,15 +37,11 @@
+   expert with the same j (the same W1 slab) run on one XCD. gemm1 waits until the m-tile's
+   rows arrived; TR epilogue (act, fp8 a2 + one scale per (row, 128 cols), written
+   through); then the m-tile's gemm1 count goes up. gemm2 waits for the I / 128 gemm1 units
+-  of its m-tile; the rows times their weights go back to the routes' source ranks: COMB
+-  "add": BF16 atomics into ``out[token]`` (as ``ep_mega``); COMB "fp8" (aiter's transport):
+-  fp8 + one f32 scale per 128 cols into ``cin[token, slot]`` (half the XGMI bytes; the
+-  atomics are bound by them at large batches).
++  of its m-tile; the rows times their weights, BF16 atomics into ``out[token]`` of the
++  route's source rank (as ``ep_mega``).
+ - Finish: the last workgroup to finish (two-level count) sets ``fflag[me]`` = epoch on every
+-  rank and resets the local counters. COMB "add": it waits for every rank's ``fflag`` (all
+-  adds into this rank's ``out`` are done: when the kernel ends, ``out`` is complete).
+-  COMB "fp8": every workgroup waits for them, then workgroup b sums the slots of tokens b,
+-  b + NUM_CU, ... (f32) into ``out``.
++  rank, waits for every rank's ``fflag`` (all adds into this rank's ``out`` are done: when
++  the kernel ends, ``out`` is complete), resets the local counters and stores the epoch.
+ 
+ Epoch: ``ctl[LC_EPOCH] + 1``, stored back by the last workgroup: the same on every rank as
+ long as every rank makes the same calls, right in CUDA graph replays. A rank starts call N + 1
+@@ -117,6 +113,8 @@
+ 
+ P2P = CM_SYS | CM_NT  # stores into a rank's (uncached) heap: written through
+ WT = CM_SC1  # x8 / a2: written through (read by another XCD)
++TLW = 512  # TL: i32 per workgroup (i64 slots: phases [0, 16), unit k: 16 + 4k ..)
++TL_UNITS = 60
+ 
+ 
+ def _lane_bcast(v, src_lane):
+@@ -142,18 +140,18 @@
+ 
+ 
+ @flydsl_kernel
+-def ep_mega_large_kernel(*, H, I, TOPK, TCAP, P=16, NO=256, ARB=128, PF=2, QX=1, COMB="add",
+-                         ACT="silu", BCM1=2, BCM2=2):
++def ep_mega_large_kernel(*, H, I, TOPK, TCAP, P=16, NO=256, ARB=128, PF=2, QX=1, LAG=0,
++                         COMB=0, ACT="silu", BCM1=2, BCM2=2, TL=0, LCOMB=0):
+     """The large megamoe kernel for (H, I, top-k) and up to TCAP tokens per rank (a power of
+     2). ``P``: producer workgroups (a multiple of 8); ``NO``: gemm2 output cols per unit;
+     ``ARB`` / ``PF``: K bytes per A tile / W prefetch distance of both GEMMs; ``QX``: x
+     scales, 1 one per (row, 128 cols) (gemm1 rescales its accumulator at every 128-K group,
+-    as ep_mega), 0 one per token row; ``COMB``: "add" (BF16 atomics into the source rank's
+-    ``out``) or "fp8" (fp8 rows + scales into its ``cin``, summed there); ``BCM1`` /
+-    ``BCM2``: gemm1 / gemm2 W load cache modifier (2 = nt)."""
++    as ep_mega), 0 one per token row; ``BCM1`` /
++    ``BCM2``: gemm1 / gemm2 W load cache modifier (2 = nt). ``TL`` 1: every workgroup writes
++    ``s_memrealtime`` at its phase ends and around its units into ``ctl[LC_TL + TLW bid ..]``
++    (analysis only)."""
+     assert ACT in ("silu", "situv2"), ACT
+-    assert QX in (0, 1) and COMB in ("add", "fp8"), (QX, COMB)
+-    FP8C = COMB == "fp8"
++    assert QX in (0, 1) and COMB in (0, 1, 2), (QX, COMB)
+     NW = 8
+     NT = 64 * NW
+     NI = 128
+@@ -181,17 +179,17 @@
+     DONE_UNIT = 64
+     ROWV = (32, 64, 128)
+     RPS = NT // 32  # gemm2 scatter rows per pass (32 lanes x 2 cols per row)
+-    SCAN_B = 8  # producer scan: route ids per thread with their loads issued together
++    SCAN_B = 4  # producer scan: 16 B loads of route ids per thread issued together
+     off, _ = large_sym_layout(H, TOPK, TCAP)
+     O_RX, O_RSX, O_RW, O_RID = off["rx"], off["rsx"], off["rw"], off["rid"]
+     O_CNT, O_PBASE, O_CDONE = off["cnt"], off["pbase"], off["cdone"]
+     O_PFLAG, O_FFLAG, O_TREADY, O_OUT = off["pflag"], off["fflag"], off["tready"], off["out"]
+-    O_CIN, O_CINS = off["cin"], off["cins"]
+-    LPR = NO // 8  # COMB fp8, gemm2 row stores: lanes per row (8 cols each)
++    O_CIN = off["cin"]
++    O_CINS = O_CIN + TCAP * TOPK * H  # COMB 2: fp8 rows, then f32 [TCAP x TOPK, H / 128]
++    LPR = NO // 8  # COMB 1, gemm2 row stores: lanes per row (16 B each)
+     SRP = NT // LPR  # rows per pass
+-    assert not FP8C or (H == 8 * NT and NT % LPR == 0 and NO % 128 == 0), (
+-        "fp8 combine: a row is 8 cols per thread, 16 lanes a 128-col group")
+-    LC_G1 = large_ctl_ints(TOPK, TCAP)[0]
++    assert not COMB or (H == 8 * NT and NT % LPR == 0), "combine: a row is 16 B per thread"
++    LC_G1, LC_TL, _ = large_ctl_ints(TOPK, TCAP)
+     assert 1 << TOPK_SHIFT == TOPK and TOPK <= 8 and TCAP == 1 << TSH and TSH + 3 <= 24, (
+         TOPK, TCAP)
+     assert P % NPES == 0 and KP & (KP - 1) == 0 and E_LOCAL % KP == 0 and DONE_UNIT % KP == 0
+@@ -202,7 +200,7 @@
+     L_XS = RATIO  # (QX 1: ratio tables [G1N][BM] + fin [BM]), gemm2's [G2N][BM] + fin [BM]
+     # LDS words (outside the units): [0, 4) broadcast; the planner's count matrix [256],
+     # segment starts [256], first m-tile [33] and rows [32] of each expert; a producer's
+-    # segment sizes [EPP], starts [EPP], chunk prefix [EPP + 1], routes dropped [1]
++    # segment sizes [EPP], starts [EPP], chunk prefix [EPP + 1]
+     L_BC = 0
+     L_PC = 16
+     L_PB = L_PC + NPES * E_LOCAL
+@@ -215,9 +213,11 @@
+                     BM * NO * 2, BM * NW * 4, (L_TOT + E_LOCAL) * 4, (L_CHP + 65) * 4)
+     assert LDS_BYTES <= LDS_BYTES_MAX, LDS_BYTES
+     kname = (f"a8w4_megamoe_large_h{H}_i{I}_k{TOPK}_t{TCAP}_p{P}_no{NO}_a{ARB}_pf{PF}"
+-             + ("" if QX else "_xrow") + ("_cfp8" if FP8C else "")
++             + ("" if QX else "_xrow") + (f"_lag{LAG}" if LAG else "")
++             + ("" if not COMB else "_cs" if COMB == 1 else "_cs8")
+              + ("" if (BCM1, BCM2) == (2, 2) else f"_bcm{BCM1}{BCM2}")
+-             + ("" if ACT == "silu" else f"_{ACT}"))
++             + ("" if ACT == "silu" else f"_{ACT}") + ("_tl" if TL else "")
++             + ("_lcomb" if LCOMB else ""))
+ 
+     @fx.struct
+     class SharedStorage:
+@@ -250,6 +250,20 @@
+         def ctl_at(i):
+             return ctl0 + fx.Int64(fx.Int32(i) * fx.Int32(4))
+ 
++        def stamp(slot, value=None):
++            """TL: thread 0 writes the realtime clock (100 MHz), or ``value``, into i64 slot
++            ``slot`` of this workgroup's timeline (a masked store: no branch)."""
++            if const_expr(TL):
++                if value is None:
++                    value = fx.Int64(llvm.inline_asm(
++                        T.i64, [], "s_memrealtime $0\ns_waitcnt lgkmcnt(0)", "=s",
++                        has_side_effects=True))
++                tl_rs = _rsrc(ctl_at(fx.Int32(LC_TL) + bid * fx.Int32(TLW)), TLW * 4)
++                buffer_store(Vec.from_elements([fx.Int64(value)], fx.Int64).bitcast(fx.Int32),
++                             tl_rs, fx.Int32(slot) * fx.Int32(2), mask=tx0 == fx.Int32(0))
++
++        stamp(0)
++
+         def lane0_add(addr, value):
+             """Atomic add by lane 0 only (old value in lane 0). The address goes through an
+             opaque VGPR zero: at a uniform address LLVM's atomic optimizer would sum the
+@@ -326,7 +340,7 @@
+         def quant(a, qi):
+             """Wave w of quant workgroup qi: tokens qi NW + w, + NQ NW, ...: the bf16 row ->
+             fp8 + f32 scales (amax / 240, 1 for all zeros; one per row, QX 1: per 128 cols),
+-            written through; COMB "add": the row of ``out`` zeroed."""
++            written through; the row of ``out`` zeroed."""
+             tx, lane, wave = _opaque_tx(tx0)
+             n_ = a["n"]
+             x_rs = _rsrc(a["x"], fx.Int64(n_) * fx.Int64(H * 2))
+@@ -374,7 +388,7 @@
+                                      mask=lane % fx.Int32(16) == fx.Int32(0), cache_modifier=WT)
+                 if const_expr(not QX):
+                     buffer_store(scs[0], xs_rs, t, mask=lane == fx.Int32(0), cache_modifier=WT)
+-                if const_expr(not FP8C):
++                if const_expr(not COMB):
+                     for c in range_constexpr(CQ):
+                         buffer_store(zero4, out_rs, t * fx.Int32(H // 2) + fx.Int32(c * 256)
+                                      + lane * fx.Int32(4))
+@@ -399,19 +413,22 @@
+             nr = a["n"] * fx.Int32(TOPK)
+             ids_rs = _rsrc(a["ids"], fx.Int64(nr) * fx.Int64(4))
+             lists_p = global_typed_ptr(a["lists"], T.i32)
+-            for r0 in range(fx.Int32(0), nr, SCAN_B * NT):
+-                gs = [fx.Int32(_ld(ids_rs, r0 + fx.Int32(j * NT) + tx0,
+-                                   mask=r0 + fx.Int32(j * NT) + tx0 < nr))
++            # 16 B loads (4 ids; nr is a multiple of TOPK, so of 4): SCAN_B per thread in
++            # flight
++            for r0 in range(fx.Int32(0), nr, SCAN_B * 4 * NT):
++                gs = [Vec(_ld(ids_rs, r0 + fx.Int32(j * 4 * NT) + tx0 * fx.Int32(4), 4,
++                              mask=r0 + fx.Int32(j * 4 * NT) + tx0 * fx.Int32(4) < nr))
+                       for j in range(SCAN_B)]
+                 for j in range_constexpr(SCAN_B):
+-                    r = r0 + fx.Int32(j * NT) + tx0
+-                    g = gs[j]
+-                    el = g & fx.Int32(E_LOCAL - 1)
+-                    mine = ((r < nr) & (g >= fx.Int32(0)) & (g < fx.Int32(E_GLOBAL))
+-                            & ((g >> fx.Int32(5)) == d) & ((el & fx.Int32(KP - 1)) == k))
+-                    if mine:
+-                        pos = _latomic_add(lds_i32, fx.Int32(L_CNTP) + el // fx.Int32(KP), 1)
+-                        _store(lists_p, g * fx.Int32(TCAP) + pos, r)
++                    for i in range_constexpr(4):
++                        r = r0 + fx.Int32(j * 4 * NT + i) + tx0 * fx.Int32(4)
++                        g = fx.Int32(gs[j][i])
++                        el = g & fx.Int32(E_LOCAL - 1)
++                        mine = ((r < nr) & (g >= fx.Int32(0)) & (g < fx.Int32(E_GLOBAL))
++                                & ((g >> fx.Int32(5)) == d) & ((el & fx.Int32(KP - 1)) == k))
++                        if mine:
++                            pos = _latomic_add(lds_i32, fx.Int32(L_CNTP) + el // fx.Int32(KP), 1)
++                            _store(lists_p, g * fx.Int32(TCAP) + pos, r)
+             rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0)
+             gpu.barrier()
+             if tx0 < fx.Int32(EPP):
+@@ -449,13 +466,11 @@
+                 if lane < fx.Int32(EPP):
+                     _store(lds, fx.Int32(L_PBS) + j, b)
+                     _store(lds, fx.Int32(L_CHP) + j, inc - nch)
+-                over = rocdl.ballot(T.i64, _raw((lane < fx.Int32(EPP)) & (b + c > fx.Int32(SCAP))))
+                 if lane == fx.Int32(EPP - 1):
+                     _store(lds, fx.Int32(L_CHP + EPP), inc)
+-                    _store(lds, fx.Int32(L_CHP + EPP + 1),
+-                           (fx.Int64(over) != fx.Int64(0)).select(fx.Int32(1), fx.Int32(0)))
+             rocdl.s_waitcnt(lgkmcnt=0)
+             gpu.barrier()
++            stamp(2)
+             total = _u(lds[fx.Int32(L_CHP + EPP)])
+             nr = a["n"] * fx.Int32(TOPK)
+             dbase = peer_u(a, d)
+@@ -468,6 +483,7 @@
+             w_rs = _rsrc(a["tw"], fx.Int64(nr) * fx.Int64(4))
+             lists_rs = _rsrc(a["lists"], E_GLOBAL * TCAP * 4)
+             q = wave
++            nq = fx.Int32(0)
+             while q < total:
+                 j = fx.Int32(0)
+                 for jj in range_constexpr(1, EPP):
+@@ -480,6 +496,10 @@
+                 i0 = (q - c0) * fx.Int32(CH)
+                 m = fx.min(cnt - i0, fx.Int32(CH))
+                 rts = fx.Int32(_ld(lists_rs, g * fx.Int32(TCAP) + i0 + lane, mask=lane < m))
++                tq = fx.Int32(8) + fx.Int32(4) * fx.min(nq, fx.Int32(1))
++                if const_expr(TL):
++                    rocdl.s_waitcnt(vmcnt=0)
++                    stamp(tq)
+                 # all loads of the chunk before any store (a store may alias a later load
+                 # for all LLVM knows)
+                 pending = []
+@@ -494,6 +514,9 @@
+                              ok & (lane < fx.Int32(XSN)))
+                     wt = _ld(w_rs, rt, 1, ok)
+                     pending.append((rt, row, ok, token, data, sc, wt))
++                if const_expr(TL):
++                    rocdl.s_waitcnt(vmcnt=0)
++                    stamp(tq + fx.Int32(1))
+                 for rt, row, ok, token, data, sc, wt in pending:
+                     for part in range_constexpr(H // 1024):
+                         buffer_store(data[part], rx_rs, row * fx.Int32(H // 4)
+@@ -508,6 +531,7 @@
+                     buffer_store(wt, rw_rs, row, mask=first, cache_modifier=P2P)
+                     buffer_store(sid, rid_rs, row, mask=first, cache_modifier=P2P)
+                 rocdl.s_waitcnt(vmcnt=0)  # the chunk's rows landed
++                stamp(tq + fx.Int32(2))
+                 r0 = base + i0
+                 r1 = fx.min(r0 + m, fx.Int32(SCAP))
+                 t0 = r0 // fx.Int32(BM)
+@@ -521,29 +545,9 @@
+                     _atomic_add_at(dbase + fx.Int64(O_TREADY) + fx.Int64((t0 + fx.Int32(1))
+                                                                          * fx.Int32(4)), n1,
+                                    "one-as")
++                stamp(tq + fx.Int32(3))
++                nq = nq + fx.Int32(1)
+                 q = q + fx.Int32(NW)
+-            if const_expr(FP8C):
+-                if _u(lds[fx.Int32(L_CHP + EPP + 1)]) != fx.Int32(0):
+-                    drop_slots(a, d, k, lists_rs, wave, lane)
+-
+-        def drop_slots(a, d, k, lists_rs, wave, lane):
+-            """COMB "fp8", producer (d, k) with routes past the destination's s_cap (not
+-            sent): their slots of this rank's ``cin`` -> 0 (the combine adds them)."""
+-            cin_rs = _rsrc(a["sym"] + fx.Int64(O_CIN), TCAP * TOPK * H)
+-            cins_rs = _rsrc(a["sym"] + fx.Int64(O_CINS), TCAP * TOPK * (H // 128) * 4)
+-            zero4 = Vec.filled(4, 0, fx.Int32)
+-            for j in range(fx.Int32(0), fx.Int32(EPP), fx.Int32(1)):
+-                g = d * fx.Int32(E_LOCAL) + k + fx.Int32(KP) * j
+-                cnt = _u(lds[fx.Int32(L_CNTP) + j])
+-                i = fx.max(fx.Int32(SCAP) - _u(lds[fx.Int32(L_PBS) + j]), fx.Int32(0)) + wave
+-                while i < cnt:
+-                    rt = fx.Int32(_ld(lists_rs, g * fx.Int32(TCAP) + i))
+-                    for part in range_constexpr(H // 1024):
+-                        buffer_store(zero4, cin_rs, rt * fx.Int32(H // 4) + fx.Int32(part * 256)
+-                                     + lane * fx.Int32(4), cache_modifier=P2P)
+-                    buffer_store(fx.Float32(0.0), cins_rs, rt * fx.Int32(H // 128) + lane,
+-                                 mask=lane < fx.Int32(H // 128), cache_modifier=P2P)
+-                    i = i + fx.Int32(NW)
+ 
+         # -------------------------------------------------------------- planner
+         def planner(a):
+@@ -738,6 +742,7 @@
+                         spin_ge(a["sym"] + fx.Int64(O_TREADY) + fx.Int64(t * fx.Int32(4)),
+                                 n_valid, "one-as")
+                     gpu.barrier()
++                    stamp(fx.Int32(17) + fx.Int32(4) * a["k"])
+                     if const_expr(QX):
+                         build_ratios(R)  # visible after the K loop's first barrier
+                     else:
+@@ -822,48 +827,58 @@
+                                                               fx.Float32))
+ 
+             def scatter(R):
+-                """rows of the bf16 LDS tile [R, NO] back to the routes' source ranks: BF16x2
+-                atomics into out[token] (128 B per row per pass); COMB "fp8": fp8 + one f32
+-                scale per 128 cols into cin[token, slot] (8 cols per lane, 16 lanes a group)."""
++                """rows of the bf16 LDS tile [R, NO] -> BF16x2 atomics into out[token] of the
++                route's source rank (128 B per row per pass); COMB 1: row stores into
++                cin[token, slot] of the source rank (16 B per lane)."""
+                 tab = global_typed_ptr(a["stab"], T.i64, align=8)
+                 rid = global_typed_ptr(a["sym"] + fx.Int64(O_RID), T.i32)
+-                if const_expr(FP8C):
++                if const_expr(COMB):
+                     c8 = (tx % fx.Int32(LPR)) * fx.Int32(8)
+                     for pp in range_constexpr(-(-R // SRP)):
+                         rib = fx.Int32(pp * SRP) + tx // fx.Int32(LPR)
+-                        ribc = fx.min(rib, fx.Int32(R - 1))
+-                        sid = fx.Int32(rid[row0 + ribc])
++                        sid = fx.Int32(rid[row0 + fx.min(rib, fx.Int32(R - 1))])
+                         ok = (rib < fx.Int32(R)) & (rib < n_valid)
+                         rank = ok.select((sid >> fx.Int32(TSH)) & fx.Int32(NPES - 1), fx.Int32(0))
++                        if const_expr(LCOMB):  # analysis: every row into this rank's cin
++                            rank = a["me"]
+                         slot = ((sid & fx.Int32(TOKEN_MASK)) * fx.Int32(TOPK)
+                                 + ((sid >> fx.Int32(24)) & fx.Int32(TOPK - 1)))
+-                        pk = lds_vec_load(lds_i32, (ribc * fx.Int32(NO) + c8) * fx.Int32(2),
+-                                          Vec.make_type(4, fx.Int32), fx.Int32, align=16)
+-                        f = Vec(pk.bitcast(fx.BFloat16)).to(fx.Float32)
+-                        vals = [fx.Float32(f[i]) for i in range(8)]
+-                        am = fx.Float32(0.0)
+-                        for v in vals:
+-                            am = fx.maxnumf(am, fx.absf(v))
+-                        for s in range_constexpr(4):  # 16 lanes = 128 cols
+-                            am = fx.maxnumf(am, am.shuffle_xor(1 << s, 64))
+-                        sc = (am == fx.Float32(0.0)).select(fx.Float32(1.0),
+-                                                            am / fx.Float32(240.0))
+-                        inv = fx.Float32(1.0) / sc
+-                        q = Vec.from_elements(
+-                            [_fp8x4_pack(*[vals[4 * h + i] * inv for i in range(4)])
+-                             for h in range(2)], fx.Int32)
+-                        base = fx.Int64(tab[rank])
+-                        dst = (base + fx.Int64(O_CIN) + fx.Int64(slot) * fx.Int64(H)
+-                               + fx.Int64(nb * fx.Int32(NO)))
+-                        buffer_store(q, _rsrc(dst, ok.select(fx.Int32(NO), fx.Int32(0))),
+-                                     c8 // fx.Int32(4), cache_modifier=P2P)
+-                        sdst = (base + fx.Int64(O_CINS)
+-                                + (fx.Int64(slot) * fx.Int64(H // 128)
+-                                   + fx.Int64(nb * fx.Int32(NO // 128))) * fx.Int64(4))
+-                        buffer_store(sc, _rsrc(sdst, ok.select(fx.Int32(NO // 128 * 4),
+-                                                               fx.Int32(0))),
+-                                     c8 // fx.Int32(128), mask=(tx % fx.Int32(16)) == fx.Int32(0),
+-                                     cache_modifier=P2P)
++                        pk = lds_vec_load(lds_i32, (fx.min(rib, fx.Int32(R - 1)) * fx.Int32(NO) + c8)
++                                          * fx.Int32(2), Vec.make_type(4, fx.Int32), fx.Int32,
++                                          align=16)
++                        if const_expr(COMB == 2):  # fp8 + one f32 scale per 128 cols
++                            f = Vec(pk.bitcast(fx.BFloat16)).to(fx.Float32)
++                            vals = [fx.Float32(f[i]) for i in range(8)]
++                            am = fx.Float32(0.0)
++                            for v in vals:
++                                am = fx.maxnumf(am, fx.absf(v))
++                            for s in range_constexpr(4):  # 16 lanes = 128 cols
++                                am = fx.maxnumf(am, am.shuffle_xor(1 << s, 64))
++                            sc = (am == fx.Float32(0.0)).select(fx.Float32(1.0),
++                                                                am / fx.Float32(240.0))
++                            inv = fx.Float32(1.0) / sc
++                            q = Vec.from_elements(
++                                [_fp8x4_pack(*[vals[4 * h + i] * inv for i in range(4)])
++                                 for h in range(2)], fx.Int32)
++                            base = fx.Int64(tab[rank])
++                            dst = (base + fx.Int64(O_CIN) + fx.Int64(slot) * fx.Int64(H)
++                                   + fx.Int64(nb * fx.Int32(NO)))
++                            buffer_store(q, _rsrc(dst, ok.select(fx.Int32(NO), fx.Int32(0))),
++                                         c8 // fx.Int32(4), cache_modifier=P2P)
++                            sdst = (base + fx.Int64(O_CINS)
++                                    + (fx.Int64(slot) * fx.Int64(H // 128)
++                                       + fx.Int64(nb * fx.Int32(NO // 128))) * fx.Int64(4))
++                            buffer_store(sc, _rsrc(sdst, ok.select(fx.Int32(NO // 128 * 4),
++                                                                   fx.Int32(0))),
++                                         c8 // fx.Int32(128),
++                                         mask=(tx % fx.Int32(16)) == fx.Int32(0),
++                                         cache_modifier=P2P)
++                            continue
++                        dst = (fx.Int64(tab[rank]) + fx.Int64(O_CIN)
++                               + (fx.Int64(slot) * fx.Int64(H) + fx.Int64(nb * fx.Int32(NO)))
++                               * fx.Int64(2))
++                        buffer_store(pk, _rsrc(dst, ok.select(fx.Int32(NO * 2), fx.Int32(0))),
++                                     c8 // fx.Int32(2), cache_modifier=P2P)
+                     return
+                 cs = (tx % fx.Int32(32)) * fx.Int32(2)
+                 rows = []
+@@ -872,6 +887,8 @@
+                     sid = fx.Int32(rid[row0 + fx.min(rib, fx.Int32(R - 1))])
+                     ok = (rib < fx.Int32(R)) & (rib < n_valid)
+                     rank = ok.select((sid >> fx.Int32(TSH)) & fx.Int32(NPES - 1), fx.Int32(0))
++                    if const_expr(LCOMB):  # analysis: every add into this rank's out
++                        rank = a["me"]
+                     row_addr = fx.Int64(tab[rank]) + fx.Int64(O_OUT) \
+                         + fx.Int64(sid & fx.Int32(TOKEN_MASK)) * fx.Int64(H * 2) \
+                         + fx.Int64((nb * fx.Int32(NO) + cs) * fx.Int32(2))
+@@ -923,6 +940,7 @@
+                         spin_ge(ctl_at(fx.Int32(LC_G1) + t * fx.Int32(16)), fx.Int32(NG),
+                                 "agent-one-as")
+                     gpu.barrier()
++                    stamp(fx.Int32(17) + fx.Int32(4) * a["k"])
+                     build_ratios(R)  # visible after the K loop's first barrier
+ 
+                 acc = core(R, row_base16, hook, pre_a=pre_a)
+@@ -931,13 +949,34 @@
+             _dispatch_rows(ROWV, [n_valid <= fx.Int32(r) for r in ROWV[:-1]], run_rows)
+ 
+         # -------------------------------------------------------------- units
+-        def run_unit(a, u, u1):
++        def run_unit(a, u, u1, tiles):
++            """Unit u of the sequence: LAG 0: the gemm1 units (t-major), then the gemm2
++            units; else the gemm1 units of the first lead = min(LAG, tiles) m-tiles, then per
++            m-tile t the gemm1 units of t + lead and the gemm2 units of t, then the gemm2
++            units of the last lead m-tiles (a gemm2 unit always follows its gemm1 units)."""
+             tx, lane, wave = _opaque_tx(tx0)
+-            if u < u1:
+-                gemm1_unit(a, u // fx.Int32(NG), u % fx.Int32(NG), tx, lane, wave)
+-            else:
++            if const_expr(LAG == 0):
++                is1 = u < u1
++                t1, j1 = u // fx.Int32(NG), u % fx.Int32(NG)
+                 v = u - u1
+-                gemm2_unit(a, v // fx.Int32(ND), v % fx.Int32(ND), tx, lane, wave)
++                t2, j2 = v // fx.Int32(ND), v % fx.Int32(ND)
++            else:
++                lead = fx.min(tiles, fx.Int32(LAG))
++                head = lead * fx.Int32(NG)
++                mid = u - head
++                slot = mid // fx.Int32(NG + ND)
++                w = mid % fx.Int32(NG + ND)
++                in_mid = slot < tiles - lead
++                tail = mid - (tiles - lead) * fx.Int32(NG + ND)
++                is1 = (u < head) | (in_mid & (w < fx.Int32(NG)))
++                t1 = (u < head).select(u // fx.Int32(NG), lead + slot)
++                j1 = (u < head).select(u % fx.Int32(NG), w)
++                t2 = in_mid.select(slot, tiles - lead + tail // fx.Int32(ND))
++                j2 = in_mid.select(w - fx.Int32(NG), tail % fx.Int32(ND))
++            if is1:
++                gemm1_unit(a, t1, j1, tx, lane, wave)
++            else:
++                gemm2_unit(a, t2, j2, tx, lane, wave)
+ 
+         def units():
+             """Every workgroup after its role: gemm1 then gemm2 units from the 8 shards."""
+@@ -950,6 +989,7 @@
+                 _inv_l1()
+                 tl_ = _u(_sys_load_at(ctl_at(LC_PLAN + 1)))
+             tiles = to_all(tl_, 1)
++            stamp(4)
+             u1 = tiles * fx.Int32(NG)
+             total = u1 + tiles * fx.Int32(ND)
+             xcd = _u(_xcc_id())
+@@ -957,6 +997,7 @@
+             # others' leftovers (a plain load first: an atomic per leftover workgroup slows
+             # the units still running)
+             q = fx.Int32(0)
++            ku = fx.Int32(0)  # units run (TL slot)
+             while q < fx.Int32(8):
+                 cand = (xcd + q) & fx.Int32(7)
+                 n_c = (total - cand + fx.Int32(7)) // fx.Int32(8)
+@@ -970,17 +1011,26 @@
+                         got = _u(lane0_add(head, 1))
+                 c = to_all(got, 0)
+                 if c < n_c:
+-                    run_unit(reload(), cand + fx.Int32(8) * c, u1)
++                    u = cand + fx.Int32(8) * c
++                    ks = fx.min(ku, fx.Int32(TL_UNITS - 1))
++                    stamp(fx.Int32(16) + fx.Int32(4) * ks)
++                    stamp(fx.Int32(19) + fx.Int32(4) * ks, fx.Int64(u))
++                    a = reload()
++                    a["k"] = ks
++                    run_unit(a, u, u1, tiles)
+                     gpu.barrier()  # the unit's LDS reads are done
++                    stamp(fx.Int32(18) + fx.Int32(4) * ks)
++                    ku = ku + fx.Int32(1)
+                 else:
+                     q = q + fx.Int32(1)
++            stamp(5)
+ 
+         def combine(a):
+-            """COMB "fp8", once every rank's rows are here: this rank's tokens b, b + GRID, ...:
++            """COMB 1, once every rank's rows are here: this rank's tokens b, b + GRID, ...:
+             out[t] = the sum of its valid slots' rows (f32, slot order; a negative id adds
+-            nothing). A thread: 8 cols, its 128-col group's scale."""
++            nothing)."""
+             n_ = a["n"]
+-            cin_rs = _rsrc(a["sym"] + fx.Int64(O_CIN), TCAP * TOPK * H)
++            cin_rs = _rsrc(a["sym"] + fx.Int64(O_CIN), TCAP * TOPK * H * 2)
+             cins_rs = _rsrc(a["sym"] + fx.Int64(O_CINS), TCAP * TOPK * (H // 128) * 4)
+             out_rs = _rsrc(a["sym"] + fx.Int64(O_OUT), fx.Int64(n_) * fx.Int64(H * 2))
+             ids_p = global_typed_ptr(a["ids"], T.i32)
+@@ -991,28 +1041,36 @@
+                     g = _u(fx.Int32(ids_p[t * fx.Int32(TOPK) + fx.Int32(k)]))
+                     ok = (g >= fx.Int32(0)) & (g < fx.Int32(E_GLOBAL))
+                     sl = t * fx.Int32(TOPK) + fx.Int32(k)
+-                    v = Vec(buffer_load(cin_rs, sl * fx.Int32(H // 4) + tx0 * fx.Int32(2),
+-                                        vec_width=2, dtype=T.i32, mask=ok, cache_modifier=CM_SYS))
+-                    s = fx.Int32(buffer_load(cins_rs, sl * fx.Int32(H // 128) + tx0 // fx.Int32(16),
+-                                             vec_width=1, dtype=T.i32, mask=ok,
+-                                             cache_modifier=CM_SYS)).bitcast(fx.Float32)
+-                    fs = []
+-                    for w in range_constexpr(2):
+-                        for hi in (False, True):
+-                            p2 = Vec(rocdl.cvt_pk_f32_fp8(T.vec(2, T.f32), _raw(fx.Int32(v[w])),
+-                                                          hi))
+-                            fs.extend(fx.Float32(p2[i]) for i in range(2))
+-                    acc = acc + Vec.from_elements([fs[i] * s for i in range(8)], fx.Float32)
++                    if const_expr(COMB == 2):  # 8 fp8 of the thread's cols x its group's scale
++                        v = Vec(buffer_load(cin_rs, sl * fx.Int32(H // 4) + tx0 * fx.Int32(2),
++                                            vec_width=2, dtype=T.i32, mask=ok,
++                                            cache_modifier=CM_SYS))
++                        s = fx.Int32(buffer_load(cins_rs, sl * fx.Int32(H // 128)
++                                                 + tx0 // fx.Int32(16), vec_width=1,
++                                                 dtype=T.i32, mask=ok,
++                                                 cache_modifier=CM_SYS)).bitcast(fx.Float32)
++                        fs = []
++                        for w in range_constexpr(2):
++                            for hi in (False, True):
++                                p2 = Vec(rocdl.cvt_pk_f32_fp8(T.vec(2, T.f32), _raw(fx.Int32(v[w])),
++                                                              hi))
++                                fs.extend(fx.Float32(p2[i]) for i in range(2))
++                        acc = acc + Vec.from_elements([fs[i] * s for i in range(8)], fx.Float32)
++                    else:
++                        v = Vec(buffer_load(cin_rs, sl * fx.Int32(H // 2) + tx0 * fx.Int32(4),
++                                            vec_width=4, dtype=T.i32, mask=ok,
++                                            cache_modifier=CM_SYS))
++                        acc = acc + v.bitcast(fx.BFloat16).to(fx.Float32)
+                 buffer_store(acc.to(fx.BFloat16).bitcast(fx.Int32), out_rs,
+                              t * fx.Int32(H // 2) + tx0 * fx.Int32(4))
+                 t = t + fx.Int32(GRID)
+ 
+         def finish(a):
+             """Count this workgroup out; the last one tells every rank its adds / rows are
+-            done and resets the counters (COMB "add": after all ranks' adds arrived, so
+-            ``out`` is complete at the kernel end); COMB "fp8": every workgroup waits for
+-            all ranks' rows, then sums its tokens."""
+-            rocdl.s_waitcnt(vmcnt=0)  # this workgroup's adds / rows are done
++            done, resets the counters (COMB 0: after all ranks' adds arrived: ``out`` is
++            complete at the kernel end); COMB 1: every workgroup waits for all ranks' rows,
++            then sums its tokens."""
++            rocdl.s_waitcnt(vmcnt=0)  # this workgroup's adds are done
+             gpu.barrier()
+             top = fx.Int32(-1)
+             if wave0 == fx.Int32(0):
+@@ -1025,7 +1083,7 @@
+                 if tx0 < fx.Int32(NPES):
+                     _sys_store_at(peer(a, tx0) + fx.Int64(O_FFLAG)
+                                   + fx.Int64(a["me"] * fx.Int32(LINE)), epoch)
+-                if const_expr(not FP8C):
++                if const_expr(not COMB):
+                     wait_flags(sym0 + fx.Int64(O_FFLAG), epoch)
+                 tiles = _u(_sys_load_at(ctl_at(LC_PLAN + 1)))
+                 for i in range(tx0, tiles, NT):
+@@ -1037,9 +1095,12 @@
+                     _sys_store_at(ctl_at(LC_TOP), fx.Int32(0))
+                     _sys_store_at(ctl_at(LC_QDONE), fx.Int32(0))
+                     _sys_store_at(ctl_at(LC_EPOCH), epoch)
+-            if const_expr(FP8C):
++                stamp(6)
++            if const_expr(COMB):
+                 wait_flags(sym0 + fx.Int64(O_FFLAG), epoch)
++                stamp(7)
+                 combine(reload())
++                stamp(6)
+ 
+         a0 = reload()
+         if bid == fx.Int32(0):
+@@ -1049,8 +1110,12 @@
+                 scan(a0, bid - fx.Int32(1))
+             else:
+                 quant(a0, bid - fx.Int32(P + 1))
++        stamp(1)
+         if (bid >= fx.Int32(1)) & (bid <= fx.Int32(P)):
+             send(reload(), bid - fx.Int32(1))
++            rocdl.s_waitcnt(vmcnt=0)
++            gpu.barrier()
++            stamp(3)
+         units()
+         finish(reload())
+ 

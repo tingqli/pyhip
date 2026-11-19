@@ -1,621 +1,1161 @@
-model_dim,inter_dim,experts_global,world,topk,routing,act,~tokens,config,us,cos
-4096,2048,256,8,8,uniform,silu,64,mega_small bm32,142.5,1.9e-04
-4096,2048,256,8,8,uniform,silu,64,mega_small bm64,142.7,1.9e-04
-4096,2048,256,8,8,uniform,silu,64,mori t16,168.5,9.9e-05
-4096,2048,256,8,8,uniform,silu,64,mori s16,169.3,9.9e-05
-4096,2048,256,8,8,uniform,silu,64,mega p16 l1 bcm22,175.9,2.0e-04
-4096,2048,256,8,8,uniform,silu,64,mega p32 l2 bcm22,176.1,2.0e-04
-4096,2048,256,8,8,uniform,silu,64,mega p16 l2 bcm22,176.4,2.0e-04
-4096,2048,256,8,8,uniform,silu,64,mega p16 l4 bcm22,176.7,2.0e-04
-4096,2048,256,8,8,uniform,silu,64,mega p8 l4 bcm22,177.0,2.0e-04
-4096,2048,256,8,8,uniform,silu,64,mega p8 l1 bcm22,177.2,2.0e-04
-4096,2048,256,8,8,uniform,silu,64,mega p32 l4 bcm22,177.3,2.0e-04
-4096,2048,256,8,8,uniform,silu,64,mega p32 l1 bcm22,177.4,2.0e-04
-4096,2048,256,8,8,uniform,silu,64,mega p8 l2 bcm22,177.8,2.0e-04
-4096,2048,256,8,8,uniform,silu,64,mega p16 l1 bcm01,186.1,2.0e-04
-4096,2048,256,8,8,uniform,silu,64,mega p8 l1 bcm01,186.2,2.0e-04
-4096,2048,256,8,8,uniform,silu,64,mega p16 l2 bcm01,186.2,2.0e-04
-4096,2048,256,8,8,uniform,silu,64,mega p32 l2 bcm01,186.3,2.0e-04
-4096,2048,256,8,8,uniform,silu,64,mega p8 l4 bcm01,186.4,2.0e-04
-4096,2048,256,8,8,uniform,silu,64,mega p16 l4 bcm01,186.8,2.0e-04
-4096,2048,256,8,8,uniform,silu,64,mega p8 l2 bcm01,187.0,2.0e-04
-4096,2048,256,8,8,uniform,silu,64,mega p32 l4 bcm01,187.4,2.0e-04
-4096,2048,256,8,8,uniform,silu,64,mega p32 l1 bcm01,187.6,2.0e-04
-4096,2048,256,8,8,uniform,silu,64,mori s32,188.8,9.9e-05
-4096,2048,256,8,8,uniform,silu,64,mori l128,201.7,7.3e-05
-4096,2048,256,8,8,uniform,silu,64,mori l128c,215.9,7.3e-05
-4096,2048,256,8,8,uniform,silu,64,mori m64,226.6,7.3e-05
-4096,2048,256,8,8,uniform,silu,64,mori_eager s16,476.7,9.9e-05
-4096,2048,256,8,8,uniform,silu,64,mori_eager m64,499.3,7.3e-05
-4096,2048,256,8,8,uniform,silu,64,mori_eager l128,526.9,7.3e-05
-4096,2048,256,8,8,uniform,silu,64,mori_eager s32,532.6,9.9e-05
-4096,2048,256,8,8,uniform,silu,64,mori_eager l128c,535.5,7.3e-05
-4096,2048,256,8,8,uniform,silu,64,mori_eager t16,578.9,9.9e-05
-4096,2048,256,8,8,uniform,silu,128,mega_small bm64,154.3,1.8e-04
-4096,2048,256,8,8,uniform,silu,128,mega_small bm32,154.9,1.8e-04
-4096,2048,256,8,8,uniform,silu,128,mori s16,186.1,9.5e-05
-4096,2048,256,8,8,uniform,silu,128,mega p16 l4 bcm22,193.6,1.9e-04
-4096,2048,256,8,8,uniform,silu,128,mega p32 l2 bcm22,194.0,1.9e-04
-4096,2048,256,8,8,uniform,silu,128,mega p16 l1 bcm22,194.2,1.9e-04
-4096,2048,256,8,8,uniform,silu,128,mega p32 l1 bcm22,194.3,1.9e-04
-4096,2048,256,8,8,uniform,silu,128,mega p8 l4 bcm22,194.7,1.9e-04
-4096,2048,256,8,8,uniform,silu,128,mega p16 l2 bcm22,194.8,1.9e-04
-4096,2048,256,8,8,uniform,silu,128,mega p32 l4 bcm22,194.9,1.9e-04
-4096,2048,256,8,8,uniform,silu,128,mega p8 l2 bcm22,195.2,1.9e-04
-4096,2048,256,8,8,uniform,silu,128,mega p8 l1 bcm22,196.2,1.9e-04
-4096,2048,256,8,8,uniform,silu,128,mori s32,200.8,9.5e-05
-4096,2048,256,8,8,uniform,silu,128,mori m64,205.0,3.8e-05
-4096,2048,256,8,8,uniform,silu,128,mega p32 l1 bcm01,205.6,1.9e-04
-4096,2048,256,8,8,uniform,silu,128,mega p16 l4 bcm01,206.2,1.9e-04
-4096,2048,256,8,8,uniform,silu,128,mega p16 l1 bcm01,206.3,1.9e-04
-4096,2048,256,8,8,uniform,silu,128,mega p16 l2 bcm01,206.8,1.9e-04
-4096,2048,256,8,8,uniform,silu,128,mega p32 l4 bcm01,206.9,1.9e-04
-4096,2048,256,8,8,uniform,silu,128,mega p8 l2 bcm01,207.0,1.9e-04
-4096,2048,256,8,8,uniform,silu,128,mega p32 l2 bcm01,207.2,1.9e-04
-4096,2048,256,8,8,uniform,silu,128,mega p8 l1 bcm01,207.9,1.9e-04
-4096,2048,256,8,8,uniform,silu,128,mega p8 l4 bcm01,208.1,1.9e-04
-4096,2048,256,8,8,uniform,silu,128,mori l128,214.7,3.8e-05
-4096,2048,256,8,8,uniform,silu,128,mori l128c,231.8,3.8e-05
-4096,2048,256,8,8,uniform,silu,128,mori t16,240.0,9.5e-05
-4096,2048,256,8,8,uniform,silu,128,mori_eager m64,484.5,3.8e-05
-4096,2048,256,8,8,uniform,silu,128,mori_eager t16,494.6,9.5e-05
-4096,2048,256,8,8,uniform,silu,128,mori_eager s16,500.0,9.5e-05
-4096,2048,256,8,8,uniform,silu,128,mori_eager s32,877.3,9.5e-05
-4096,2048,256,8,8,uniform,silu,128,mori_eager l128c,878.7,3.8e-05
-4096,2048,256,8,8,uniform,silu,128,mori_eager l128,884.4,3.8e-05
-4096,2048,256,8,8,uniform,silu,256,mega_small bm64,158.8,1.7e-04
-4096,2048,256,8,8,uniform,silu,256,mega_small bm32,159.8,1.7e-04
-4096,2048,256,8,8,uniform,silu,256,mori s16,188.6,8.6e-05
-4096,2048,256,8,8,uniform,silu,256,mori t16,188.7,8.6e-05
-4096,2048,256,8,8,uniform,silu,256,mega p32 l1 bcm22,200.8,1.8e-04
-4096,2048,256,8,8,uniform,silu,256,mega p32 l4 bcm22,200.8,1.8e-04
-4096,2048,256,8,8,uniform,silu,256,mega p32 l2 bcm22,201.1,1.8e-04
-4096,2048,256,8,8,uniform,silu,256,mega p16 l1 bcm22,201.3,1.8e-04
-4096,2048,256,8,8,uniform,silu,256,mega p16 l4 bcm22,201.4,1.8e-04
-4096,2048,256,8,8,uniform,silu,256,mega p8 l4 bcm22,202.3,1.8e-04
-4096,2048,256,8,8,uniform,silu,256,mega p16 l2 bcm22,202.9,1.8e-04
-4096,2048,256,8,8,uniform,silu,256,mega p8 l2 bcm22,203.2,1.8e-04
-4096,2048,256,8,8,uniform,silu,256,mega p8 l1 bcm22,204.6,1.8e-04
-4096,2048,256,8,8,uniform,silu,256,mori s32,206.2,8.6e-05
-4096,2048,256,8,8,uniform,silu,256,mori m64,211.2,3.1e-05
-4096,2048,256,8,8,uniform,silu,256,mega p32 l1 bcm01,212.0,1.8e-04
-4096,2048,256,8,8,uniform,silu,256,mega p32 l2 bcm01,212.0,1.8e-04
-4096,2048,256,8,8,uniform,silu,256,mega p32 l4 bcm01,212.2,1.8e-04
-4096,2048,256,8,8,uniform,silu,256,mega p16 l4 bcm01,213.5,1.8e-04
-4096,2048,256,8,8,uniform,silu,256,mega p16 l2 bcm01,213.6,1.8e-04
-4096,2048,256,8,8,uniform,silu,256,mega p16 l1 bcm01,213.9,1.8e-04
-4096,2048,256,8,8,uniform,silu,256,mega p8 l1 bcm01,214.3,1.8e-04
-4096,2048,256,8,8,uniform,silu,256,mega p8 l4 bcm01,214.4,1.8e-04
-4096,2048,256,8,8,uniform,silu,256,mega p8 l2 bcm01,214.7,1.8e-04
-4096,2048,256,8,8,uniform,silu,256,mori l128,221.3,3.1e-05
-4096,2048,256,8,8,uniform,silu,256,mori l128c,237.6,3.1e-05
-4096,2048,256,8,8,uniform,silu,256,mori_eager m64,518.7,3.1e-05
-4096,2048,256,8,8,uniform,silu,256,mori_eager s32,530.2,8.6e-05
-4096,2048,256,8,8,uniform,silu,256,mori_eager t16,533.2,8.6e-05
-4096,2048,256,8,8,uniform,silu,256,mori_eager l128c,558.2,3.1e-05
-4096,2048,256,8,8,uniform,silu,256,mori_eager l128,615.1,3.1e-05
-4096,2048,256,8,8,uniform,silu,256,mori_eager s16,804.8,8.6e-05
-4096,2048,256,8,8,uniform,silu,512,mega_small bm64,173.6,1.6e-04
-4096,2048,256,8,8,uniform,silu,512,mega_small bm32,174.2,1.6e-04
-4096,2048,256,8,8,uniform,silu,512,mega p32 l4 bcm22,210.7,1.6e-04
-4096,2048,256,8,8,uniform,silu,512,mega p16 l4 bcm22,211.4,1.6e-04
-4096,2048,256,8,8,uniform,silu,512,mega p16 l1 bcm22,212.0,1.6e-04
-4096,2048,256,8,8,uniform,silu,512,mega p32 l2 bcm22,212.2,1.6e-04
-4096,2048,256,8,8,uniform,silu,512,mega p32 l1 bcm22,212.5,1.6e-04
-4096,2048,256,8,8,uniform,silu,512,mega p16 l2 bcm22,212.8,1.6e-04
-4096,2048,256,8,8,uniform,silu,512,mega p8 l4 bcm22,213.3,1.6e-04
-4096,2048,256,8,8,uniform,silu,512,mega p8 l1 bcm22,214.2,1.6e-04
-4096,2048,256,8,8,uniform,silu,512,mega p8 l2 bcm22,214.2,1.6e-04
-4096,2048,256,8,8,uniform,silu,512,mori s32,217.9,8.5e-05
-4096,2048,256,8,8,uniform,silu,512,mega p32 l4 bcm01,220.8,1.6e-04
-4096,2048,256,8,8,uniform,silu,512,mega p32 l1 bcm01,221.3,1.6e-04
-4096,2048,256,8,8,uniform,silu,512,mega p16 l1 bcm01,221.5,1.6e-04
-4096,2048,256,8,8,uniform,silu,512,mega p32 l2 bcm01,221.5,1.6e-04
-4096,2048,256,8,8,uniform,silu,512,mega p16 l4 bcm01,221.7,1.6e-04
-4096,2048,256,8,8,uniform,silu,512,mega p16 l2 bcm01,222.0,1.6e-04
-4096,2048,256,8,8,uniform,silu,512,mori m64,222.0,2.7e-05
-4096,2048,256,8,8,uniform,silu,512,mega p8 l2 bcm01,224.1,1.6e-04
-4096,2048,256,8,8,uniform,silu,512,mega p8 l1 bcm01,224.3,1.6e-04
-4096,2048,256,8,8,uniform,silu,512,mega p8 l4 bcm01,224.6,1.6e-04
-4096,2048,256,8,8,uniform,silu,512,mori l128,231.8,2.7e-05
-4096,2048,256,8,8,uniform,silu,512,mori s16,245.0,8.5e-05
-4096,2048,256,8,8,uniform,silu,512,mori t16,247.6,8.5e-05
-4096,2048,256,8,8,uniform,silu,512,mori l128c,250.3,2.7e-05
-4096,2048,256,8,8,uniform,silu,512,mori_eager s32,360.4,8.5e-05
-4096,2048,256,8,8,uniform,silu,512,mori_eager l128,368.0,2.7e-05
-4096,2048,256,8,8,uniform,silu,512,mori_eager m64,375.7,2.7e-05
-4096,2048,256,8,8,uniform,silu,512,mori_eager t16,378.4,8.5e-05
-4096,2048,256,8,8,uniform,silu,512,mori_eager l128c,383.8,2.7e-05
-4096,2048,256,8,8,uniform,silu,512,mori_eager s16,385.9,8.5e-05
-4096,2048,256,8,8,uniform,silu,1024,mega_small bm64,228.4,1.6e-04
-4096,2048,256,8,8,uniform,silu,1024,mega p32 l2 bcm22,242.6,1.6e-04
-4096,2048,256,8,8,uniform,silu,1024,mega p16 l1 bcm22,242.7,1.6e-04
-4096,2048,256,8,8,uniform,silu,1024,mega p16 l2 bcm22,243.0,1.6e-04
-4096,2048,256,8,8,uniform,silu,1024,mega p32 l1 bcm22,243.0,1.6e-04
-4096,2048,256,8,8,uniform,silu,1024,mega p16 l4 bcm22,243.2,1.6e-04
-4096,2048,256,8,8,uniform,silu,1024,mega p32 l4 bcm22,244.0,1.6e-04
-4096,2048,256,8,8,uniform,silu,1024,mega p8 l1 bcm22,245.4,1.6e-04
-4096,2048,256,8,8,uniform,silu,1024,mega p8 l2 bcm22,245.5,1.6e-04
-4096,2048,256,8,8,uniform,silu,1024,mega p8 l4 bcm22,246.0,1.6e-04
-4096,2048,256,8,8,uniform,silu,1024,mega p32 l1 bcm01,251.3,1.6e-04
-4096,2048,256,8,8,uniform,silu,1024,mega p32 l4 bcm01,251.4,1.6e-04
-4096,2048,256,8,8,uniform,silu,1024,mega p16 l4 bcm01,251.9,1.6e-04
-4096,2048,256,8,8,uniform,silu,1024,mega p16 l1 bcm01,252.0,1.6e-04
-4096,2048,256,8,8,uniform,silu,1024,mega p32 l2 bcm01,252.0,1.6e-04
-4096,2048,256,8,8,uniform,silu,1024,mega p8 l2 bcm01,252.2,1.6e-04
-4096,2048,256,8,8,uniform,silu,1024,mega p16 l2 bcm01,252.8,1.6e-04
-4096,2048,256,8,8,uniform,silu,1024,mega p8 l4 bcm01,253.5,1.6e-04
-4096,2048,256,8,8,uniform,silu,1024,mega p8 l1 bcm01,254.7,1.6e-04
-4096,2048,256,8,8,uniform,silu,1024,mega_small bm32,260.7,1.6e-04
-4096,2048,256,8,8,uniform,silu,1024,mori m64,273.4,2.5e-05
-4096,2048,256,8,8,uniform,silu,1024,mori l128,279.2,2.5e-05
-4096,2048,256,8,8,uniform,silu,1024,mori l128c,290.1,2.5e-05
-4096,2048,256,8,8,uniform,silu,1024,mori s32,301.6,7.9e-05
-4096,2048,256,8,8,uniform,silu,1024,mori s16,355.1,7.9e-05
-4096,2048,256,8,8,uniform,silu,1024,mori t16,371.5,7.9e-05
-4096,2048,256,8,8,uniform,silu,1024,mori_eager l128,387.4,2.5e-05
-4096,2048,256,8,8,uniform,silu,1024,mori_eager m64,417.1,2.5e-05
-4096,2048,256,8,8,uniform,silu,1024,mori_eager l128c,431.3,2.5e-05
-4096,2048,256,8,8,uniform,silu,1024,mori_eager s32,453.3,7.9e-05
-4096,2048,256,8,8,uniform,silu,1024,mori_eager s16,507.4,7.9e-05
-4096,2048,256,8,8,uniform,silu,1024,mori_eager t16,510.3,7.9e-05
-4096,2048,256,8,8,uniform,silu,2048,mega p16 l2 bcm22,364.8,1.6e-04
-4096,2048,256,8,8,uniform,silu,2048,mega p32 l2 bcm22,365.7,1.6e-04
-4096,2048,256,8,8,uniform,silu,2048,mega p16 l4 bcm22,366.2,1.6e-04
-4096,2048,256,8,8,uniform,silu,2048,mega p32 l4 bcm22,366.2,1.6e-04
-4096,2048,256,8,8,uniform,silu,2048,mega p16 l1 bcm22,366.5,1.6e-04
-4096,2048,256,8,8,uniform,silu,2048,mega p32 l1 bcm22,366.8,1.6e-04
-4096,2048,256,8,8,uniform,silu,2048,mega p32 l4 bcm01,372.8,1.6e-04
-4096,2048,256,8,8,uniform,silu,2048,mega p32 l1 bcm01,373.3,1.6e-04
-4096,2048,256,8,8,uniform,silu,2048,mega p32 l2 bcm01,373.5,1.6e-04
-4096,2048,256,8,8,uniform,silu,2048,mega p16 l1 bcm01,373.9,1.6e-04
-4096,2048,256,8,8,uniform,silu,2048,mega p16 l4 bcm01,374.0,1.6e-04
-4096,2048,256,8,8,uniform,silu,2048,mega p16 l2 bcm01,374.4,1.6e-04
-4096,2048,256,8,8,uniform,silu,2048,mega p8 l4 bcm22,374.5,1.6e-04
-4096,2048,256,8,8,uniform,silu,2048,mega p8 l2 bcm22,374.9,1.6e-04
-4096,2048,256,8,8,uniform,silu,2048,mega p8 l1 bcm22,375.3,1.6e-04
-4096,2048,256,8,8,uniform,silu,2048,mega p8 l2 bcm01,383.1,1.6e-04
-4096,2048,256,8,8,uniform,silu,2048,mega p8 l4 bcm01,383.1,1.6e-04
-4096,2048,256,8,8,uniform,silu,2048,mega p8 l1 bcm01,384.2,1.6e-04
-4096,2048,256,8,8,uniform,silu,2048,mori m64,438.2,2.5e-05
-4096,2048,256,8,8,uniform,silu,2048,mori l128,439.1,2.5e-05
-4096,2048,256,8,8,uniform,silu,2048,mori l128c,449.3,2.5e-05
-4096,2048,256,8,8,uniform,silu,2048,mori s32,478.9,7.8e-05
-4096,2048,256,8,8,uniform,silu,2048,mori_eager m64,576.7,2.5e-05
-4096,2048,256,8,8,uniform,silu,2048,mori_eager l128,578.8,2.5e-05
-4096,2048,256,8,8,uniform,silu,2048,mori_eager l128c,586.2,2.5e-05
-4096,2048,256,8,8,uniform,silu,2048,mori s16,597.4,7.8e-05
-4096,2048,256,8,8,uniform,silu,2048,mori_eager s32,618.5,7.8e-05
-4096,2048,256,8,8,uniform,silu,2048,mori t16,640.5,7.8e-05
-4096,2048,256,8,8,uniform,silu,2048,mori_eager s16,724.3,7.8e-05
-4096,2048,256,8,8,uniform,silu,2048,mori_eager t16,757.4,7.8e-05
-4096,2048,256,8,8,uniform,silu,4096,mega p16 l4 bcm01,531.3,1.5e-04
-4096,2048,256,8,8,uniform,silu,4096,mega p16 l2 bcm01,534.0,1.5e-04
-4096,2048,256,8,8,uniform,silu,4096,mega p16 l4 bcm22,537.6,1.5e-04
-4096,2048,256,8,8,uniform,silu,4096,mega p32 l4 bcm01,541.8,1.5e-04
-4096,2048,256,8,8,uniform,silu,4096,mega p16 l2 bcm22,542.2,1.5e-04
-4096,2048,256,8,8,uniform,silu,4096,mega p32 l2 bcm01,544.9,1.5e-04
-4096,2048,256,8,8,uniform,silu,4096,mega p8 l4 bcm01,545.0,1.5e-04
-4096,2048,256,8,8,uniform,silu,4096,mega p32 l4 bcm22,546.1,1.5e-04
-4096,2048,256,8,8,uniform,silu,4096,mega p8 l2 bcm01,546.7,1.5e-04
-4096,2048,256,8,8,uniform,silu,4096,mega p8 l2 bcm22,550.1,1.5e-04
-4096,2048,256,8,8,uniform,silu,4096,mega p8 l4 bcm22,550.1,1.5e-04
-4096,2048,256,8,8,uniform,silu,4096,mega p32 l2 bcm22,553.3,1.5e-04
-4096,2048,256,8,8,uniform,silu,4096,mega p16 l1 bcm01,556.5,1.5e-04
-4096,2048,256,8,8,uniform,silu,4096,mega p16 l1 bcm22,562.0,1.5e-04
-4096,2048,256,8,8,uniform,silu,4096,mega p32 l1 bcm01,567.4,1.5e-04
-4096,2048,256,8,8,uniform,silu,4096,mega p8 l1 bcm01,569.2,1.5e-04
-4096,2048,256,8,8,uniform,silu,4096,mega p8 l1 bcm22,571.3,1.5e-04
-4096,2048,256,8,8,uniform,silu,4096,mega p32 l1 bcm22,573.4,1.5e-04
-4096,2048,256,8,8,uniform,silu,4096,mori l128,709.9,2.2e-05
-4096,2048,256,8,8,uniform,silu,4096,mori l128c,713.7,2.2e-05
-4096,2048,256,8,8,uniform,silu,4096,mori m64,718.5,2.2e-05
-4096,2048,256,8,8,uniform,silu,4096,mori s32,816.2,7.7e-05
-4096,2048,256,8,8,uniform,silu,4096,mori_eager l128,857.9,2.2e-05
-4096,2048,256,8,8,uniform,silu,4096,mori_eager l128c,859.7,2.2e-05
-4096,2048,256,8,8,uniform,silu,4096,mori_eager m64,874.8,2.2e-05
-4096,2048,256,8,8,uniform,silu,4096,mori_eager s32,965.6,7.7e-05
-4096,2048,256,8,8,uniform,silu,4096,mori s16,1091.3,7.7e-05
-4096,2048,256,8,8,uniform,silu,4096,mori t16,1167.2,7.7e-05
-4096,2048,256,8,8,uniform,silu,4096,mori_eager s16,1229.4,7.7e-05
-4096,2048,256,8,8,uniform,silu,4096,mori_eager t16,1288.3,7.7e-05
-4096,2048,256,8,8,uniform,silu,8192,mega p16 l4 bcm01,897.7,1.5e-04
-4096,2048,256,8,8,uniform,silu,8192,mega p32 l4 bcm01,903.2,1.5e-04
-4096,2048,256,8,8,uniform,silu,8192,mega p8 l4 bcm01,905.4,1.5e-04
-4096,2048,256,8,8,uniform,silu,8192,mega p16 l2 bcm01,913.9,1.5e-04
-4096,2048,256,8,8,uniform,silu,8192,mega p16 l4 bcm22,918.7,1.5e-04
-4096,2048,256,8,8,uniform,silu,8192,mega p16 l1 bcm01,920.0,1.5e-04
-4096,2048,256,8,8,uniform,silu,8192,mega p32 l2 bcm01,921.6,1.5e-04
-4096,2048,256,8,8,uniform,silu,8192,mega p8 l1 bcm01,922.3,1.5e-04
-4096,2048,256,8,8,uniform,silu,8192,mega p8 l4 bcm22,923.5,1.5e-04
-4096,2048,256,8,8,uniform,silu,8192,mega p8 l2 bcm01,924.7,1.5e-04
-4096,2048,256,8,8,uniform,silu,8192,mega p32 l4 bcm22,925.0,1.5e-04
-4096,2048,256,8,8,uniform,silu,8192,mega p32 l1 bcm01,925.7,1.5e-04
-4096,2048,256,8,8,uniform,silu,8192,mega p16 l2 bcm22,929.9,1.5e-04
-4096,2048,256,8,8,uniform,silu,8192,mega p16 l1 bcm22,937.9,1.5e-04
-4096,2048,256,8,8,uniform,silu,8192,mega p32 l1 bcm22,940.6,1.5e-04
-4096,2048,256,8,8,uniform,silu,8192,mega p8 l2 bcm22,940.8,1.5e-04
-4096,2048,256,8,8,uniform,silu,8192,mega p8 l1 bcm22,941.6,1.5e-04
-4096,2048,256,8,8,uniform,silu,8192,mega p32 l2 bcm22,941.6,1.5e-04
-4096,2048,256,8,8,uniform,silu,8192,mori l128c,1136.5,2.2e-05
-4096,2048,256,8,8,uniform,silu,8192,mori l128,1150.6,2.2e-05
-4096,2048,256,8,8,uniform,silu,8192,mori m64,1293.6,2.2e-05
-4096,2048,256,8,8,uniform,silu,8192,mori s32,1523.4,7.6e-05
-4096,2048,256,8,8,uniform,silu,8192,mori_eager m64,1862.8,2.2e-05
-4096,2048,256,8,8,uniform,silu,8192,mori_eager l128,1984.2,2.2e-05
-4096,2048,256,8,8,uniform,silu,8192,mori_eager l128c,2002.8,2.2e-05
-4096,2048,256,8,8,uniform,silu,8192,mori_eager s32,2078.9,7.6e-05
-4096,2048,256,8,8,uniform,silu,8192,mori t16,2258.9,7.6e-05
-4096,2048,256,8,8,uniform,silu,8192,mori s16,2276.0,7.6e-05
-4096,2048,256,8,8,uniform,silu,8192,mori_eager s16,2507.6,7.6e-05
-4096,2048,256,8,8,uniform,silu,8192,mori_eager t16,2705.2,7.6e-05
-4096,2048,256,8,8,uniform,silu,16384,mega p16 l4 bcm01,1637.4,1.5e-04
-4096,2048,256,8,8,uniform,silu,16384,mega p8 l4 bcm01,1643.5,1.5e-04
-4096,2048,256,8,8,uniform,silu,16384,mega p8 l2 bcm01,1663.7,1.5e-04
-4096,2048,256,8,8,uniform,silu,16384,mega p32 l1 bcm01,1671.3,1.5e-04
-4096,2048,256,8,8,uniform,silu,16384,mega p16 l2 bcm22,1675.3,1.5e-04
-4096,2048,256,8,8,uniform,silu,16384,mega p16 l4 bcm22,1676.3,1.5e-04
-4096,2048,256,8,8,uniform,silu,16384,mega p16 l2 bcm01,1676.7,1.5e-04
-4096,2048,256,8,8,uniform,silu,16384,mega p16 l1 bcm01,1685.6,1.5e-04
-4096,2048,256,8,8,uniform,silu,16384,mega p32 l2 bcm01,1689.2,1.5e-04
-4096,2048,256,8,8,uniform,silu,16384,mega p16 l1 bcm22,1691.1,1.5e-04
-4096,2048,256,8,8,uniform,silu,16384,mega p32 l4 bcm22,1696.5,1.5e-04
-4096,2048,256,8,8,uniform,silu,16384,mega p8 l2 bcm22,1696.7,1.5e-04
-4096,2048,256,8,8,uniform,silu,16384,mega p8 l4 bcm22,1697.1,1.5e-04
-4096,2048,256,8,8,uniform,silu,16384,mega p32 l4 bcm01,1704.1,1.5e-04
-4096,2048,256,8,8,uniform,silu,16384,mega p32 l2 bcm22,1719.0,1.5e-04
-4096,2048,256,8,8,uniform,silu,16384,mega p8 l1 bcm22,1729.3,1.5e-04
-4096,2048,256,8,8,uniform,silu,16384,mega p8 l1 bcm01,1757.8,1.5e-04
-4096,2048,256,8,8,uniform,silu,16384,mega p32 l1 bcm22,1772.8,1.5e-04
-4096,2048,256,8,8,uniform,silu,16384,mori l128c,2015.0,2.2e-05
-4096,2048,256,8,8,uniform,silu,16384,mori l128,2090.0,2.2e-05
-4096,2048,256,8,8,uniform,silu,16384,mori_eager l128c,2151.0,2.2e-05
-4096,2048,256,8,8,uniform,silu,16384,mori_eager l128,2249.8,2.2e-05
-4096,2048,256,8,8,uniform,silu,16384,mori m64,2361.7,2.2e-05
-4096,2048,256,8,8,uniform,silu,16384,mori_eager m64,2507.5,2.2e-05
-4096,2048,256,8,8,uniform,silu,16384,mori s32,2906.5,7.6e-05
-4096,2048,256,8,8,uniform,silu,16384,mori_eager s32,3031.9,7.6e-05
-4096,2048,256,8,8,uniform,silu,16384,mori s16,4543.9,7.6e-05
-4096,2048,256,8,8,uniform,silu,16384,mori_eager s16,4813.5,7.6e-05
-4096,2048,256,8,8,uniform,silu,16384,mori_eager t16,4927.1,7.6e-05
-4096,2048,256,8,8,uniform,silu,16384,mori t16,4942.1,7.6e-05
-4096,2048,256,8,8,uniform,silu,32768,mega p32 l4 bcm01,3158.9,1.5e-04
-4096,2048,256,8,8,uniform,silu,32768,mega p16 l4 bcm01,3161.7,1.5e-04
-4096,2048,256,8,8,uniform,silu,32768,mega p16 l2 bcm01,3170.2,1.5e-04
-4096,2048,256,8,8,uniform,silu,32768,mega p32 l1 bcm01,3250.2,1.5e-04
-4096,2048,256,8,8,uniform,silu,32768,mega p32 l2 bcm01,3260.4,1.5e-04
-4096,2048,256,8,8,uniform,silu,32768,mega p16 l1 bcm01,3261.0,1.5e-04
-4096,2048,256,8,8,uniform,silu,32768,mega p16 l1 bcm22,3323.1,1.5e-04
-4096,2048,256,8,8,uniform,silu,32768,mega p8 l4 bcm01,3336.0,1.5e-04
-4096,2048,256,8,8,uniform,silu,32768,mega p8 l1 bcm22,3368.3,1.5e-04
-4096,2048,256,8,8,uniform,silu,32768,mega p8 l1 bcm01,3379.5,1.5e-04
-4096,2048,256,8,8,uniform,silu,32768,mega p8 l2 bcm01,3386.2,1.5e-04
-4096,2048,256,8,8,uniform,silu,32768,mega p8 l2 bcm22,3390.0,1.5e-04
-4096,2048,256,8,8,uniform,silu,32768,mega p32 l1 bcm22,3395.2,1.5e-04
-4096,2048,256,8,8,uniform,silu,32768,mega p32 l4 bcm22,3396.4,1.5e-04
-4096,2048,256,8,8,uniform,silu,32768,mega p16 l4 bcm22,3400.8,1.5e-04
-4096,2048,256,8,8,uniform,silu,32768,mega p16 l2 bcm22,3408.9,1.5e-04
-4096,2048,256,8,8,uniform,silu,32768,mega p32 l2 bcm22,3424.0,1.5e-04
-4096,2048,256,8,8,uniform,silu,32768,mega p8 l4 bcm22,3500.4,1.5e-04
-4096,2048,256,8,8,uniform,silu,32768,mori l128c,3888.2,2.1e-05
-4096,2048,256,8,8,uniform,silu,32768,mori_eager l128c,3959.4,2.1e-05
-4096,2048,256,8,8,uniform,silu,32768,mori l128,4028.1,2.1e-05
-4096,2048,256,8,8,uniform,silu,32768,mori_eager l128,4104.6,2.1e-05
-4096,2048,256,8,8,uniform,silu,32768,mori m64,4977.3,2.1e-05
-4096,2048,256,8,8,uniform,silu,32768,mori_eager m64,5134.1,2.1e-05
-4096,2048,256,8,8,uniform,silu,32768,mori s32,6387.0,7.6e-05
-4096,2048,256,8,8,uniform,silu,32768,mori_eager s32,6647.2,7.6e-05
-4096,2048,256,8,8,uniform,silu,32768,mori s16,8861.6,7.6e-05
-4096,2048,256,8,8,uniform,silu,32768,mori_eager s16,8979.8,7.6e-05
-4096,2048,256,8,8,uniform,silu,32768,mori_eager t16,9329.4,7.6e-05
-4096,2048,256,8,8,uniform,silu,32768,mori t16,9524.6,7.6e-05
-4096,2048,256,8,8,uniform,situv2,64,mega_small bm64,144.3,2.2e-04
-4096,2048,256,8,8,uniform,situv2,64,mega_small bm32,144.9,2.2e-04
-4096,2048,256,8,8,uniform,situv2,64,mori t16,170.7,7.0e-05
-4096,2048,256,8,8,uniform,situv2,64,mori s16,170.7,7.0e-05
-4096,2048,256,8,8,uniform,situv2,64,mega p16 l4 bcm22,178.0,2.2e-04
-4096,2048,256,8,8,uniform,situv2,64,mega p32 l4 bcm22,178.7,2.2e-04
-4096,2048,256,8,8,uniform,situv2,64,mega p8 l1 bcm22,179.0,2.2e-04
-4096,2048,256,8,8,uniform,situv2,64,mega p32 l2 bcm22,179.3,2.2e-04
-4096,2048,256,8,8,uniform,situv2,64,mega p8 l4 bcm22,179.4,2.2e-04
-4096,2048,256,8,8,uniform,situv2,64,mega p16 l2 bcm22,179.6,2.2e-04
-4096,2048,256,8,8,uniform,situv2,64,mega p32 l1 bcm22,179.7,2.2e-04
-4096,2048,256,8,8,uniform,situv2,64,mega p8 l2 bcm22,180.0,2.2e-04
-4096,2048,256,8,8,uniform,situv2,64,mega p16 l1 bcm22,180.0,2.2e-04
-4096,2048,256,8,8,uniform,situv2,64,mega p16 l4 bcm01,188.1,2.2e-04
-4096,2048,256,8,8,uniform,situv2,64,mega p32 l2 bcm01,188.3,2.2e-04
-4096,2048,256,8,8,uniform,situv2,64,mega p32 l4 bcm01,188.4,2.2e-04
-4096,2048,256,8,8,uniform,situv2,64,mega p8 l2 bcm01,188.6,2.2e-04
-4096,2048,256,8,8,uniform,situv2,64,mega p8 l1 bcm01,189.0,2.2e-04
-4096,2048,256,8,8,uniform,situv2,64,mega p16 l2 bcm01,189.2,2.2e-04
-4096,2048,256,8,8,uniform,situv2,64,mega p32 l1 bcm01,189.6,2.2e-04
-4096,2048,256,8,8,uniform,situv2,64,mega p16 l1 bcm01,189.7,2.2e-04
-4096,2048,256,8,8,uniform,situv2,64,mori s32,190.0,7.0e-05
-4096,2048,256,8,8,uniform,situv2,64,mega p8 l4 bcm01,190.5,2.2e-04
-4096,2048,256,8,8,uniform,situv2,64,mori m64,198.7,6.6e-05
-4096,2048,256,8,8,uniform,situv2,64,mori l128,204.7,6.6e-05
-4096,2048,256,8,8,uniform,situv2,64,mori l128c,218.8,6.6e-05
-4096,2048,256,8,8,uniform,situv2,64,mori_eager t16,420.0,7.0e-05
-4096,2048,256,8,8,uniform,situv2,64,mori_eager s16,420.2,7.0e-05
-4096,2048,256,8,8,uniform,situv2,64,mori_eager s32,421.1,7.0e-05
-4096,2048,256,8,8,uniform,situv2,64,mori_eager l128,422.6,6.6e-05
-4096,2048,256,8,8,uniform,situv2,64,mori_eager m64,422.7,6.6e-05
-4096,2048,256,8,8,uniform,situv2,64,mori_eager l128c,426.1,6.6e-05
-4096,2048,256,8,8,uniform,situv2,128,mega_small bm64,154.6,1.9e-04
-4096,2048,256,8,8,uniform,situv2,128,mega_small bm32,156.1,1.9e-04
-4096,2048,256,8,8,uniform,situv2,128,mori t16,184.4,3.9e-05
-4096,2048,256,8,8,uniform,situv2,128,mori s16,185.4,3.9e-05
-4096,2048,256,8,8,uniform,situv2,128,mega p16 l1 bcm22,195.4,2.0e-04
-4096,2048,256,8,8,uniform,situv2,128,mega p32 l2 bcm22,196.0,2.0e-04
-4096,2048,256,8,8,uniform,situv2,128,mega p16 l4 bcm22,196.1,2.0e-04
-4096,2048,256,8,8,uniform,situv2,128,mega p8 l2 bcm22,196.3,2.0e-04
-4096,2048,256,8,8,uniform,situv2,128,mega p32 l1 bcm22,196.5,2.0e-04
-4096,2048,256,8,8,uniform,situv2,128,mega p32 l4 bcm22,197.0,2.0e-04
-4096,2048,256,8,8,uniform,situv2,128,mega p16 l2 bcm22,197.2,2.0e-04
-4096,2048,256,8,8,uniform,situv2,128,mega p8 l4 bcm22,197.3,2.0e-04
-4096,2048,256,8,8,uniform,situv2,128,mega p8 l1 bcm22,197.9,2.0e-04
-4096,2048,256,8,8,uniform,situv2,128,mori s32,202.9,3.9e-05
-4096,2048,256,8,8,uniform,situv2,128,mega p16 l1 bcm01,207.2,2.0e-04
-4096,2048,256,8,8,uniform,situv2,128,mega p16 l2 bcm01,207.4,2.0e-04
-4096,2048,256,8,8,uniform,situv2,128,mori m64,207.5,3.1e-05
-4096,2048,256,8,8,uniform,situv2,128,mega p32 l4 bcm01,207.7,2.0e-04
-4096,2048,256,8,8,uniform,situv2,128,mega p16 l4 bcm01,207.9,2.0e-04
-4096,2048,256,8,8,uniform,situv2,128,mega p8 l1 bcm01,208.6,2.0e-04
-4096,2048,256,8,8,uniform,situv2,128,mega p8 l2 bcm01,208.8,2.0e-04
-4096,2048,256,8,8,uniform,situv2,128,mega p32 l1 bcm01,208.8,2.0e-04
-4096,2048,256,8,8,uniform,situv2,128,mega p32 l2 bcm01,209.4,2.0e-04
-4096,2048,256,8,8,uniform,situv2,128,mega p8 l4 bcm01,209.6,2.0e-04
-4096,2048,256,8,8,uniform,situv2,128,mori l128,215.9,3.1e-05
-4096,2048,256,8,8,uniform,situv2,128,mori l128c,234.0,3.1e-05
-4096,2048,256,8,8,uniform,situv2,128,mori_eager m64,413.3,3.1e-05
-4096,2048,256,8,8,uniform,situv2,128,mori_eager s16,418.1,3.9e-05
-4096,2048,256,8,8,uniform,situv2,128,mori_eager s32,420.1,3.9e-05
-4096,2048,256,8,8,uniform,situv2,128,mori_eager l128c,446.7,3.1e-05
-4096,2048,256,8,8,uniform,situv2,128,mori_eager l128,451.6,3.1e-05
-4096,2048,256,8,8,uniform,situv2,128,mori_eager t16,454.0,3.9e-05
-4096,2048,256,8,8,uniform,situv2,256,mega_small bm64,160.1,1.7e-04
-4096,2048,256,8,8,uniform,situv2,256,mega_small bm32,160.3,1.7e-04
-4096,2048,256,8,8,uniform,situv2,256,mori t16,189.5,3.3e-05
-4096,2048,256,8,8,uniform,situv2,256,mori s16,189.8,3.3e-05
-4096,2048,256,8,8,uniform,situv2,256,mega p32 l4 bcm22,204.5,1.7e-04
-4096,2048,256,8,8,uniform,situv2,256,mega p32 l1 bcm22,205.8,1.7e-04
-4096,2048,256,8,8,uniform,situv2,256,mega p32 l2 bcm22,205.8,1.7e-04
-4096,2048,256,8,8,uniform,situv2,256,mega p16 l1 bcm22,206.0,1.7e-04
-4096,2048,256,8,8,uniform,situv2,256,mega p16 l2 bcm22,206.2,1.7e-04
-4096,2048,256,8,8,uniform,situv2,256,mega p8 l2 bcm22,206.6,1.7e-04
-4096,2048,256,8,8,uniform,situv2,256,mega p16 l4 bcm22,206.6,1.7e-04
-4096,2048,256,8,8,uniform,situv2,256,mega p8 l4 bcm22,206.7,1.7e-04
-4096,2048,256,8,8,uniform,situv2,256,mega p8 l1 bcm22,208.0,1.7e-04
-4096,2048,256,8,8,uniform,situv2,256,mori s32,209.6,3.3e-05
-4096,2048,256,8,8,uniform,situv2,256,mori m64,213.1,2.6e-05
-4096,2048,256,8,8,uniform,situv2,256,mega p32 l2 bcm01,215.0,1.7e-04
-4096,2048,256,8,8,uniform,situv2,256,mega p32 l1 bcm01,215.3,1.7e-04
-4096,2048,256,8,8,uniform,situv2,256,mega p32 l4 bcm01,215.3,1.7e-04
-4096,2048,256,8,8,uniform,situv2,256,mega p16 l2 bcm01,216.0,1.7e-04
-4096,2048,256,8,8,uniform,situv2,256,mega p16 l4 bcm01,216.4,1.7e-04
-4096,2048,256,8,8,uniform,situv2,256,mega p8 l4 bcm01,217.0,1.7e-04
-4096,2048,256,8,8,uniform,situv2,256,mega p16 l1 bcm01,217.1,1.7e-04
-4096,2048,256,8,8,uniform,situv2,256,mega p8 l1 bcm01,217.2,1.7e-04
-4096,2048,256,8,8,uniform,situv2,256,mega p8 l2 bcm01,217.8,1.7e-04
-4096,2048,256,8,8,uniform,situv2,256,mori l128,221.7,2.6e-05
-4096,2048,256,8,8,uniform,situv2,256,mori l128c,243.7,2.6e-05
-4096,2048,256,8,8,uniform,situv2,256,mori_eager s16,406.4,3.3e-05
-4096,2048,256,8,8,uniform,situv2,256,mori_eager t16,409.5,3.3e-05
-4096,2048,256,8,8,uniform,situv2,256,mori_eager s32,411.1,3.3e-05
-4096,2048,256,8,8,uniform,situv2,256,mori_eager m64,414.4,2.6e-05
-4096,2048,256,8,8,uniform,situv2,256,mori_eager l128,415.0,2.6e-05
-4096,2048,256,8,8,uniform,situv2,256,mori_eager l128c,423.3,2.6e-05
-4096,2048,256,8,8,uniform,situv2,512,mega_small bm64,175.3,1.6e-04
-4096,2048,256,8,8,uniform,situv2,512,mega_small bm32,175.9,1.6e-04
-4096,2048,256,8,8,uniform,situv2,512,mega p32 l4 bcm22,216.3,1.6e-04
-4096,2048,256,8,8,uniform,situv2,512,mega p32 l1 bcm22,216.7,1.6e-04
-4096,2048,256,8,8,uniform,situv2,512,mega p32 l2 bcm22,217.1,1.6e-04
-4096,2048,256,8,8,uniform,situv2,512,mega p16 l1 bcm22,218.4,1.6e-04
-4096,2048,256,8,8,uniform,situv2,512,mega p16 l2 bcm22,219.1,1.6e-04
-4096,2048,256,8,8,uniform,situv2,512,mega p16 l4 bcm22,219.1,1.6e-04
-4096,2048,256,8,8,uniform,situv2,512,mega p8 l1 bcm22,219.6,1.6e-04
-4096,2048,256,8,8,uniform,situv2,512,mega p8 l4 bcm22,219.7,1.6e-04
-4096,2048,256,8,8,uniform,situv2,512,mega p8 l2 bcm22,220.0,1.6e-04
-4096,2048,256,8,8,uniform,situv2,512,mori s32,221.9,3.3e-05
-4096,2048,256,8,8,uniform,situv2,512,mega p32 l4 bcm01,224.3,1.6e-04
-4096,2048,256,8,8,uniform,situv2,512,mega p32 l1 bcm01,224.8,1.6e-04
-4096,2048,256,8,8,uniform,situv2,512,mega p32 l2 bcm01,224.8,1.6e-04
-4096,2048,256,8,8,uniform,situv2,512,mega p16 l4 bcm01,225.9,1.6e-04
-4096,2048,256,8,8,uniform,situv2,512,mega p16 l1 bcm01,226.4,1.6e-04
-4096,2048,256,8,8,uniform,situv2,512,mega p16 l2 bcm01,226.8,1.6e-04
-4096,2048,256,8,8,uniform,situv2,512,mori m64,227.2,2.4e-05
-4096,2048,256,8,8,uniform,situv2,512,mega p8 l1 bcm01,228.4,1.6e-04
-4096,2048,256,8,8,uniform,situv2,512,mega p8 l2 bcm01,229.0,1.6e-04
-4096,2048,256,8,8,uniform,situv2,512,mega p8 l4 bcm01,229.1,1.6e-04
-4096,2048,256,8,8,uniform,situv2,512,mori l128,235.1,2.4e-05
-4096,2048,256,8,8,uniform,situv2,512,mori s16,248.7,3.3e-05
-4096,2048,256,8,8,uniform,situv2,512,mori t16,250.6,3.3e-05
-4096,2048,256,8,8,uniform,situv2,512,mori l128c,252.7,2.4e-05
-4096,2048,256,8,8,uniform,situv2,512,mori_eager s32,380.0,3.3e-05
-4096,2048,256,8,8,uniform,situv2,512,mori_eager m64,393.1,2.4e-05
-4096,2048,256,8,8,uniform,situv2,512,mori_eager l128,402.1,2.4e-05
-4096,2048,256,8,8,uniform,situv2,512,mori_eager t16,403.5,3.3e-05
-4096,2048,256,8,8,uniform,situv2,512,mori_eager l128c,407.6,2.4e-05
-4096,2048,256,8,8,uniform,situv2,512,mori_eager s16,410.0,3.3e-05
-4096,2048,256,8,8,uniform,situv2,1024,mega_small bm64,232.5,1.6e-04
-4096,2048,256,8,8,uniform,situv2,1024,mega p32 l1 bcm22,247.1,1.6e-04
-4096,2048,256,8,8,uniform,situv2,1024,mega p16 l2 bcm22,247.4,1.6e-04
-4096,2048,256,8,8,uniform,situv2,1024,mega p32 l4 bcm22,247.5,1.6e-04
-4096,2048,256,8,8,uniform,situv2,1024,mega p16 l1 bcm22,248.1,1.6e-04
-4096,2048,256,8,8,uniform,situv2,1024,mega p32 l2 bcm22,248.1,1.6e-04
-4096,2048,256,8,8,uniform,situv2,1024,mega p16 l4 bcm22,248.2,1.6e-04
-4096,2048,256,8,8,uniform,situv2,1024,mega p8 l2 bcm22,249.1,1.6e-04
-4096,2048,256,8,8,uniform,situv2,1024,mega p8 l4 bcm22,249.6,1.6e-04
-4096,2048,256,8,8,uniform,situv2,1024,mega p8 l1 bcm22,250.1,1.6e-04
-4096,2048,256,8,8,uniform,situv2,1024,mega p32 l4 bcm01,254.9,1.6e-04
-4096,2048,256,8,8,uniform,situv2,1024,mega p32 l1 bcm01,255.1,1.6e-04
-4096,2048,256,8,8,uniform,situv2,1024,mega p32 l2 bcm01,256.1,1.6e-04
-4096,2048,256,8,8,uniform,situv2,1024,mega p16 l4 bcm01,256.2,1.6e-04
-4096,2048,256,8,8,uniform,situv2,1024,mega p8 l1 bcm01,256.4,1.6e-04
-4096,2048,256,8,8,uniform,situv2,1024,mega p16 l2 bcm01,256.5,1.6e-04
-4096,2048,256,8,8,uniform,situv2,1024,mega p8 l2 bcm01,256.6,1.6e-04
-4096,2048,256,8,8,uniform,situv2,1024,mega p16 l1 bcm01,256.7,1.6e-04
-4096,2048,256,8,8,uniform,situv2,1024,mega p8 l4 bcm01,256.8,1.6e-04
-4096,2048,256,8,8,uniform,situv2,1024,mega_small bm32,264.7,1.6e-04
-4096,2048,256,8,8,uniform,situv2,1024,mori m64,278.6,2.0e-05
-4096,2048,256,8,8,uniform,situv2,1024,mori l128,284.9,2.0e-05
-4096,2048,256,8,8,uniform,situv2,1024,mori l128c,295.2,2.0e-05
-4096,2048,256,8,8,uniform,situv2,1024,mori s32,305.2,2.9e-05
-4096,2048,256,8,8,uniform,situv2,1024,mori s16,361.8,2.9e-05
-4096,2048,256,8,8,uniform,situv2,1024,mori t16,375.5,2.9e-05
-4096,2048,256,8,8,uniform,situv2,1024,mori_eager m64,436.6,2.0e-05
-4096,2048,256,8,8,uniform,situv2,1024,mori_eager l128,443.4,2.0e-05
-4096,2048,256,8,8,uniform,situv2,1024,mori_eager l128c,451.9,2.0e-05
-4096,2048,256,8,8,uniform,situv2,1024,mori_eager s32,456.9,2.9e-05
-4096,2048,256,8,8,uniform,situv2,1024,mori_eager s16,513.9,2.9e-05
-4096,2048,256,8,8,uniform,situv2,1024,mori_eager t16,526.3,2.9e-05
-4096,2048,256,8,8,uniform,situv2,2048,mega p16 l2 bcm22,373.5,1.6e-04
-4096,2048,256,8,8,uniform,situv2,2048,mega p32 l4 bcm22,373.5,1.6e-04
-4096,2048,256,8,8,uniform,situv2,2048,mega p16 l1 bcm22,373.6,1.6e-04
-4096,2048,256,8,8,uniform,situv2,2048,mega p32 l1 bcm22,374.0,1.6e-04
-4096,2048,256,8,8,uniform,situv2,2048,mega p32 l2 bcm22,374.1,1.6e-04
-4096,2048,256,8,8,uniform,situv2,2048,mega p16 l4 bcm22,374.5,1.6e-04
-4096,2048,256,8,8,uniform,situv2,2048,mega p32 l1 bcm01,380.2,1.6e-04
-4096,2048,256,8,8,uniform,situv2,2048,mega p16 l1 bcm01,380.6,1.6e-04
-4096,2048,256,8,8,uniform,situv2,2048,mega p32 l2 bcm01,381.3,1.6e-04
-4096,2048,256,8,8,uniform,situv2,2048,mega p32 l4 bcm01,381.3,1.6e-04
-4096,2048,256,8,8,uniform,situv2,2048,mega p8 l4 bcm22,382.3,1.6e-04
-4096,2048,256,8,8,uniform,situv2,2048,mega p16 l2 bcm01,382.4,1.6e-04
-4096,2048,256,8,8,uniform,situv2,2048,mega p16 l4 bcm01,382.4,1.6e-04
-4096,2048,256,8,8,uniform,situv2,2048,mega p8 l1 bcm22,383.2,1.6e-04
-4096,2048,256,8,8,uniform,situv2,2048,mega p8 l2 bcm22,383.6,1.6e-04
-4096,2048,256,8,8,uniform,situv2,2048,mega p8 l4 bcm01,390.3,1.6e-04
-4096,2048,256,8,8,uniform,situv2,2048,mega p8 l1 bcm01,390.5,1.6e-04
-4096,2048,256,8,8,uniform,situv2,2048,mega p8 l2 bcm01,390.5,1.6e-04
-4096,2048,256,8,8,uniform,situv2,2048,mori m64,448.2,2.0e-05
-4096,2048,256,8,8,uniform,situv2,2048,mori l128,450.3,2.0e-05
-4096,2048,256,8,8,uniform,situv2,2048,mori l128c,461.4,2.0e-05
-4096,2048,256,8,8,uniform,situv2,2048,mori s32,485.1,2.9e-05
-4096,2048,256,8,8,uniform,situv2,2048,mori_eager l128,589.9,2.0e-05
-4096,2048,256,8,8,uniform,situv2,2048,mori_eager m64,592.6,2.0e-05
-4096,2048,256,8,8,uniform,situv2,2048,mori s16,603.5,2.9e-05
-4096,2048,256,8,8,uniform,situv2,2048,mori_eager l128c,624.4,2.0e-05
-4096,2048,256,8,8,uniform,situv2,2048,mori_eager s32,625.5,2.9e-05
-4096,2048,256,8,8,uniform,situv2,2048,mori t16,649.6,2.9e-05
-4096,2048,256,8,8,uniform,situv2,2048,mori_eager s16,736.0,2.9e-05
-4096,2048,256,8,8,uniform,situv2,2048,mori_eager t16,771.5,2.9e-05
-4096,2048,256,8,8,uniform,situv2,4096,mega p16 l4 bcm01,544.1,1.5e-04
-4096,2048,256,8,8,uniform,situv2,4096,mega p16 l2 bcm01,545.5,1.5e-04
-4096,2048,256,8,8,uniform,situv2,4096,mega p16 l4 bcm22,549.6,1.5e-04
-4096,2048,256,8,8,uniform,situv2,4096,mega p32 l4 bcm01,550.2,1.5e-04
-4096,2048,256,8,8,uniform,situv2,4096,mega p32 l2 bcm01,552.9,1.5e-04
-4096,2048,256,8,8,uniform,situv2,4096,mega p16 l2 bcm22,553.6,1.5e-04
-4096,2048,256,8,8,uniform,situv2,4096,mega p32 l4 bcm22,555.6,1.5e-04
-4096,2048,256,8,8,uniform,situv2,4096,mega p8 l2 bcm01,559.0,1.5e-04
-4096,2048,256,8,8,uniform,situv2,4096,mega p8 l4 bcm01,559.6,1.5e-04
-4096,2048,256,8,8,uniform,situv2,4096,mega p32 l2 bcm22,559.7,1.5e-04
-4096,2048,256,8,8,uniform,situv2,4096,mega p8 l4 bcm22,562.0,1.5e-04
-4096,2048,256,8,8,uniform,situv2,4096,mega p8 l2 bcm22,565.2,1.5e-04
-4096,2048,256,8,8,uniform,situv2,4096,mega p16 l1 bcm01,569.9,1.5e-04
-4096,2048,256,8,8,uniform,situv2,4096,mega p16 l1 bcm22,573.0,1.5e-04
-4096,2048,256,8,8,uniform,situv2,4096,mega p32 l1 bcm01,579.3,1.5e-04
-4096,2048,256,8,8,uniform,situv2,4096,mega p32 l1 bcm22,581.8,1.5e-04
-4096,2048,256,8,8,uniform,situv2,4096,mega p8 l1 bcm01,585.0,1.5e-04
-4096,2048,256,8,8,uniform,situv2,4096,mega p8 l1 bcm22,589.1,1.5e-04
-4096,2048,256,8,8,uniform,situv2,4096,mori l128,728.8,1.8e-05
-4096,2048,256,8,8,uniform,situv2,4096,mori m64,729.2,1.8e-05
-4096,2048,256,8,8,uniform,situv2,4096,mori l128c,730.6,1.8e-05
-4096,2048,256,8,8,uniform,situv2,4096,mori s32,834.8,2.7e-05
-4096,2048,256,8,8,uniform,situv2,4096,mori_eager l128,855.8,1.8e-05
-4096,2048,256,8,8,uniform,situv2,4096,mori_eager l128c,864.2,1.8e-05
-4096,2048,256,8,8,uniform,situv2,4096,mori_eager m64,875.0,1.8e-05
-4096,2048,256,8,8,uniform,situv2,4096,mori_eager s32,959.2,2.7e-05
-4096,2048,256,8,8,uniform,situv2,4096,mori s16,1098.1,2.7e-05
-4096,2048,256,8,8,uniform,situv2,4096,mori t16,1178.3,2.7e-05
-4096,2048,256,8,8,uniform,situv2,4096,mori_eager s16,1206.1,2.7e-05
-4096,2048,256,8,8,uniform,situv2,4096,mori_eager t16,1279.2,2.7e-05
-4096,2048,256,8,8,uniform,situv2,8192,mega p16 l4 bcm01,920.6,1.5e-04
-4096,2048,256,8,8,uniform,situv2,8192,mega p32 l4 bcm01,927.8,1.5e-04
-4096,2048,256,8,8,uniform,situv2,8192,mega p8 l4 bcm01,931.6,1.5e-04
-4096,2048,256,8,8,uniform,situv2,8192,mega p16 l2 bcm01,940.2,1.5e-04
-4096,2048,256,8,8,uniform,situv2,8192,mega p16 l4 bcm22,941.8,1.5e-04
-4096,2048,256,8,8,uniform,situv2,8192,mega p16 l1 bcm01,944.3,1.5e-04
-4096,2048,256,8,8,uniform,situv2,8192,mega p32 l4 bcm22,948.5,1.5e-04
-4096,2048,256,8,8,uniform,situv2,8192,mega p8 l4 bcm22,950.3,1.5e-04
-4096,2048,256,8,8,uniform,situv2,8192,mega p32 l2 bcm01,951.1,1.5e-04
-4096,2048,256,8,8,uniform,situv2,8192,mega p8 l2 bcm01,952.3,1.5e-04
-4096,2048,256,8,8,uniform,situv2,8192,mega p32 l1 bcm01,953.8,1.5e-04
-4096,2048,256,8,8,uniform,situv2,8192,mega p8 l1 bcm01,954.5,1.5e-04
-4096,2048,256,8,8,uniform,situv2,8192,mega p16 l2 bcm22,959.8,1.5e-04
-4096,2048,256,8,8,uniform,situv2,8192,mega p16 l1 bcm22,961.9,1.5e-04
-4096,2048,256,8,8,uniform,situv2,8192,mega p8 l1 bcm22,971.5,1.5e-04
-4096,2048,256,8,8,uniform,situv2,8192,mega p32 l2 bcm22,971.5,1.5e-04
-4096,2048,256,8,8,uniform,situv2,8192,mega p32 l1 bcm22,972.1,1.5e-04
-4096,2048,256,8,8,uniform,situv2,8192,mega p8 l2 bcm22,973.2,1.5e-04
-4096,2048,256,8,8,uniform,situv2,8192,mori l128c,1134.9,1.8e-05
-4096,2048,256,8,8,uniform,situv2,8192,mori l128,1148.3,1.8e-05
-4096,2048,256,8,8,uniform,situv2,8192,mori m64,1261.5,1.8e-05
-4096,2048,256,8,8,uniform,situv2,8192,mori_eager l128c,1265.3,1.8e-05
-4096,2048,256,8,8,uniform,situv2,8192,mori_eager l128,1302.6,1.8e-05
-4096,2048,256,8,8,uniform,situv2,8192,mori_eager m64,1427.2,1.8e-05
-4096,2048,256,8,8,uniform,situv2,8192,mori s32,1533.2,2.7e-05
-4096,2048,256,8,8,uniform,situv2,8192,mori_eager s32,1677.8,2.7e-05
-4096,2048,256,8,8,uniform,situv2,8192,mori s16,2103.6,2.7e-05
-4096,2048,256,8,8,uniform,situv2,8192,mori_eager s16,2223.1,2.7e-05
-4096,2048,256,8,8,uniform,situv2,8192,mori t16,2267.9,2.7e-05
-4096,2048,256,8,8,uniform,situv2,8192,mori_eager t16,2348.4,2.7e-05
-4096,2048,256,8,8,uniform,situv2,16384,mega p16 l4 bcm01,1640.6,1.5e-04
-4096,2048,256,8,8,uniform,situv2,16384,mega p32 l4 bcm01,1657.2,1.5e-04
-4096,2048,256,8,8,uniform,situv2,16384,mega p8 l4 bcm01,1662.2,1.5e-04
-4096,2048,256,8,8,uniform,situv2,16384,mega p16 l2 bcm01,1675.3,1.5e-04
-4096,2048,256,8,8,uniform,situv2,16384,mega p16 l4 bcm22,1676.1,1.5e-04
-4096,2048,256,8,8,uniform,situv2,16384,mega p16 l1 bcm01,1678.5,1.5e-04
-4096,2048,256,8,8,uniform,situv2,16384,mega p32 l1 bcm01,1688.8,1.5e-04
-4096,2048,256,8,8,uniform,situv2,16384,mega p8 l1 bcm01,1692.5,1.5e-04
-4096,2048,256,8,8,uniform,situv2,16384,mega p32 l2 bcm01,1692.6,1.5e-04
-4096,2048,256,8,8,uniform,situv2,16384,mega p8 l2 bcm01,1696.4,1.5e-04
-4096,2048,256,8,8,uniform,situv2,16384,mega p8 l4 bcm22,1696.5,1.5e-04
-4096,2048,256,8,8,uniform,situv2,16384,mega p32 l4 bcm22,1696.9,1.5e-04
-4096,2048,256,8,8,uniform,situv2,16384,mega p16 l2 bcm22,1708.8,1.5e-04
-4096,2048,256,8,8,uniform,situv2,16384,mega p16 l1 bcm22,1714.3,1.5e-04
-4096,2048,256,8,8,uniform,situv2,16384,mega p8 l1 bcm22,1726.7,1.5e-04
-4096,2048,256,8,8,uniform,situv2,16384,mega p32 l2 bcm22,1728.3,1.5e-04
-4096,2048,256,8,8,uniform,situv2,16384,mega p8 l2 bcm22,1729.8,1.5e-04
-4096,2048,256,8,8,uniform,situv2,16384,mega p32 l1 bcm22,1732.3,1.5e-04
-4096,2048,256,8,8,uniform,situv2,16384,mori l128c,2047.1,1.8e-05
-4096,2048,256,8,8,uniform,situv2,16384,mori l128,2105.0,1.8e-05
-4096,2048,256,8,8,uniform,situv2,16384,mori_eager l128c,2197.9,1.8e-05
-4096,2048,256,8,8,uniform,situv2,16384,mori_eager l128,2249.2,1.8e-05
-4096,2048,256,8,8,uniform,situv2,16384,mori m64,2371.4,1.8e-05
-4096,2048,256,8,8,uniform,situv2,16384,mori_eager m64,2532.0,1.8e-05
-4096,2048,256,8,8,uniform,situv2,16384,mori s32,2910.7,2.7e-05
-4096,2048,256,8,8,uniform,situv2,16384,mori_eager s32,3061.3,2.7e-05
-4096,2048,256,8,8,uniform,situv2,16384,mori s16,4510.9,2.7e-05
-4096,2048,256,8,8,uniform,situv2,16384,mori_eager s16,4663.5,2.7e-05
-4096,2048,256,8,8,uniform,situv2,16384,mori t16,4728.7,2.7e-05
-4096,2048,256,8,8,uniform,situv2,16384,mori_eager t16,4845.1,2.7e-05
-4096,2048,256,8,8,uniform,situv2,32768,mega p32 l4 bcm01,3268.9,1.5e-04
-4096,2048,256,8,8,uniform,situv2,32768,mega p16 l4 bcm01,3269.1,1.5e-04
-4096,2048,256,8,8,uniform,situv2,32768,mega p8 l1 bcm01,3284.2,1.5e-04
-4096,2048,256,8,8,uniform,situv2,32768,mega p16 l2 bcm01,3312.6,1.5e-04
-4096,2048,256,8,8,uniform,situv2,32768,mega p16 l2 bcm22,3329.9,1.5e-04
-4096,2048,256,8,8,uniform,situv2,32768,mega p8 l4 bcm01,3333.4,1.5e-04
-4096,2048,256,8,8,uniform,situv2,32768,mega p8 l2 bcm01,3340.1,1.5e-04
-4096,2048,256,8,8,uniform,situv2,32768,mega p32 l2 bcm01,3368.0,1.5e-04
-4096,2048,256,8,8,uniform,situv2,32768,mega p32 l1 bcm01,3374.7,1.5e-04
-4096,2048,256,8,8,uniform,situv2,32768,mega p16 l1 bcm01,3381.4,1.5e-04
-4096,2048,256,8,8,uniform,situv2,32768,mega p32 l4 bcm22,3388.7,1.5e-04
-4096,2048,256,8,8,uniform,situv2,32768,mega p16 l4 bcm22,3401.1,1.5e-04
-4096,2048,256,8,8,uniform,situv2,32768,mega p16 l1 bcm22,3414.2,1.5e-04
-4096,2048,256,8,8,uniform,situv2,32768,mega p8 l2 bcm22,3435.0,1.5e-04
-4096,2048,256,8,8,uniform,situv2,32768,mega p32 l1 bcm22,3435.9,1.5e-04
-4096,2048,256,8,8,uniform,situv2,32768,mega p8 l1 bcm22,3457.7,1.5e-04
-4096,2048,256,8,8,uniform,situv2,32768,mega p32 l2 bcm22,3489.9,1.5e-04
-4096,2048,256,8,8,uniform,situv2,32768,mega p8 l4 bcm22,3534.8,1.5e-04
-4096,2048,256,8,8,uniform,situv2,32768,mori l128c,3859.1,1.7e-05
-4096,2048,256,8,8,uniform,situv2,32768,mori_eager l128c,4017.2,1.7e-05
-4096,2048,256,8,8,uniform,situv2,32768,mori l128,4033.5,1.7e-05
-4096,2048,256,8,8,uniform,situv2,32768,mori_eager l128,4180.7,1.7e-05
-4096,2048,256,8,8,uniform,situv2,32768,mori m64,4932.8,1.7e-05
-4096,2048,256,8,8,uniform,situv2,32768,mori_eager m64,5042.7,1.7e-05
-4096,2048,256,8,8,uniform,situv2,32768,mori s32,6333.6,2.6e-05
-4096,2048,256,8,8,uniform,situv2,32768,mori_eager s32,6566.6,2.6e-05
-4096,2048,256,8,8,uniform,situv2,32768,mori s16,8780.5,2.6e-05
-4096,2048,256,8,8,uniform,situv2,32768,mori_eager s16,8900.2,2.6e-05
-4096,2048,256,8,8,uniform,situv2,32768,mori_eager t16,9304.6,2.6e-05
-4096,2048,256,8,8,uniform,situv2,32768,mori t16,9457.5,2.6e-05
+model_dim,inter_dim,experts_global,world,topk,routing,act,x_quant,~tokens,config,us,cos
+4096,2048,256,8,8,uniform,silu,per_1x128,64,mega_small bm64,142.4,1.9e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,64,mega_small bm32,143.1,1.9e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,64,mega_large cadd bcm22,164.8,2.0e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,64,mega_large cfp8 bcm22,168.3,5.3e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,64,mori s16,170.0,9.9e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,64,mori t16,170.4,9.9e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,64,mega_large cadd bcm01,172.5,2.0e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,64,mega_large cfp8 bcm01,175.4,5.3e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,64,mega p8 l2 bcm22,177.0,2.0e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,64,mega p16 l2 bcm22,177.2,2.0e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,64,mega p16 l4 bcm22,177.5,2.0e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,64,mega p16 l1 bcm22,177.6,2.0e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,64,mega p8 l4 bcm22,177.8,2.0e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,64,mega p32 l1 bcm22,177.9,2.0e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,64,mega p32 l2 bcm22,178.0,2.0e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,64,mega p32 l4 bcm22,178.3,2.0e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,64,mega p8 l1 bcm22,178.9,2.0e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,64,mega p8 l2 bcm01,186.5,2.0e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,64,mega p8 l1 bcm01,186.6,2.0e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,64,mega p16 l1 bcm01,186.7,2.0e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,64,mega p16 l2 bcm01,186.7,2.0e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,64,mega p8 l4 bcm01,187.4,2.0e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,64,mega p32 l1 bcm01,187.4,2.0e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,64,mega p32 l4 bcm01,187.4,2.0e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,64,mega p32 l2 bcm01,187.6,2.0e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,64,mori s32,187.6,9.9e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,64,mega p16 l4 bcm01,187.8,2.0e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,64,mori m64,194.7,7.3e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,64,mori l128,200.9,7.3e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,64,mori l128c,215.9,7.3e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,64,mori_eager s32,399.7,9.9e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,64,mori_eager t16,407.3,9.9e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,64,mori_eager s16,409.1,9.9e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,64,mori_eager m64,414.2,7.3e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,64,mori_eager l128c,415.3,7.3e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,64,mori_eager l128,419.7,7.3e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,128,mega_small bm64,153.9,1.8e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,128,mega_small bm32,154.4,1.8e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,128,mega_large cadd bcm22,178.0,1.9e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,128,mega_large cfp8 bcm22,180.9,5.0e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,128,mori t16,182.5,9.5e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,128,mori s16,182.9,9.5e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,128,mega_large cadd bcm01,187.8,1.9e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,128,mega_large cfp8 bcm01,188.6,5.0e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,128,mega p32 l2 bcm22,193.9,1.9e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,128,mega p16 l2 bcm22,194.3,1.9e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,128,mega p16 l4 bcm22,194.7,1.9e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,128,mega p8 l4 bcm22,194.8,1.9e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,128,mega p8 l1 bcm22,195.1,1.9e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,128,mega p32 l4 bcm22,195.4,1.9e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,128,mega p8 l2 bcm22,195.8,1.9e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,128,mega p32 l1 bcm22,195.8,1.9e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,128,mega p16 l1 bcm22,196.2,1.9e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,128,mori s32,200.1,9.5e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,128,mori m64,202.9,3.8e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,128,mega p32 l1 bcm01,205.4,1.9e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,128,mega p16 l2 bcm01,206.6,1.9e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,128,mega p16 l1 bcm01,207.0,1.9e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,128,mega p32 l2 bcm01,207.0,1.9e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,128,mega p8 l4 bcm01,207.2,1.9e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,128,mega p8 l2 bcm01,207.3,1.9e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,128,mega p8 l1 bcm01,207.4,1.9e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,128,mega p32 l4 bcm01,207.4,1.9e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,128,mega p16 l4 bcm01,207.8,1.9e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,128,mori l128,212.0,3.8e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,128,mori l128c,231.6,3.8e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,128,mori_eager s32,358.4,9.5e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,128,mori_eager m64,358.5,3.8e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,128,mori_eager l128,362.9,3.8e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,128,mori_eager t16,367.4,9.5e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,128,mori_eager l128c,375.1,3.8e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,128,mori_eager s16,393.1,9.5e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,256,mega_small bm32,160.0,1.7e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,256,mega_small bm64,160.0,1.7e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,256,mega_large cadd bcm22,185.1,1.8e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,256,mori s16,187.6,8.6e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,256,mega_large cfp8 bcm22,188.2,5.0e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,256,mori t16,188.3,8.6e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,256,mega_large cadd bcm01,191.7,1.8e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,256,mega_large cfp8 bcm01,195.3,5.0e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,256,mega p32 l1 bcm22,200.8,1.8e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,256,mega p32 l4 bcm22,201.8,1.8e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,256,mega p32 l2 bcm22,201.9,1.8e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,256,mega p16 l1 bcm22,202.0,1.8e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,256,mega p16 l4 bcm22,202.6,1.8e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,256,mega p16 l2 bcm22,202.7,1.8e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,256,mega p8 l4 bcm22,202.8,1.8e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,256,mega p8 l1 bcm22,203.3,1.8e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,256,mega p8 l2 bcm22,203.5,1.8e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,256,mori s32,206.2,8.6e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,256,mori m64,209.0,3.1e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,256,mega p32 l2 bcm01,212.5,1.8e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,256,mega p32 l4 bcm01,212.6,1.8e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,256,mega p16 l1 bcm01,213.9,1.8e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,256,mega p32 l1 bcm01,214.2,1.8e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,256,mega p16 l4 bcm01,214.8,1.8e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,256,mega p16 l2 bcm01,214.9,1.8e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,256,mega p8 l2 bcm01,215.3,1.8e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,256,mega p8 l4 bcm01,215.3,1.8e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,256,mega p8 l1 bcm01,215.5,1.8e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,256,mori l128,218.1,3.1e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,256,mori l128c,237.1,3.1e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,256,mori_eager s16,362.0,8.6e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,256,mori_eager s32,397.7,8.6e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,256,mori_eager l128c,397.7,3.1e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,256,mori_eager t16,405.7,8.6e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,256,mori_eager m64,406.2,3.1e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,256,mori_eager l128,406.3,3.1e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,512,mega_small bm64,174.0,1.6e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,512,mega_small bm32,174.3,1.6e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,512,mega_large cadd bcm22,194.4,1.6e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,512,mega_large cfp8 bcm22,198.6,4.8e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,512,mega_large cadd bcm01,202.6,1.6e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,512,mega_large cfp8 bcm01,204.8,4.8e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,512,mega p32 l1 bcm22,211.4,1.6e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,512,mega p32 l2 bcm22,211.9,1.6e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,512,mega p16 l2 bcm22,212.3,1.6e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,512,mega p16 l1 bcm22,212.4,1.6e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,512,mega p32 l4 bcm22,212.5,1.6e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,512,mega p16 l4 bcm22,212.6,1.6e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,512,mega p8 l2 bcm22,213.9,1.6e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,512,mega p8 l1 bcm22,214.6,1.6e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,512,mega p8 l4 bcm22,214.6,1.6e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,512,mori s32,219.0,8.5e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,512,mori m64,221.7,2.7e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,512,mega p32 l4 bcm01,222.2,1.6e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,512,mega p32 l2 bcm01,222.4,1.6e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,512,mega p32 l1 bcm01,222.5,1.6e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,512,mega p16 l4 bcm01,223.1,1.6e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,512,mega p16 l2 bcm01,223.2,1.6e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,512,mega p16 l1 bcm01,223.5,1.6e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,512,mega p8 l4 bcm01,225.1,1.6e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,512,mega p8 l1 bcm01,225.2,1.6e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,512,mega p8 l2 bcm01,225.2,1.6e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,512,mori l128,230.0,2.7e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,512,mori s16,246.0,8.5e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,512,mori t16,248.5,8.5e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,512,mori l128c,249.3,2.7e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,512,mori_eager s32,382.4,8.5e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,512,mori_eager m64,386.2,2.7e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,512,mori_eager l128,386.7,2.7e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,512,mori_eager t16,407.9,8.5e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,512,mori_eager s16,408.1,8.5e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,512,mori_eager l128c,414.6,2.7e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,1024,mega_small bm64,229.3,1.6e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,1024,mega_large cadd bcm22,231.0,1.6e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,1024,mega_large cfp8 bcm22,237.7,4.8e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,1024,mega_large cadd bcm01,239.2,1.6e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,1024,mega p32 l4 bcm22,242.9,1.6e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,1024,mega p32 l2 bcm22,243.2,1.6e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,1024,mega p16 l2 bcm22,243.4,1.6e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,1024,mega p16 l1 bcm22,243.6,1.6e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,1024,mega p32 l1 bcm22,243.8,1.6e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,1024,mega p16 l4 bcm22,244.4,1.6e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,1024,mega p8 l2 bcm22,244.6,1.6e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,1024,mega_large cfp8 bcm01,245.0,4.8e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,1024,mega p8 l4 bcm22,245.4,1.6e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,1024,mega p8 l1 bcm22,245.5,1.6e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,1024,mega p32 l1 bcm01,252.0,1.6e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,1024,mega p32 l2 bcm01,252.1,1.6e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,1024,mega p16 l2 bcm01,252.7,1.6e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,1024,mega p16 l4 bcm01,252.9,1.6e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,1024,mega p16 l1 bcm01,253.0,1.6e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,1024,mega p8 l4 bcm01,253.1,1.6e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,1024,mega p32 l4 bcm01,253.1,1.6e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,1024,mega p8 l2 bcm01,253.3,1.6e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,1024,mega p8 l1 bcm01,253.5,1.6e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,1024,mega_small bm32,261.0,1.6e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,1024,mori m64,272.6,2.5e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,1024,mori l128,280.4,2.5e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,1024,mori l128c,289.7,2.5e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,1024,mori s32,301.7,7.9e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,1024,mori s16,356.6,7.9e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,1024,mori t16,373.2,7.9e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,1024,mori_eager m64,435.8,2.5e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,1024,mori_eager l128,447.4,2.5e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,1024,mori_eager l128c,451.3,2.5e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,1024,mori_eager s32,462.7,7.9e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,1024,mori_eager s16,514.3,7.9e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,1024,mori_eager t16,521.8,7.9e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,2048,mega_large cadd bcm22,353.4,1.6e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,2048,mega_large cfp8 bcm22,358.0,4.8e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,2048,mega_large cadd bcm01,360.0,1.6e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,2048,mega_large cfp8 bcm01,365.4,4.8e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,2048,mega p32 l4 bcm22,366.2,1.6e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,2048,mega p16 l2 bcm22,366.7,1.6e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,2048,mega p16 l1 bcm22,367.4,1.6e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,2048,mega p16 l4 bcm22,367.4,1.6e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,2048,mega p32 l1 bcm22,367.4,1.6e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,2048,mega p32 l2 bcm22,367.6,1.6e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,2048,mega p32 l2 bcm01,373.2,1.6e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,2048,mega p32 l4 bcm01,373.4,1.6e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,2048,mega p32 l1 bcm01,373.5,1.6e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,2048,mega p16 l1 bcm01,374.3,1.6e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,2048,mega p16 l4 bcm01,374.3,1.6e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,2048,mega p8 l2 bcm22,374.8,1.6e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,2048,mega p16 l2 bcm01,374.8,1.6e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,2048,mega p8 l4 bcm22,375.5,1.6e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,2048,mega p8 l1 bcm22,376.4,1.6e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,2048,mega p8 l2 bcm01,382.9,1.6e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,2048,mega p8 l1 bcm01,383.6,1.6e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,2048,mega p8 l4 bcm01,383.6,1.6e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,2048,mori m64,440.6,2.5e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,2048,mori l128,443.8,2.5e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,2048,mori l128c,453.2,2.5e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,2048,mori s32,561.1,7.8e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,2048,mori_eager l128,622.0,2.5e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,2048,mori_eager m64,622.9,2.5e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,2048,mori_eager l128c,632.4,2.5e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,2048,mori_eager s32,660.8,7.8e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,2048,mori s16,674.4,7.8e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,2048,mori t16,720.8,7.8e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,2048,mori_eager s16,773.1,7.8e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,2048,mori_eager t16,814.9,7.8e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,4096,mega_large cfp8 bcm01,519.0,4.8e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,4096,mega p16 l4 bcm01,531.4,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,4096,mega_large cfp8 bcm22,534.0,4.8e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,4096,mega_large cadd bcm01,534.4,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,4096,mega p16 l2 bcm01,535.4,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,4096,mega p16 l4 bcm22,540.0,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,4096,mega p32 l4 bcm01,542.8,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,4096,mega p32 l2 bcm01,543.9,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,4096,mega p16 l2 bcm22,544.1,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,4096,mega p8 l4 bcm01,545.4,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,4096,mega p8 l2 bcm01,546.3,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,4096,mega p32 l4 bcm22,548.9,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,4096,mega p8 l4 bcm22,549.3,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,4096,mega p8 l2 bcm22,552.3,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,4096,mega p32 l2 bcm22,552.8,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,4096,mega p16 l1 bcm01,556.3,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,4096,mega p16 l1 bcm22,561.0,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,4096,mega_large cadd bcm22,565.8,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,4096,mega p32 l1 bcm01,569.7,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,4096,mega p8 l1 bcm01,571.2,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,4096,mega p32 l1 bcm22,573.6,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,4096,mega p8 l1 bcm22,574.7,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,4096,mori l128,709.9,2.2e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,4096,mori l128c,712.8,2.2e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,4096,mori m64,719.8,2.2e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,4096,mori s32,817.2,7.7e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,4096,mori_eager l128,858.5,2.2e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,4096,mori_eager l128c,860.6,2.2e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,4096,mori_eager m64,874.2,2.2e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,4096,mori_eager s32,968.2,7.7e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,4096,mori s16,1079.8,7.7e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,4096,mori t16,1168.4,7.7e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,4096,mori_eager s16,1235.2,7.7e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,4096,mori_eager t16,1314.0,7.6e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,8192,mega_large cfp8 bcm01,877.7,4.7e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,8192,mega_large cadd bcm01,885.2,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,8192,mega p16 l4 bcm01,904.4,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,8192,mega p32 l4 bcm01,906.3,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,8192,mega p8 l4 bcm01,911.9,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,8192,mega p16 l2 bcm01,919.3,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,8192,mega_large cfp8 bcm22,920.8,4.7e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,8192,mega p16 l4 bcm22,924.0,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,8192,mega p32 l2 bcm01,927.6,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,8192,mega p32 l4 bcm22,929.5,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,8192,mega p16 l1 bcm01,930.3,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,8192,mega p8 l2 bcm01,930.5,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,8192,mega p8 l1 bcm01,932.1,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,8192,mega p32 l1 bcm01,932.3,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,8192,mega p8 l4 bcm22,933.1,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,8192,mega p16 l2 bcm22,940.0,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,8192,mega p16 l1 bcm22,946.2,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,8192,mega p32 l2 bcm22,950.2,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,8192,mega p32 l1 bcm22,951.6,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,8192,mega p8 l1 bcm22,953.1,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,8192,mega p8 l2 bcm22,953.8,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,8192,mega_large cadd bcm22,954.8,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,8192,mori l128c,1116.0,2.2e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,8192,mori l128,1129.2,2.2e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,8192,mori m64,1245.9,2.2e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,8192,mori_eager l128c,1254.0,2.2e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,8192,mori_eager l128,1278.6,2.2e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,8192,mori_eager m64,1396.9,2.2e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,8192,mori s32,1520.2,7.6e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,8192,mori_eager s32,1643.1,7.6e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,8192,mori s16,2075.2,7.6e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,8192,mori_eager s16,2192.3,7.6e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,8192,mori t16,2250.2,7.6e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,8192,mori_eager t16,2347.4,7.6e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,16384,mega_large cadd bcm01,1592.6,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,16384,mega p8 l4 bcm01,1654.0,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,16384,mega p32 l2 bcm01,1666.4,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,16384,mega p32 l1 bcm01,1667.4,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,16384,mega p16 l2 bcm01,1670.9,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,16384,mega p32 l4 bcm01,1671.6,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,16384,mega p8 l1 bcm01,1680.5,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,16384,mega p16 l1 bcm01,1680.6,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,16384,mega p8 l2 bcm01,1681.3,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,16384,mega p16 l2 bcm22,1685.4,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,16384,mega_large cfp8 bcm01,1688.9,4.7e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,16384,mega p32 l4 bcm22,1696.1,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,16384,mega_large cadd bcm22,1709.1,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,16384,mega p8 l4 bcm22,1709.4,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,16384,mega p32 l2 bcm22,1711.1,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,16384,mega p8 l2 bcm22,1711.3,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,16384,mega p16 l4 bcm22,1715.0,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,16384,mega p16 l4 bcm01,1715.4,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,16384,mega p16 l1 bcm22,1724.6,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,16384,mega_large cfp8 bcm22,1731.4,4.7e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,16384,mega p32 l1 bcm22,1749.2,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,16384,mega p8 l1 bcm22,1758.7,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,16384,mori l128c,2035.8,2.2e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,16384,mori l128,2096.7,2.2e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,16384,mori_eager l128c,2131.5,2.2e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,16384,mori_eager l128,2223.4,2.2e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,16384,mori m64,2368.9,2.2e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,16384,mori_eager m64,2468.8,2.2e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,16384,mori s32,2909.6,7.6e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,16384,mori_eager s32,2997.2,7.6e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,16384,mori s16,4568.8,7.6e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,16384,mori_eager s16,4684.1,7.6e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,16384,mori t16,4824.4,7.6e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,16384,mori_eager t16,4956.3,7.6e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,32768,mega_large cfp8 bcm01,2994.1,4.7e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,32768,mega_large cadd bcm01,3128.6,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,32768,mega_large cfp8 bcm22,3167.4,4.7e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,32768,mega p32 l4 bcm01,3224.4,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,32768,mega p32 l2 bcm01,3257.9,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,32768,mega p16 l1 bcm01,3281.5,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,32768,mega p16 l4 bcm01,3283.2,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,32768,mega p16 l2 bcm01,3319.6,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,32768,mega p32 l1 bcm01,3322.7,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,32768,mega p8 l4 bcm01,3324.5,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,32768,mega p16 l4 bcm22,3329.2,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,32768,mega p8 l2 bcm01,3341.3,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,32768,mega p32 l2 bcm22,3387.0,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,32768,mega p16 l1 bcm22,3398.8,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,32768,mega p32 l4 bcm22,3412.4,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,32768,mega p32 l1 bcm22,3420.3,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,32768,mega p8 l1 bcm22,3423.9,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,32768,mega p8 l4 bcm22,3461.5,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,32768,mega p16 l2 bcm22,3478.3,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,32768,mega p8 l2 bcm22,3498.6,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,32768,mega_large cadd bcm22,3504.7,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,32768,mega p8 l1 bcm01,3513.7,1.5e-04
+4096,2048,256,8,8,uniform,silu,per_1x128,32768,mori l128c,3877.0,2.1e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,32768,mori_eager l128c,3914.5,2.1e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,32768,mori l128,3994.5,2.1e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,32768,mori_eager l128,4158.3,2.1e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,32768,mori m64,4958.3,2.1e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,32768,mori_eager m64,5082.0,2.1e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,32768,mori s32,6381.5,7.6e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,32768,mori_eager s32,6651.4,7.6e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,32768,mori s16,8906.9,7.6e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,32768,mori_eager s16,8927.5,7.6e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,32768,mori_eager t16,9258.1,7.6e-05
+4096,2048,256,8,8,uniform,silu,per_1x128,32768,mori t16,9469.0,7.6e-05
+4096,2048,256,8,8,uniform,silu,per_token,64,mega_small bm64,139.8,6.9e-05
+4096,2048,256,8,8,uniform,silu,per_token,64,mega_small bm32,140.0,6.9e-05
+4096,2048,256,8,8,uniform,silu,per_token,64,mega_large cadd bcm22,158.7,7.4e-05
+4096,2048,256,8,8,uniform,silu,per_token,64,mega_large cfp8 bcm22,161.5,4.0e-04
+4096,2048,256,8,8,uniform,silu,per_token,64,mega_large cadd bcm01,165.1,7.4e-05
+4096,2048,256,8,8,uniform,silu,per_token,64,mega_large cfp8 bcm01,169.4,4.0e-04
+4096,2048,256,8,8,uniform,silu,per_token,64,mega p16 l1 bcm22,170.8,7.4e-05
+4096,2048,256,8,8,uniform,silu,per_token,64,mega p32 l4 bcm22,171.3,7.4e-05
+4096,2048,256,8,8,uniform,silu,per_token,64,mega p8 l4 bcm22,171.4,7.4e-05
+4096,2048,256,8,8,uniform,silu,per_token,64,mega p32 l2 bcm22,171.5,7.4e-05
+4096,2048,256,8,8,uniform,silu,per_token,64,mega p16 l4 bcm22,172.2,7.4e-05
+4096,2048,256,8,8,uniform,silu,per_token,64,mega p8 l2 bcm22,172.4,7.5e-05
+4096,2048,256,8,8,uniform,silu,per_token,64,mega p8 l1 bcm22,172.5,7.4e-05
+4096,2048,256,8,8,uniform,silu,per_token,64,mega p16 l2 bcm22,172.6,7.3e-05
+4096,2048,256,8,8,uniform,silu,per_token,64,mega p32 l1 bcm22,172.8,7.4e-05
+4096,2048,256,8,8,uniform,silu,per_token,64,mega p16 l1 bcm01,180.7,7.4e-05
+4096,2048,256,8,8,uniform,silu,per_token,64,mega p8 l1 bcm01,181.1,7.4e-05
+4096,2048,256,8,8,uniform,silu,per_token,64,mega p32 l4 bcm01,181.2,7.4e-05
+4096,2048,256,8,8,uniform,silu,per_token,64,mega p8 l4 bcm01,181.4,7.4e-05
+4096,2048,256,8,8,uniform,silu,per_token,64,mega p16 l2 bcm01,181.6,7.4e-05
+4096,2048,256,8,8,uniform,silu,per_token,64,mega p32 l2 bcm01,181.6,7.4e-05
+4096,2048,256,8,8,uniform,silu,per_token,64,mega p32 l1 bcm01,181.8,7.4e-05
+4096,2048,256,8,8,uniform,silu,per_token,64,mega p16 l4 bcm01,181.9,7.4e-05
+4096,2048,256,8,8,uniform,silu,per_token,64,mega p8 l2 bcm01,182.2,7.4e-05
+4096,2048,256,8,8,uniform,silu,per_token,128,mega_small bm64,151.5,7.1e-05
+4096,2048,256,8,8,uniform,silu,per_token,128,mega_small bm32,151.8,7.1e-05
+4096,2048,256,8,8,uniform,silu,per_token,128,mega_large cadd bcm22,168.9,7.6e-05
+4096,2048,256,8,8,uniform,silu,per_token,128,mega_large cfp8 bcm22,171.8,4.0e-04
+4096,2048,256,8,8,uniform,silu,per_token,128,mega_large cadd bcm01,177.2,7.6e-05
+4096,2048,256,8,8,uniform,silu,per_token,128,mega_large cfp8 bcm01,181.6,4.0e-04
+4096,2048,256,8,8,uniform,silu,per_token,128,mega p16 l4 bcm22,185.6,7.7e-05
+4096,2048,256,8,8,uniform,silu,per_token,128,mega p16 l2 bcm22,185.7,7.6e-05
+4096,2048,256,8,8,uniform,silu,per_token,128,mega p32 l1 bcm22,186.0,7.6e-05
+4096,2048,256,8,8,uniform,silu,per_token,128,mega p16 l1 bcm22,186.1,7.6e-05
+4096,2048,256,8,8,uniform,silu,per_token,128,mega p32 l4 bcm22,186.6,7.6e-05
+4096,2048,256,8,8,uniform,silu,per_token,128,mega p8 l2 bcm22,187.0,7.6e-05
+4096,2048,256,8,8,uniform,silu,per_token,128,mega p32 l2 bcm22,187.2,7.7e-05
+4096,2048,256,8,8,uniform,silu,per_token,128,mega p8 l4 bcm22,187.4,7.6e-05
+4096,2048,256,8,8,uniform,silu,per_token,128,mega p8 l1 bcm22,187.6,7.6e-05
+4096,2048,256,8,8,uniform,silu,per_token,128,mega p32 l4 bcm01,199.0,7.7e-05
+4096,2048,256,8,8,uniform,silu,per_token,128,mega p16 l2 bcm01,199.1,7.6e-05
+4096,2048,256,8,8,uniform,silu,per_token,128,mega p32 l2 bcm01,199.3,7.7e-05
+4096,2048,256,8,8,uniform,silu,per_token,128,mega p16 l1 bcm01,199.8,7.7e-05
+4096,2048,256,8,8,uniform,silu,per_token,128,mega p16 l4 bcm01,200.0,7.7e-05
+4096,2048,256,8,8,uniform,silu,per_token,128,mega p32 l1 bcm01,200.0,7.6e-05
+4096,2048,256,8,8,uniform,silu,per_token,128,mega p8 l4 bcm01,200.7,7.6e-05
+4096,2048,256,8,8,uniform,silu,per_token,128,mega p8 l2 bcm01,200.9,7.6e-05
+4096,2048,256,8,8,uniform,silu,per_token,128,mega p8 l1 bcm01,201.4,7.6e-05
+4096,2048,256,8,8,uniform,silu,per_token,256,mega_small bm32,156.4,4.6e-05
+4096,2048,256,8,8,uniform,silu,per_token,256,mega_small bm64,157.8,4.6e-05
+4096,2048,256,8,8,uniform,silu,per_token,256,mega_large cadd bcm22,176.9,5.1e-05
+4096,2048,256,8,8,uniform,silu,per_token,256,mega_large cfp8 bcm22,180.2,3.7e-04
+4096,2048,256,8,8,uniform,silu,per_token,256,mega_large cadd bcm01,182.9,5.1e-05
+4096,2048,256,8,8,uniform,silu,per_token,256,mega_large cfp8 bcm01,186.3,3.7e-04
+4096,2048,256,8,8,uniform,silu,per_token,256,mega p32 l2 bcm22,191.6,5.1e-05
+4096,2048,256,8,8,uniform,silu,per_token,256,mega p32 l4 bcm22,192.0,5.1e-05
+4096,2048,256,8,8,uniform,silu,per_token,256,mega p32 l1 bcm22,192.5,5.1e-05
+4096,2048,256,8,8,uniform,silu,per_token,256,mega p16 l4 bcm22,192.7,5.1e-05
+4096,2048,256,8,8,uniform,silu,per_token,256,mega p16 l2 bcm22,192.8,5.1e-05
+4096,2048,256,8,8,uniform,silu,per_token,256,mega p16 l1 bcm22,193.0,5.1e-05
+4096,2048,256,8,8,uniform,silu,per_token,256,mega p8 l2 bcm22,194.0,5.1e-05
+4096,2048,256,8,8,uniform,silu,per_token,256,mega p8 l4 bcm22,194.6,5.1e-05
+4096,2048,256,8,8,uniform,silu,per_token,256,mega p8 l1 bcm22,194.9,5.1e-05
+4096,2048,256,8,8,uniform,silu,per_token,256,mega p32 l1 bcm01,206.0,5.1e-05
+4096,2048,256,8,8,uniform,silu,per_token,256,mega p32 l2 bcm01,206.5,5.1e-05
+4096,2048,256,8,8,uniform,silu,per_token,256,mega p32 l4 bcm01,206.7,5.1e-05
+4096,2048,256,8,8,uniform,silu,per_token,256,mega p16 l4 bcm01,207.0,5.1e-05
+4096,2048,256,8,8,uniform,silu,per_token,256,mega p16 l1 bcm01,207.2,5.1e-05
+4096,2048,256,8,8,uniform,silu,per_token,256,mega p16 l2 bcm01,207.3,5.1e-05
+4096,2048,256,8,8,uniform,silu,per_token,256,mega p8 l1 bcm01,207.8,5.1e-05
+4096,2048,256,8,8,uniform,silu,per_token,256,mega p8 l4 bcm01,208.0,5.1e-05
+4096,2048,256,8,8,uniform,silu,per_token,256,mega p8 l2 bcm01,208.2,5.1e-05
+4096,2048,256,8,8,uniform,silu,per_token,512,mega_small bm64,170.5,5.2e-05
+4096,2048,256,8,8,uniform,silu,per_token,512,mega_small bm32,171.1,5.2e-05
+4096,2048,256,8,8,uniform,silu,per_token,512,mega_large cadd bcm22,186.8,5.7e-05
+4096,2048,256,8,8,uniform,silu,per_token,512,mega_large cfp8 bcm22,190.3,3.8e-04
+4096,2048,256,8,8,uniform,silu,per_token,512,mega_large cadd bcm01,193.3,5.7e-05
+4096,2048,256,8,8,uniform,silu,per_token,512,mega_large cfp8 bcm01,196.0,3.8e-04
+4096,2048,256,8,8,uniform,silu,per_token,512,mega p32 l2 bcm22,200.1,5.7e-05
+4096,2048,256,8,8,uniform,silu,per_token,512,mega p32 l1 bcm22,200.8,5.7e-05
+4096,2048,256,8,8,uniform,silu,per_token,512,mega p16 l4 bcm22,201.1,5.7e-05
+4096,2048,256,8,8,uniform,silu,per_token,512,mega p32 l4 bcm22,201.3,5.7e-05
+4096,2048,256,8,8,uniform,silu,per_token,512,mega p16 l2 bcm22,201.7,5.7e-05
+4096,2048,256,8,8,uniform,silu,per_token,512,mega p16 l1 bcm22,202.5,5.7e-05
+4096,2048,256,8,8,uniform,silu,per_token,512,mega p8 l4 bcm22,203.0,5.7e-05
+4096,2048,256,8,8,uniform,silu,per_token,512,mega p8 l2 bcm22,203.3,5.7e-05
+4096,2048,256,8,8,uniform,silu,per_token,512,mega p8 l1 bcm22,205.4,5.7e-05
+4096,2048,256,8,8,uniform,silu,per_token,512,mega p32 l4 bcm01,214.5,5.7e-05
+4096,2048,256,8,8,uniform,silu,per_token,512,mega p32 l2 bcm01,214.8,5.7e-05
+4096,2048,256,8,8,uniform,silu,per_token,512,mega p16 l2 bcm01,215.7,5.7e-05
+4096,2048,256,8,8,uniform,silu,per_token,512,mega p32 l1 bcm01,215.9,5.7e-05
+4096,2048,256,8,8,uniform,silu,per_token,512,mega p16 l4 bcm01,216.0,5.7e-05
+4096,2048,256,8,8,uniform,silu,per_token,512,mega p16 l1 bcm01,216.4,5.7e-05
+4096,2048,256,8,8,uniform,silu,per_token,512,mega p8 l2 bcm01,217.7,5.7e-05
+4096,2048,256,8,8,uniform,silu,per_token,512,mega p8 l4 bcm01,218.7,5.7e-05
+4096,2048,256,8,8,uniform,silu,per_token,512,mega p8 l1 bcm01,219.7,5.7e-05
+4096,2048,256,8,8,uniform,silu,per_token,1024,mega_small bm64,218.1,3.5e-05
+4096,2048,256,8,8,uniform,silu,per_token,1024,mega_large cadd bcm22,221.3,4.1e-05
+4096,2048,256,8,8,uniform,silu,per_token,1024,mega_large cfp8 bcm22,227.2,3.6e-04
+4096,2048,256,8,8,uniform,silu,per_token,1024,mega_large cadd bcm01,228.9,4.1e-05
+4096,2048,256,8,8,uniform,silu,per_token,1024,mega p32 l2 bcm22,231.0,4.1e-05
+4096,2048,256,8,8,uniform,silu,per_token,1024,mega p32 l1 bcm22,231.9,4.1e-05
+4096,2048,256,8,8,uniform,silu,per_token,1024,mega p16 l1 bcm22,232.0,4.1e-05
+4096,2048,256,8,8,uniform,silu,per_token,1024,mega p32 l4 bcm22,232.1,4.1e-05
+4096,2048,256,8,8,uniform,silu,per_token,1024,mega p16 l2 bcm22,232.3,4.1e-05
+4096,2048,256,8,8,uniform,silu,per_token,1024,mega p16 l4 bcm22,232.9,4.1e-05
+4096,2048,256,8,8,uniform,silu,per_token,1024,mega_large cfp8 bcm01,233.5,3.6e-04
+4096,2048,256,8,8,uniform,silu,per_token,1024,mega p8 l2 bcm22,234.7,4.1e-05
+4096,2048,256,8,8,uniform,silu,per_token,1024,mega p8 l4 bcm22,235.3,4.1e-05
+4096,2048,256,8,8,uniform,silu,per_token,1024,mega p8 l1 bcm22,235.6,4.1e-05
+4096,2048,256,8,8,uniform,silu,per_token,1024,mega p32 l1 bcm01,241.4,4.1e-05
+4096,2048,256,8,8,uniform,silu,per_token,1024,mega p32 l2 bcm01,241.5,4.1e-05
+4096,2048,256,8,8,uniform,silu,per_token,1024,mega p32 l4 bcm01,241.9,4.1e-05
+4096,2048,256,8,8,uniform,silu,per_token,1024,mega p8 l1 bcm01,242.0,4.1e-05
+4096,2048,256,8,8,uniform,silu,per_token,1024,mega p16 l4 bcm01,242.9,4.1e-05
+4096,2048,256,8,8,uniform,silu,per_token,1024,mega p8 l4 bcm01,243.0,4.1e-05
+4096,2048,256,8,8,uniform,silu,per_token,1024,mega p16 l1 bcm01,243.0,4.1e-05
+4096,2048,256,8,8,uniform,silu,per_token,1024,mega p16 l2 bcm01,243.0,4.1e-05
+4096,2048,256,8,8,uniform,silu,per_token,1024,mega p8 l2 bcm01,243.2,4.1e-05
+4096,2048,256,8,8,uniform,silu,per_token,1024,mega_small bm32,251.5,3.5e-05
+4096,2048,256,8,8,uniform,silu,per_token,2048,mega_large cadd bcm22,333.0,3.8e-05
+4096,2048,256,8,8,uniform,silu,per_token,2048,mega_large cfp8 bcm22,336.1,3.6e-04
+4096,2048,256,8,8,uniform,silu,per_token,2048,mega_large cadd bcm01,340.5,3.8e-05
+4096,2048,256,8,8,uniform,silu,per_token,2048,mega p16 l1 bcm22,342.9,3.8e-05
+4096,2048,256,8,8,uniform,silu,per_token,2048,mega p32 l2 bcm22,342.9,3.8e-05
+4096,2048,256,8,8,uniform,silu,per_token,2048,mega_large cfp8 bcm01,343.0,3.6e-04
+4096,2048,256,8,8,uniform,silu,per_token,2048,mega p16 l4 bcm22,343.1,3.8e-05
+4096,2048,256,8,8,uniform,silu,per_token,2048,mega p32 l4 bcm22,343.5,3.8e-05
+4096,2048,256,8,8,uniform,silu,per_token,2048,mega p32 l1 bcm22,344.1,3.8e-05
+4096,2048,256,8,8,uniform,silu,per_token,2048,mega p16 l2 bcm22,344.5,3.8e-05
+4096,2048,256,8,8,uniform,silu,per_token,2048,mega p16 l1 bcm01,349.8,3.8e-05
+4096,2048,256,8,8,uniform,silu,per_token,2048,mega p16 l2 bcm01,350.7,3.8e-05
+4096,2048,256,8,8,uniform,silu,per_token,2048,mega p16 l4 bcm01,350.7,3.8e-05
+4096,2048,256,8,8,uniform,silu,per_token,2048,mega p32 l1 bcm01,351.0,3.8e-05
+4096,2048,256,8,8,uniform,silu,per_token,2048,mega p32 l2 bcm01,351.3,3.8e-05
+4096,2048,256,8,8,uniform,silu,per_token,2048,mega p32 l4 bcm01,351.3,3.8e-05
+4096,2048,256,8,8,uniform,silu,per_token,2048,mega p8 l2 bcm22,352.7,3.8e-05
+4096,2048,256,8,8,uniform,silu,per_token,2048,mega p8 l4 bcm22,353.0,3.8e-05
+4096,2048,256,8,8,uniform,silu,per_token,2048,mega p8 l1 bcm22,353.7,3.8e-05
+4096,2048,256,8,8,uniform,silu,per_token,2048,mega p8 l2 bcm01,360.0,3.8e-05
+4096,2048,256,8,8,uniform,silu,per_token,2048,mega p8 l4 bcm01,360.1,3.8e-05
+4096,2048,256,8,8,uniform,silu,per_token,2048,mega p8 l1 bcm01,360.5,3.8e-05
+4096,2048,256,8,8,uniform,silu,per_token,4096,mega_large cfp8 bcm01,491.0,3.6e-04
+4096,2048,256,8,8,uniform,silu,per_token,4096,mega_large cfp8 bcm22,503.6,3.6e-04
+4096,2048,256,8,8,uniform,silu,per_token,4096,mega p16 l4 bcm01,513.7,3.9e-05
+4096,2048,256,8,8,uniform,silu,per_token,4096,mega p16 l2 bcm01,514.8,3.9e-05
+4096,2048,256,8,8,uniform,silu,per_token,4096,mega p16 l4 bcm22,517.3,3.9e-05
+4096,2048,256,8,8,uniform,silu,per_token,4096,mega p8 l4 bcm01,518.8,3.9e-05
+4096,2048,256,8,8,uniform,silu,per_token,4096,mega p8 l2 bcm01,520.2,3.9e-05
+4096,2048,256,8,8,uniform,silu,per_token,4096,mega p32 l2 bcm01,521.8,3.9e-05
+4096,2048,256,8,8,uniform,silu,per_token,4096,mega p32 l4 bcm01,522.7,3.9e-05
+4096,2048,256,8,8,uniform,silu,per_token,4096,mega_large cadd bcm01,523.0,3.9e-05
+4096,2048,256,8,8,uniform,silu,per_token,4096,mega p16 l2 bcm22,523.6,3.9e-05
+4096,2048,256,8,8,uniform,silu,per_token,4096,mega p8 l4 bcm22,526.1,3.9e-05
+4096,2048,256,8,8,uniform,silu,per_token,4096,mega p16 l1 bcm01,526.9,3.9e-05
+4096,2048,256,8,8,uniform,silu,per_token,4096,mega p32 l2 bcm22,527.7,3.9e-05
+4096,2048,256,8,8,uniform,silu,per_token,4096,mega p8 l2 bcm22,527.9,3.9e-05
+4096,2048,256,8,8,uniform,silu,per_token,4096,mega p32 l4 bcm22,528.3,3.9e-05
+4096,2048,256,8,8,uniform,silu,per_token,4096,mega p16 l1 bcm22,536.0,3.9e-05
+4096,2048,256,8,8,uniform,silu,per_token,4096,mega p32 l1 bcm01,536.5,3.9e-05
+4096,2048,256,8,8,uniform,silu,per_token,4096,mega p32 l1 bcm22,538.8,3.9e-05
+4096,2048,256,8,8,uniform,silu,per_token,4096,mega_large cadd bcm22,539.4,3.9e-05
+4096,2048,256,8,8,uniform,silu,per_token,4096,mega p8 l1 bcm01,543.1,3.9e-05
+4096,2048,256,8,8,uniform,silu,per_token,4096,mega p8 l1 bcm22,546.1,3.9e-05
+4096,2048,256,8,8,uniform,silu,per_token,8192,mega_large cadd bcm01,835.8,3.4e-05
+4096,2048,256,8,8,uniform,silu,per_token,8192,mega_large cfp8 bcm01,837.2,3.5e-04
+4096,2048,256,8,8,uniform,silu,per_token,8192,mega p16 l4 bcm01,855.0,3.4e-05
+4096,2048,256,8,8,uniform,silu,per_token,8192,mega p8 l4 bcm01,859.5,3.4e-05
+4096,2048,256,8,8,uniform,silu,per_token,8192,mega p16 l2 bcm01,865.0,3.4e-05
+4096,2048,256,8,8,uniform,silu,per_token,8192,mega p32 l4 bcm01,866.4,3.4e-05
+4096,2048,256,8,8,uniform,silu,per_token,8192,mega p8 l2 bcm01,868.5,3.4e-05
+4096,2048,256,8,8,uniform,silu,per_token,8192,mega p16 l1 bcm01,872.2,3.4e-05
+4096,2048,256,8,8,uniform,silu,per_token,8192,mega_large cfp8 bcm22,874.9,3.5e-04
+4096,2048,256,8,8,uniform,silu,per_token,8192,mega p8 l1 bcm01,875.3,3.4e-05
+4096,2048,256,8,8,uniform,silu,per_token,8192,mega p32 l2 bcm01,875.3,3.4e-05
+4096,2048,256,8,8,uniform,silu,per_token,8192,mega p16 l4 bcm22,877.9,3.4e-05
+4096,2048,256,8,8,uniform,silu,per_token,8192,mega p32 l1 bcm01,885.0,3.4e-05
+4096,2048,256,8,8,uniform,silu,per_token,8192,mega p8 l4 bcm22,885.2,3.4e-05
+4096,2048,256,8,8,uniform,silu,per_token,8192,mega p32 l4 bcm22,887.8,3.4e-05
+4096,2048,256,8,8,uniform,silu,per_token,8192,mega p16 l2 bcm22,889.1,3.4e-05
+4096,2048,256,8,8,uniform,silu,per_token,8192,mega p16 l1 bcm22,896.1,3.4e-05
+4096,2048,256,8,8,uniform,silu,per_token,8192,mega p8 l1 bcm22,896.9,3.4e-05
+4096,2048,256,8,8,uniform,silu,per_token,8192,mega p8 l2 bcm22,897.2,3.4e-05
+4096,2048,256,8,8,uniform,silu,per_token,8192,mega p32 l2 bcm22,900.0,3.4e-05
+4096,2048,256,8,8,uniform,silu,per_token,8192,mega_large cadd bcm22,904.7,3.4e-05
+4096,2048,256,8,8,uniform,silu,per_token,8192,mega p32 l1 bcm22,908.7,3.4e-05
+4096,2048,256,8,8,uniform,silu,per_token,16384,mega_large cadd bcm01,1498.7,3.4e-05
+4096,2048,256,8,8,uniform,silu,per_token,16384,mega_large cfp8 bcm01,1519.7,3.5e-04
+4096,2048,256,8,8,uniform,silu,per_token,16384,mega p16 l4 bcm01,1532.4,3.4e-05
+4096,2048,256,8,8,uniform,silu,per_token,16384,mega p16 l2 bcm01,1548.7,3.4e-05
+4096,2048,256,8,8,uniform,silu,per_token,16384,mega p16 l1 bcm01,1549.4,3.4e-05
+4096,2048,256,8,8,uniform,silu,per_token,16384,mega p32 l4 bcm01,1553.2,3.4e-05
+4096,2048,256,8,8,uniform,silu,per_token,16384,mega p8 l4 bcm01,1558.4,3.4e-05
+4096,2048,256,8,8,uniform,silu,per_token,16384,mega p32 l1 bcm01,1564.4,3.4e-05
+4096,2048,256,8,8,uniform,silu,per_token,16384,mega p8 l1 bcm01,1567.2,3.4e-05
+4096,2048,256,8,8,uniform,silu,per_token,16384,mega p8 l2 bcm01,1579.8,3.4e-05
+4096,2048,256,8,8,uniform,silu,per_token,16384,mega_large cfp8 bcm22,1605.0,3.5e-04
+4096,2048,256,8,8,uniform,silu,per_token,16384,mega p16 l2 bcm22,1633.6,3.4e-05
+4096,2048,256,8,8,uniform,silu,per_token,16384,mega_large cadd bcm22,1636.2,3.4e-05
+4096,2048,256,8,8,uniform,silu,per_token,16384,mega p32 l2 bcm01,1647.9,3.4e-05
+4096,2048,256,8,8,uniform,silu,per_token,16384,mega p32 l2 bcm22,1662.4,3.4e-05
+4096,2048,256,8,8,uniform,silu,per_token,16384,mega p16 l1 bcm22,1671.3,3.4e-05
+4096,2048,256,8,8,uniform,silu,per_token,16384,mega p8 l1 bcm22,1674.7,3.4e-05
+4096,2048,256,8,8,uniform,silu,per_token,16384,mega p16 l4 bcm22,1682.9,3.4e-05
+4096,2048,256,8,8,uniform,silu,per_token,16384,mega p32 l4 bcm22,1687.8,3.4e-05
+4096,2048,256,8,8,uniform,silu,per_token,16384,mega p8 l4 bcm22,1696.7,3.4e-05
+4096,2048,256,8,8,uniform,silu,per_token,16384,mega p32 l1 bcm22,1701.9,3.4e-05
+4096,2048,256,8,8,uniform,silu,per_token,16384,mega p8 l2 bcm22,1705.3,3.4e-05
+4096,2048,256,8,8,uniform,silu,per_token,32768,mega p16 l2 bcm01,2833.2,3.2e-05
+4096,2048,256,8,8,uniform,silu,per_token,32768,mega p16 l4 bcm01,2835.4,3.2e-05
+4096,2048,256,8,8,uniform,silu,per_token,32768,mega p16 l1 bcm01,2849.4,3.2e-05
+4096,2048,256,8,8,uniform,silu,per_token,32768,mega p32 l4 bcm01,2859.5,3.2e-05
+4096,2048,256,8,8,uniform,silu,per_token,32768,mega p32 l2 bcm01,2862.9,3.2e-05
+4096,2048,256,8,8,uniform,silu,per_token,32768,mega p8 l2 bcm01,2895.3,3.2e-05
+4096,2048,256,8,8,uniform,silu,per_token,32768,mega p32 l1 bcm01,2904.1,3.2e-05
+4096,2048,256,8,8,uniform,silu,per_token,32768,mega p8 l1 bcm01,2910.2,3.2e-05
+4096,2048,256,8,8,uniform,silu,per_token,32768,mega_large cfp8 bcm01,2937.6,3.5e-04
+4096,2048,256,8,8,uniform,silu,per_token,32768,mega p8 l4 bcm01,2946.9,3.2e-05
+4096,2048,256,8,8,uniform,silu,per_token,32768,mega_large cadd bcm01,3034.0,3.2e-05
+4096,2048,256,8,8,uniform,silu,per_token,32768,mega_large cfp8 bcm22,3071.2,3.5e-04
+4096,2048,256,8,8,uniform,silu,per_token,32768,mega p16 l4 bcm22,3081.9,3.2e-05
+4096,2048,256,8,8,uniform,silu,per_token,32768,mega p16 l2 bcm22,3182.8,3.2e-05
+4096,2048,256,8,8,uniform,silu,per_token,32768,mega p32 l4 bcm22,3187.4,3.2e-05
+4096,2048,256,8,8,uniform,silu,per_token,32768,mega p8 l1 bcm22,3213.7,3.2e-05
+4096,2048,256,8,8,uniform,silu,per_token,32768,mega p16 l1 bcm22,3231.2,3.2e-05
+4096,2048,256,8,8,uniform,silu,per_token,32768,mega p8 l4 bcm22,3239.2,3.2e-05
+4096,2048,256,8,8,uniform,silu,per_token,32768,mega_large cadd bcm22,3289.2,3.2e-05
+4096,2048,256,8,8,uniform,silu,per_token,32768,mega p8 l2 bcm22,3307.8,3.2e-05
+4096,2048,256,8,8,uniform,silu,per_token,32768,mega p32 l1 bcm22,3334.7,3.2e-05
+4096,2048,256,8,8,uniform,silu,per_token,32768,mega p32 l2 bcm22,3339.6,3.2e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,64,mega_small bm32,145.4,2.2e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,64,mega_small bm64,145.5,2.2e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,64,mega_large cadd bcm22,166.1,2.2e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,64,mega_large cfp8 bcm22,169.4,5.4e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,64,mori s16,171.0,7.0e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,64,mori t16,172.7,7.0e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,64,mega_large cadd bcm01,173.6,2.2e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,64,mega_large cfp8 bcm01,177.2,5.4e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,64,mega p8 l4 bcm22,178.2,2.2e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,64,mega p16 l4 bcm22,178.2,2.2e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,64,mega p32 l4 bcm22,178.4,2.2e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,64,mega p32 l2 bcm22,178.7,2.2e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,64,mega p8 l2 bcm22,178.8,2.2e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,64,mega p16 l1 bcm22,179.4,2.2e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,64,mega p32 l1 bcm22,179.5,2.2e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,64,mega p16 l2 bcm22,179.8,2.2e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,64,mega p8 l1 bcm22,181.6,2.2e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,64,mega p16 l2 bcm01,188.3,2.2e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,64,mega p32 l4 bcm01,188.6,2.2e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,64,mega p16 l1 bcm01,188.8,2.2e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,64,mega p32 l1 bcm01,188.8,2.2e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,64,mega p32 l2 bcm01,188.8,2.2e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,64,mega p8 l1 bcm01,189.0,2.2e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,64,mega p16 l4 bcm01,189.8,2.2e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,64,mega p8 l4 bcm01,190.2,2.2e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,64,mega p8 l2 bcm01,190.7,2.2e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,64,mori s32,190.9,7.0e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,64,mori m64,196.8,6.6e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,64,mori l128,205.1,6.6e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,64,mori l128c,218.5,6.6e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,64,mori_eager l128,421.1,6.6e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,64,mori_eager l128c,424.6,6.6e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,64,mori_eager m64,427.6,6.6e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,64,mori_eager t16,428.6,7.0e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,64,mori_eager s16,439.6,7.0e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,64,mori_eager s32,463.9,7.1e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,128,mega_small bm64,154.6,1.9e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,128,mega_small bm32,155.6,1.9e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,128,mega_large cadd bcm22,180.0,2.0e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,128,mega_large cfp8 bcm22,183.1,5.2e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,128,mori s16,183.9,3.9e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,128,mori t16,185.5,3.9e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,128,mega_large cadd bcm01,190.4,2.0e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,128,mega_large cfp8 bcm01,192.7,5.2e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,128,mega p32 l2 bcm22,196.2,2.0e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,128,mega p16 l4 bcm22,196.5,2.0e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,128,mega p32 l4 bcm22,196.9,2.0e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,128,mega p32 l1 bcm22,197.5,2.0e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,128,mega p8 l4 bcm22,197.7,2.0e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,128,mega p16 l1 bcm22,197.9,2.0e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,128,mega p8 l2 bcm22,198.2,2.0e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,128,mega p8 l1 bcm22,198.6,2.0e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,128,mega p16 l2 bcm22,198.7,2.0e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,128,mori s32,204.0,3.9e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,128,mori m64,206.4,3.1e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,128,mega p16 l1 bcm01,208.6,2.0e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,128,mega p8 l2 bcm01,208.9,2.0e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,128,mega p8 l4 bcm01,209.1,2.0e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,128,mega p32 l1 bcm01,209.1,2.0e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,128,mega p32 l4 bcm01,209.6,2.0e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,128,mega p32 l2 bcm01,209.7,2.0e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,128,mega p16 l2 bcm01,209.8,2.0e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,128,mega p16 l4 bcm01,209.8,2.0e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,128,mega p8 l1 bcm01,210.8,2.0e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,128,mori l128,215.7,3.1e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,128,mori l128c,232.6,3.1e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,128,mori_eager s32,409.0,3.9e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,128,mori_eager t16,412.3,3.9e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,128,mori_eager m64,413.4,3.1e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,128,mori_eager l128,413.8,3.1e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,128,mori_eager s16,420.5,3.9e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,128,mori_eager l128c,448.3,3.2e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,256,mega_small bm64,160.7,1.7e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,256,mega_small bm32,161.3,1.7e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,256,mega_large cadd bcm22,186.1,1.7e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,256,mega_large cfp8 bcm22,189.0,5.0e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,256,mori s16,189.5,3.3e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,256,mori t16,190.9,3.3e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,256,mega_large cadd bcm01,193.2,1.7e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,256,mega_large cfp8 bcm01,196.3,5.0e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,256,mega p32 l4 bcm22,203.2,1.7e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,256,mega p32 l2 bcm22,203.6,1.7e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,256,mega p32 l1 bcm22,204.0,1.7e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,256,mega p16 l4 bcm22,204.1,1.7e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,256,mega p8 l4 bcm22,204.5,1.7e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,256,mega p16 l1 bcm22,204.7,1.7e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,256,mega p16 l2 bcm22,204.9,1.7e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,256,mega p8 l1 bcm22,205.2,1.7e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,256,mega p8 l2 bcm22,205.2,1.7e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,256,mori s32,207.7,3.3e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,256,mori m64,212.2,2.6e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,256,mega p32 l4 bcm01,214.4,1.7e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,256,mega p32 l1 bcm01,215.1,1.7e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,256,mega p32 l2 bcm01,215.5,1.7e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,256,mega p16 l1 bcm01,216.1,1.7e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,256,mega p16 l4 bcm01,216.5,1.7e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,256,mega p16 l2 bcm01,216.7,1.7e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,256,mega p8 l4 bcm01,216.9,1.7e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,256,mega p8 l1 bcm01,217.1,1.7e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,256,mega p8 l2 bcm01,217.6,1.7e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,256,mori l128,221.0,2.6e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,256,mori l128c,239.6,2.6e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,256,mori_eager l128,412.9,2.6e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,256,mori_eager t16,415.0,3.3e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,256,mori_eager s32,419.9,3.3e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,256,mori_eager m64,422.3,2.6e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,256,mori_eager s16,424.2,3.3e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,256,mori_eager l128c,426.8,2.6e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,512,mega_small bm32,175.0,1.6e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,512,mega_small bm64,175.2,1.6e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,512,mega_large cadd bcm22,195.8,1.6e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,512,mega_large cfp8 bcm22,200.3,4.9e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,512,mega_large cadd bcm01,204.1,1.6e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,512,mega_large cfp8 bcm01,206.1,4.9e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,512,mega p32 l4 bcm22,214.2,1.6e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,512,mega p32 l2 bcm22,214.5,1.6e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,512,mega p16 l2 bcm22,214.9,1.6e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,512,mega p16 l1 bcm22,215.1,1.6e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,512,mega p32 l1 bcm22,215.3,1.6e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,512,mega p8 l2 bcm22,215.9,1.6e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,512,mega p16 l4 bcm22,216.1,1.6e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,512,mega p8 l1 bcm22,217.8,1.6e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,512,mega p8 l4 bcm22,218.0,1.6e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,512,mori s32,221.6,3.3e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,512,mori m64,224.0,2.4e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,512,mega p32 l2 bcm01,224.8,1.6e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,512,mega p16 l1 bcm01,224.9,1.6e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,512,mega p32 l4 bcm01,225.0,1.6e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,512,mega p16 l4 bcm01,225.2,1.6e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,512,mega p32 l1 bcm01,225.2,1.6e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,512,mega p16 l2 bcm01,225.4,1.6e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,512,mega p8 l4 bcm01,227.9,1.6e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,512,mega p8 l2 bcm01,228.1,1.6e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,512,mega p8 l1 bcm01,228.2,1.6e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,512,mori l128,233.0,2.4e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,512,mori s16,246.0,3.3e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,512,mori t16,249.1,3.3e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,512,mori l128c,252.7,2.4e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,512,mori_eager t16,432.9,3.3e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,512,mori_eager s16,433.6,3.3e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,512,mori_eager l128,438.3,2.4e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,512,mori_eager m64,446.9,2.4e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,512,mori_eager s32,464.5,3.3e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,512,mori_eager l128c,469.6,2.4e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,1024,mega_small bm64,232.0,1.6e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,1024,mega_large cadd bcm22,233.0,1.6e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,1024,mega_large cfp8 bcm22,238.5,4.8e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,1024,mega_large cadd bcm01,240.5,1.6e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,1024,mega_large cfp8 bcm01,245.8,4.8e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,1024,mega p32 l2 bcm22,246.6,1.6e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,1024,mega p16 l1 bcm22,246.7,1.6e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,1024,mega p16 l4 bcm22,247.2,1.6e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,1024,mega p16 l2 bcm22,247.4,1.6e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,1024,mega p32 l1 bcm22,247.7,1.6e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,1024,mega p32 l4 bcm22,247.8,1.6e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,1024,mega p8 l1 bcm22,248.9,1.6e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,1024,mega p8 l2 bcm22,248.9,1.6e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,1024,mega p8 l4 bcm22,249.3,1.6e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,1024,mega p32 l2 bcm01,254.7,1.6e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,1024,mega p32 l1 bcm01,254.8,1.6e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,1024,mega p32 l4 bcm01,254.8,1.6e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,1024,mega p16 l4 bcm01,255.5,1.6e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,1024,mega p16 l2 bcm01,255.6,1.6e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,1024,mega p16 l1 bcm01,255.7,1.6e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,1024,mega p8 l1 bcm01,256.7,1.6e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,1024,mega p8 l2 bcm01,256.8,1.6e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,1024,mega p8 l4 bcm01,257.4,1.6e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,1024,mega_small bm32,263.4,1.6e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,1024,mori m64,277.3,2.0e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,1024,mori l128,284.1,2.0e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,1024,mori l128c,294.8,2.0e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,1024,mori s32,304.2,2.9e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,1024,mori s16,356.7,2.9e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,1024,mori t16,375.9,2.9e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,1024,mori_eager l128,446.4,2.0e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,1024,mori_eager m64,456.9,2.0e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,1024,mori_eager l128c,474.3,2.0e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,1024,mori_eager s32,481.4,2.9e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,1024,mori_eager s16,535.8,2.9e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,1024,mori_eager t16,552.6,2.9e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,2048,mega_large cadd bcm22,360.7,1.6e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,2048,mega_large cfp8 bcm22,366.1,4.8e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,2048,mega_large cadd bcm01,367.4,1.6e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,2048,mega_large cfp8 bcm01,372.6,4.8e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,2048,mega p16 l1 bcm22,373.3,1.6e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,2048,mega p16 l4 bcm22,373.3,1.6e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,2048,mega p32 l1 bcm22,373.7,1.6e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,2048,mega p16 l2 bcm22,373.8,1.6e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,2048,mega p32 l2 bcm22,373.8,1.6e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,2048,mega p32 l4 bcm22,373.9,1.6e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,2048,mega p16 l4 bcm01,380.5,1.6e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,2048,mega p32 l2 bcm01,380.5,1.6e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,2048,mega p32 l4 bcm01,380.6,1.6e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,2048,mega p16 l1 bcm01,380.8,1.6e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,2048,mega p32 l1 bcm01,380.8,1.6e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,2048,mega p16 l2 bcm01,381.1,1.6e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,2048,mega p8 l1 bcm22,381.9,1.6e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,2048,mega p8 l4 bcm22,382.4,1.6e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,2048,mega p8 l2 bcm22,382.6,1.6e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,2048,mega p8 l1 bcm01,389.5,1.6e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,2048,mega p8 l4 bcm01,389.6,1.6e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,2048,mega p8 l2 bcm01,389.8,1.6e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,2048,mori m64,445.1,2.0e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,2048,mori l128,451.2,2.0e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,2048,mori l128c,460.1,2.0e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,2048,mori s32,482.7,2.9e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,2048,mori s16,595.5,2.9e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,2048,mori_eager m64,631.6,2.0e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,2048,mori_eager l128,632.1,2.0e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,2048,mori t16,637.2,2.9e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,2048,mori_eager l128c,647.8,2.0e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,2048,mori_eager s32,661.1,2.9e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,2048,mori_eager s16,770.7,2.9e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,2048,mori_eager t16,816.8,2.9e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,4096,mega_large cfp8 bcm01,524.2,4.7e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,4096,mega_large cfp8 bcm22,535.9,4.7e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,4096,mega_large cadd bcm01,538.1,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,4096,mega p16 l4 bcm01,542.5,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,4096,mega p16 l2 bcm01,543.1,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,4096,mega p16 l4 bcm22,548.4,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,4096,mega p32 l4 bcm01,550.4,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,4096,mega p16 l2 bcm22,550.8,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,4096,mega p32 l2 bcm01,552.3,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,4096,mega p32 l4 bcm22,555.7,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,4096,mega p8 l4 bcm01,556.8,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,4096,mega p8 l2 bcm01,557.7,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,4096,mega p32 l2 bcm22,558.0,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,4096,mega_large cadd bcm22,558.4,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,4096,mega p8 l2 bcm22,562.4,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,4096,mega p8 l4 bcm22,563.6,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,4096,mega p16 l1 bcm01,569.8,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,4096,mega p16 l1 bcm22,573.1,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,4096,mega p32 l1 bcm01,578.3,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,4096,mega p32 l1 bcm22,580.5,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,4096,mega p8 l1 bcm01,583.3,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,4096,mega p8 l1 bcm22,589.0,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,4096,mori l128,727.5,1.8e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,4096,mori l128c,729.7,1.8e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,4096,mori m64,731.3,1.8e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,4096,mori s32,827.8,2.7e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,4096,mori_eager l128c,875.0,1.8e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,4096,mori_eager l128,876.4,1.8e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,4096,mori_eager m64,883.6,1.8e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,4096,mori_eager s32,979.6,2.7e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,4096,mori s16,1095.4,2.7e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,4096,mori t16,1167.6,2.7e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,4096,mori_eager s16,1238.6,2.7e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,4096,mori_eager t16,1310.3,2.7e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,8192,mega_large cfp8 bcm01,900.6,4.7e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,8192,mega_large cadd bcm01,903.6,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,8192,mega p16 l4 bcm01,921.3,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,8192,mega p32 l4 bcm01,926.5,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,8192,mega p8 l4 bcm01,931.0,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,8192,mega_large cfp8 bcm22,936.8,4.7e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,8192,mega p16 l4 bcm22,942.9,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,8192,mega p16 l2 bcm01,943.6,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,8192,mega p16 l1 bcm01,948.8,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,8192,mega p32 l4 bcm22,949.5,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,8192,mega p32 l2 bcm01,950.2,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,8192,mega p8 l4 bcm22,952.6,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,8192,mega p32 l1 bcm01,955.3,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,8192,mega p8 l1 bcm01,957.4,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,8192,mega p8 l2 bcm01,957.6,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,8192,mega p16 l2 bcm22,961.4,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,8192,mega_large cadd bcm22,962.8,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,8192,mega p16 l1 bcm22,968.0,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,8192,mega p32 l2 bcm22,969.8,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,8192,mega p32 l1 bcm22,972.0,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,8192,mega p8 l2 bcm22,976.7,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,8192,mega p8 l1 bcm22,978.7,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,8192,mori l128c,1135.3,1.8e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,8192,mori l128,1150.0,1.8e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,8192,mori_eager l128c,1253.5,1.8e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,8192,mori m64,1266.2,1.8e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,8192,mori_eager l128,1268.2,1.8e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,8192,mori_eager m64,1397.5,1.8e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,8192,mori s32,1544.2,2.7e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,8192,mori_eager s32,1667.2,2.7e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,8192,mori s16,2077.6,2.7e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,8192,mori_eager s16,2186.6,2.7e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,8192,mori t16,2253.2,2.7e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,8192,mori_eager t16,2322.6,2.7e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,16384,mega_large cfp8 bcm01,1643.1,4.7e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,16384,mega p8 l4 bcm01,1693.4,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,16384,mega p32 l4 bcm01,1699.2,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,16384,mega p16 l1 bcm01,1707.7,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,16384,mega_large cadd bcm01,1711.3,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,16384,mega p16 l2 bcm01,1716.7,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,16384,mega p32 l2 bcm01,1724.3,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,16384,mega p16 l2 bcm22,1730.9,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,16384,mega p8 l4 bcm22,1736.2,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,16384,mega p32 l4 bcm22,1736.5,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,16384,mega p8 l2 bcm01,1744.5,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,16384,mega p16 l1 bcm22,1745.3,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,16384,mega_large cfp8 bcm22,1752.9,4.7e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,16384,mega p8 l1 bcm01,1772.8,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,16384,mega p16 l4 bcm01,1775.0,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,16384,mega p32 l2 bcm22,1780.9,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,16384,mega p16 l4 bcm22,1794.6,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,16384,mega_large cadd bcm22,1795.4,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,16384,mega p32 l1 bcm01,1800.4,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,16384,mega p8 l1 bcm22,1810.2,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,16384,mega p8 l2 bcm22,1816.8,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,16384,mega p32 l1 bcm22,1859.2,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,16384,mori l128c,2059.8,1.8e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,16384,mori l128,2127.7,1.8e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,16384,mori_eager l128c,2201.1,1.8e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,16384,mori_eager l128,2266.7,1.8e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,16384,mori m64,2397.3,1.8e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,16384,mori_eager m64,2524.1,1.8e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,16384,mori s32,2949.9,2.7e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,16384,mori_eager s32,3076.9,2.7e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,16384,mori s16,4582.3,2.7e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,16384,mori_eager s16,4771.7,2.7e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,16384,mori t16,4814.4,2.7e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,16384,mori_eager t16,4991.0,2.7e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,32768,mega_large cfp8 bcm01,3081.2,4.7e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,32768,mega_large cadd bcm01,3224.2,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,32768,mega_large cfp8 bcm22,3258.9,4.7e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,32768,mega p16 l4 bcm01,3274.9,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,32768,mega p16 l2 bcm01,3293.1,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,32768,mega p8 l4 bcm01,3332.6,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,32768,mega p32 l2 bcm01,3352.3,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,32768,mega p32 l1 bcm01,3355.0,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,32768,mega_large cadd bcm22,3390.9,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,32768,mega p8 l1 bcm01,3398.0,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,32768,mega p8 l2 bcm01,3413.1,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,32768,mega p16 l1 bcm01,3415.5,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,32768,mega p32 l4 bcm01,3432.6,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,32768,mega p8 l4 bcm22,3434.4,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,32768,mega p32 l1 bcm22,3436.0,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,32768,mega p16 l4 bcm22,3442.4,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,32768,mega p8 l1 bcm22,3454.7,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,32768,mega p32 l2 bcm22,3462.9,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,32768,mega p32 l4 bcm22,3493.9,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,32768,mega p16 l2 bcm22,3504.0,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,32768,mega p16 l1 bcm22,3524.5,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,32768,mega p8 l2 bcm22,3533.5,1.5e-04
+4096,2048,256,8,8,uniform,situv2,per_1x128,32768,mori l128c,3954.0,1.7e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,32768,mori_eager l128c,3983.7,1.7e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,32768,mori l128,4063.8,1.7e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,32768,mori_eager l128,4127.1,1.7e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,32768,mori m64,4886.9,1.7e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,32768,mori_eager m64,5099.6,1.7e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,32768,mori s32,6371.8,2.6e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,32768,mori_eager s32,6570.9,2.6e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,32768,mori s16,8919.0,2.6e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,32768,mori_eager s16,9016.4,2.6e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,32768,mori_eager t16,9331.8,2.6e-05
+4096,2048,256,8,8,uniform,situv2,per_1x128,32768,mori t16,9465.8,2.6e-05
+4096,2048,256,8,8,uniform,situv2,per_token,64,mega_small bm64,140.8,8.3e-05
+4096,2048,256,8,8,uniform,situv2,per_token,64,mega_small bm32,141.6,8.3e-05
+4096,2048,256,8,8,uniform,situv2,per_token,64,mega_large cadd bcm22,159.9,8.8e-05
+4096,2048,256,8,8,uniform,situv2,per_token,64,mega_large cfp8 bcm22,163.3,4.1e-04
+4096,2048,256,8,8,uniform,situv2,per_token,64,mega_large cadd bcm01,166.1,8.8e-05
+4096,2048,256,8,8,uniform,situv2,per_token,64,mega_large cfp8 bcm01,169.3,4.1e-04
+4096,2048,256,8,8,uniform,situv2,per_token,64,mega p32 l1 bcm22,173.4,8.8e-05
+4096,2048,256,8,8,uniform,situv2,per_token,64,mega p16 l4 bcm22,173.7,8.8e-05
+4096,2048,256,8,8,uniform,situv2,per_token,64,mega p8 l1 bcm22,173.8,8.8e-05
+4096,2048,256,8,8,uniform,situv2,per_token,64,mega p32 l4 bcm22,173.9,8.8e-05
+4096,2048,256,8,8,uniform,situv2,per_token,64,mega p8 l4 bcm22,174.0,8.8e-05
+4096,2048,256,8,8,uniform,situv2,per_token,64,mega p16 l1 bcm22,174.1,8.8e-05
+4096,2048,256,8,8,uniform,situv2,per_token,64,mega p8 l2 bcm22,174.4,8.8e-05
+4096,2048,256,8,8,uniform,situv2,per_token,64,mega p16 l2 bcm22,174.4,8.8e-05
+4096,2048,256,8,8,uniform,situv2,per_token,64,mega p32 l2 bcm22,174.5,8.8e-05
+4096,2048,256,8,8,uniform,situv2,per_token,64,mega p16 l4 bcm01,183.7,8.8e-05
+4096,2048,256,8,8,uniform,situv2,per_token,64,mega p16 l1 bcm01,183.8,8.8e-05
+4096,2048,256,8,8,uniform,situv2,per_token,64,mega p16 l2 bcm01,183.8,8.8e-05
+4096,2048,256,8,8,uniform,situv2,per_token,64,mega p8 l1 bcm01,183.9,8.8e-05
+4096,2048,256,8,8,uniform,situv2,per_token,64,mega p8 l2 bcm01,183.9,8.8e-05
+4096,2048,256,8,8,uniform,situv2,per_token,64,mega p8 l4 bcm01,184.0,8.8e-05
+4096,2048,256,8,8,uniform,situv2,per_token,64,mega p32 l1 bcm01,184.5,8.8e-05
+4096,2048,256,8,8,uniform,situv2,per_token,64,mega p32 l4 bcm01,184.5,8.8e-05
+4096,2048,256,8,8,uniform,situv2,per_token,64,mega p32 l2 bcm01,184.9,8.9e-05
+4096,2048,256,8,8,uniform,situv2,per_token,128,mega_small bm32,152.8,1.7e-04
+4096,2048,256,8,8,uniform,situv2,per_token,128,mega_small bm64,153.5,1.7e-04
+4096,2048,256,8,8,uniform,situv2,per_token,128,mega_large cadd bcm22,170.2,1.7e-04
+4096,2048,256,8,8,uniform,situv2,per_token,128,mega_large cfp8 bcm22,173.8,5.0e-04
+4096,2048,256,8,8,uniform,situv2,per_token,128,mega_large cadd bcm01,178.8,1.7e-04
+4096,2048,256,8,8,uniform,situv2,per_token,128,mega_large cfp8 bcm01,182.2,5.0e-04
+4096,2048,256,8,8,uniform,situv2,per_token,128,mega p32 l1 bcm22,187.1,1.7e-04
+4096,2048,256,8,8,uniform,situv2,per_token,128,mega p16 l4 bcm22,187.3,1.7e-04
+4096,2048,256,8,8,uniform,situv2,per_token,128,mega p16 l1 bcm22,187.5,1.7e-04
+4096,2048,256,8,8,uniform,situv2,per_token,128,mega p32 l4 bcm22,187.7,1.7e-04
+4096,2048,256,8,8,uniform,situv2,per_token,128,mega p32 l2 bcm22,188.1,1.7e-04
+4096,2048,256,8,8,uniform,situv2,per_token,128,mega p16 l2 bcm22,188.2,1.7e-04
+4096,2048,256,8,8,uniform,situv2,per_token,128,mega p8 l2 bcm22,188.4,1.7e-04
+4096,2048,256,8,8,uniform,situv2,per_token,128,mega p8 l4 bcm22,188.5,1.7e-04
+4096,2048,256,8,8,uniform,situv2,per_token,128,mega p8 l1 bcm22,189.5,1.7e-04
+4096,2048,256,8,8,uniform,situv2,per_token,128,mega p32 l2 bcm01,200.4,1.7e-04
+4096,2048,256,8,8,uniform,situv2,per_token,128,mega p16 l2 bcm01,200.8,1.7e-04
+4096,2048,256,8,8,uniform,situv2,per_token,128,mega p16 l4 bcm01,200.9,1.7e-04
+4096,2048,256,8,8,uniform,situv2,per_token,128,mega p32 l1 bcm01,201.6,1.7e-04
+4096,2048,256,8,8,uniform,situv2,per_token,128,mega p8 l1 bcm01,201.7,1.7e-04
+4096,2048,256,8,8,uniform,situv2,per_token,128,mega p16 l1 bcm01,202.0,1.7e-04
+4096,2048,256,8,8,uniform,situv2,per_token,128,mega p32 l4 bcm01,202.4,1.7e-04
+4096,2048,256,8,8,uniform,situv2,per_token,128,mega p8 l4 bcm01,202.7,1.7e-04
+4096,2048,256,8,8,uniform,situv2,per_token,128,mega p8 l2 bcm01,202.8,1.7e-04
+4096,2048,256,8,8,uniform,situv2,per_token,256,mega_small bm64,157.8,5.9e-05
+4096,2048,256,8,8,uniform,situv2,per_token,256,mega_small bm32,158.2,5.9e-05
+4096,2048,256,8,8,uniform,situv2,per_token,256,mega_large cadd bcm22,178.6,6.4e-05
+4096,2048,256,8,8,uniform,situv2,per_token,256,mega_large cfp8 bcm22,182.5,3.8e-04
+4096,2048,256,8,8,uniform,situv2,per_token,256,mega_large cadd bcm01,184.0,6.4e-05
+4096,2048,256,8,8,uniform,situv2,per_token,256,mega_large cfp8 bcm01,188.6,3.8e-04
+4096,2048,256,8,8,uniform,situv2,per_token,256,mega p32 l1 bcm22,194.6,6.4e-05
+4096,2048,256,8,8,uniform,situv2,per_token,256,mega p32 l4 bcm22,195.0,6.4e-05
+4096,2048,256,8,8,uniform,situv2,per_token,256,mega p16 l1 bcm22,195.9,6.4e-05
+4096,2048,256,8,8,uniform,situv2,per_token,256,mega p8 l2 bcm22,196.2,6.5e-05
+4096,2048,256,8,8,uniform,situv2,per_token,256,mega p16 l2 bcm22,196.3,6.4e-05
+4096,2048,256,8,8,uniform,situv2,per_token,256,mega p8 l4 bcm22,196.4,6.4e-05
+4096,2048,256,8,8,uniform,situv2,per_token,256,mega p16 l4 bcm22,196.5,6.4e-05
+4096,2048,256,8,8,uniform,situv2,per_token,256,mega p32 l2 bcm22,196.5,6.4e-05
+4096,2048,256,8,8,uniform,situv2,per_token,256,mega p8 l1 bcm22,197.1,6.4e-05
+4096,2048,256,8,8,uniform,situv2,per_token,256,mega p32 l1 bcm01,206.9,6.4e-05
+4096,2048,256,8,8,uniform,situv2,per_token,256,mega p32 l2 bcm01,207.0,6.4e-05
+4096,2048,256,8,8,uniform,situv2,per_token,256,mega p32 l4 bcm01,208.4,6.4e-05
+4096,2048,256,8,8,uniform,situv2,per_token,256,mega p16 l1 bcm01,209.0,6.4e-05
+4096,2048,256,8,8,uniform,situv2,per_token,256,mega p16 l4 bcm01,209.2,6.4e-05
+4096,2048,256,8,8,uniform,situv2,per_token,256,mega p8 l1 bcm01,209.4,6.4e-05
+4096,2048,256,8,8,uniform,situv2,per_token,256,mega p8 l2 bcm01,209.5,6.4e-05
+4096,2048,256,8,8,uniform,situv2,per_token,256,mega p8 l4 bcm01,209.7,6.4e-05
+4096,2048,256,8,8,uniform,situv2,per_token,256,mega p16 l2 bcm01,209.8,6.4e-05
+4096,2048,256,8,8,uniform,situv2,per_token,512,mega_small bm64,171.1,9.1e-05
+4096,2048,256,8,8,uniform,situv2,per_token,512,mega_small bm32,172.0,9.1e-05
+4096,2048,256,8,8,uniform,situv2,per_token,512,mega_large cadd bcm22,188.8,9.7e-05
+4096,2048,256,8,8,uniform,situv2,per_token,512,mega_large cfp8 bcm22,191.9,4.2e-04
+4096,2048,256,8,8,uniform,situv2,per_token,512,mega_large cadd bcm01,195.3,9.7e-05
+4096,2048,256,8,8,uniform,situv2,per_token,512,mega_large cfp8 bcm01,197.8,4.2e-04
+4096,2048,256,8,8,uniform,situv2,per_token,512,mega p32 l1 bcm22,203.9,9.7e-05
+4096,2048,256,8,8,uniform,situv2,per_token,512,mega p32 l4 bcm22,204.0,9.7e-05
+4096,2048,256,8,8,uniform,situv2,per_token,512,mega p32 l2 bcm22,204.5,9.7e-05
+4096,2048,256,8,8,uniform,situv2,per_token,512,mega p16 l1 bcm22,205.0,9.7e-05
+4096,2048,256,8,8,uniform,situv2,per_token,512,mega p16 l2 bcm22,205.0,9.7e-05
+4096,2048,256,8,8,uniform,situv2,per_token,512,mega p16 l4 bcm22,205.7,9.7e-05
+4096,2048,256,8,8,uniform,situv2,per_token,512,mega p8 l4 bcm22,207.2,9.7e-05
+4096,2048,256,8,8,uniform,situv2,per_token,512,mega p8 l2 bcm22,207.4,9.7e-05
+4096,2048,256,8,8,uniform,situv2,per_token,512,mega p8 l1 bcm22,207.6,9.7e-05
+4096,2048,256,8,8,uniform,situv2,per_token,512,mega p32 l2 bcm01,216.3,9.7e-05
+4096,2048,256,8,8,uniform,situv2,per_token,512,mega p32 l4 bcm01,216.3,9.7e-05
+4096,2048,256,8,8,uniform,situv2,per_token,512,mega p32 l1 bcm01,216.5,9.7e-05
+4096,2048,256,8,8,uniform,situv2,per_token,512,mega p16 l1 bcm01,217.5,9.7e-05
+4096,2048,256,8,8,uniform,situv2,per_token,512,mega p16 l2 bcm01,218.3,9.7e-05
+4096,2048,256,8,8,uniform,situv2,per_token,512,mega p16 l4 bcm01,218.3,9.7e-05
+4096,2048,256,8,8,uniform,situv2,per_token,512,mega p8 l2 bcm01,219.8,9.7e-05
+4096,2048,256,8,8,uniform,situv2,per_token,512,mega p8 l1 bcm01,220.9,9.7e-05
+4096,2048,256,8,8,uniform,situv2,per_token,512,mega p8 l4 bcm01,220.9,9.7e-05
+4096,2048,256,8,8,uniform,situv2,per_token,1024,mega_small bm64,221.3,6.1e-05
+4096,2048,256,8,8,uniform,situv2,per_token,1024,mega_large cadd bcm22,224.2,6.6e-05
+4096,2048,256,8,8,uniform,situv2,per_token,1024,mega_large cfp8 bcm22,230.2,3.9e-04
+4096,2048,256,8,8,uniform,situv2,per_token,1024,mega_large cadd bcm01,231.3,6.6e-05
+4096,2048,256,8,8,uniform,situv2,per_token,1024,mega p32 l2 bcm22,234.6,6.6e-05
+4096,2048,256,8,8,uniform,situv2,per_token,1024,mega p32 l1 bcm22,235.4,6.6e-05
+4096,2048,256,8,8,uniform,situv2,per_token,1024,mega p16 l1 bcm22,235.7,6.6e-05
+4096,2048,256,8,8,uniform,situv2,per_token,1024,mega p16 l2 bcm22,236.1,6.6e-05
+4096,2048,256,8,8,uniform,situv2,per_token,1024,mega p16 l4 bcm22,236.1,6.6e-05
+4096,2048,256,8,8,uniform,situv2,per_token,1024,mega p32 l4 bcm22,236.1,6.6e-05
+4096,2048,256,8,8,uniform,situv2,per_token,1024,mega_large cfp8 bcm01,236.2,3.9e-04
+4096,2048,256,8,8,uniform,situv2,per_token,1024,mega p8 l4 bcm22,236.9,6.6e-05
+4096,2048,256,8,8,uniform,situv2,per_token,1024,mega p8 l2 bcm22,237.2,6.6e-05
+4096,2048,256,8,8,uniform,situv2,per_token,1024,mega p8 l1 bcm22,238.9,6.6e-05
+4096,2048,256,8,8,uniform,situv2,per_token,1024,mega p32 l4 bcm01,244.4,6.6e-05
+4096,2048,256,8,8,uniform,situv2,per_token,1024,mega p32 l2 bcm01,244.7,6.6e-05
+4096,2048,256,8,8,uniform,situv2,per_token,1024,mega p32 l1 bcm01,244.9,6.6e-05
+4096,2048,256,8,8,uniform,situv2,per_token,1024,mega p8 l2 bcm01,245.1,6.6e-05
+4096,2048,256,8,8,uniform,situv2,per_token,1024,mega p8 l4 bcm01,245.2,6.6e-05
+4096,2048,256,8,8,uniform,situv2,per_token,1024,mega p8 l1 bcm01,245.3,6.6e-05
+4096,2048,256,8,8,uniform,situv2,per_token,1024,mega p16 l2 bcm01,245.4,6.6e-05
+4096,2048,256,8,8,uniform,situv2,per_token,1024,mega p16 l1 bcm01,246.2,6.6e-05
+4096,2048,256,8,8,uniform,situv2,per_token,1024,mega p16 l4 bcm01,246.2,6.6e-05
+4096,2048,256,8,8,uniform,situv2,per_token,1024,mega_small bm32,253.1,6.1e-05
+4096,2048,256,8,8,uniform,situv2,per_token,2048,mega_large cadd bcm22,341.4,5.0e-05
+4096,2048,256,8,8,uniform,situv2,per_token,2048,mega_large cfp8 bcm22,344.0,3.7e-04
+4096,2048,256,8,8,uniform,situv2,per_token,2048,mega_large cadd bcm01,348.6,5.0e-05
+4096,2048,256,8,8,uniform,situv2,per_token,2048,mega p16 l1 bcm22,348.8,5.0e-05
+4096,2048,256,8,8,uniform,situv2,per_token,2048,mega p16 l4 bcm22,348.8,5.0e-05
+4096,2048,256,8,8,uniform,situv2,per_token,2048,mega p16 l2 bcm22,349.7,5.0e-05
+4096,2048,256,8,8,uniform,situv2,per_token,2048,mega_large cfp8 bcm01,349.7,3.7e-04
+4096,2048,256,8,8,uniform,situv2,per_token,2048,mega p32 l1 bcm22,349.8,5.0e-05
+4096,2048,256,8,8,uniform,situv2,per_token,2048,mega p32 l4 bcm22,350.7,5.0e-05
+4096,2048,256,8,8,uniform,situv2,per_token,2048,mega p32 l2 bcm22,351.0,5.0e-05
+4096,2048,256,8,8,uniform,situv2,per_token,2048,mega p16 l4 bcm01,355.7,5.0e-05
+4096,2048,256,8,8,uniform,situv2,per_token,2048,mega p16 l2 bcm01,356.9,5.0e-05
+4096,2048,256,8,8,uniform,situv2,per_token,2048,mega p32 l4 bcm01,357.3,5.0e-05
+4096,2048,256,8,8,uniform,situv2,per_token,2048,mega p16 l1 bcm01,357.6,5.0e-05
+4096,2048,256,8,8,uniform,situv2,per_token,2048,mega p32 l1 bcm01,358.1,5.0e-05
+4096,2048,256,8,8,uniform,situv2,per_token,2048,mega p32 l2 bcm01,358.4,5.0e-05
+4096,2048,256,8,8,uniform,situv2,per_token,2048,mega p8 l4 bcm22,359.2,5.0e-05
+4096,2048,256,8,8,uniform,situv2,per_token,2048,mega p8 l2 bcm22,359.7,5.0e-05
+4096,2048,256,8,8,uniform,situv2,per_token,2048,mega p8 l1 bcm22,360.2,5.0e-05
+4096,2048,256,8,8,uniform,situv2,per_token,2048,mega p8 l4 bcm01,366.5,5.0e-05
+4096,2048,256,8,8,uniform,situv2,per_token,2048,mega p8 l2 bcm01,367.4,5.0e-05
+4096,2048,256,8,8,uniform,situv2,per_token,2048,mega p8 l1 bcm01,367.8,5.0e-05
+4096,2048,256,8,8,uniform,situv2,per_token,4096,mega_large cfp8 bcm01,497.7,3.7e-04
+4096,2048,256,8,8,uniform,situv2,per_token,4096,mega_large cfp8 bcm22,509.7,3.7e-04
+4096,2048,256,8,8,uniform,situv2,per_token,4096,mega p16 l4 bcm01,516.3,5.4e-05
+4096,2048,256,8,8,uniform,situv2,per_token,4096,mega_large cadd bcm01,518.0,5.4e-05
+4096,2048,256,8,8,uniform,situv2,per_token,4096,mega p16 l2 bcm01,520.4,5.4e-05
+4096,2048,256,8,8,uniform,situv2,per_token,4096,mega p16 l4 bcm22,521.7,5.4e-05
+4096,2048,256,8,8,uniform,situv2,per_token,4096,mega p8 l4 bcm01,523.5,5.4e-05
+4096,2048,256,8,8,uniform,situv2,per_token,4096,mega p8 l2 bcm01,525.8,5.4e-05
+4096,2048,256,8,8,uniform,situv2,per_token,4096,mega p16 l2 bcm22,526.2,5.4e-05
+4096,2048,256,8,8,uniform,situv2,per_token,4096,mega p32 l4 bcm01,526.2,5.4e-05
+4096,2048,256,8,8,uniform,situv2,per_token,4096,mega p32 l2 bcm01,526.4,5.4e-05
+4096,2048,256,8,8,uniform,situv2,per_token,4096,mega p32 l4 bcm22,527.9,5.4e-05
+4096,2048,256,8,8,uniform,situv2,per_token,4096,mega p8 l4 bcm22,530.0,5.4e-05
+4096,2048,256,8,8,uniform,situv2,per_token,4096,mega p32 l2 bcm22,531.0,5.4e-05
+4096,2048,256,8,8,uniform,situv2,per_token,4096,mega p8 l2 bcm22,532.5,5.4e-05
+4096,2048,256,8,8,uniform,situv2,per_token,4096,mega p16 l1 bcm01,537.6,5.4e-05
+4096,2048,256,8,8,uniform,situv2,per_token,4096,mega p16 l1 bcm22,541.8,5.4e-05
+4096,2048,256,8,8,uniform,situv2,per_token,4096,mega p32 l1 bcm01,547.1,5.4e-05
+4096,2048,256,8,8,uniform,situv2,per_token,4096,mega_large cadd bcm22,550.0,5.4e-05
+4096,2048,256,8,8,uniform,situv2,per_token,4096,mega p32 l1 bcm22,551.1,5.4e-05
+4096,2048,256,8,8,uniform,situv2,per_token,4096,mega p8 l1 bcm01,552.5,5.4e-05
+4096,2048,256,8,8,uniform,situv2,per_token,4096,mega p8 l1 bcm22,555.1,5.4e-05
+4096,2048,256,8,8,uniform,situv2,per_token,8192,mega_large cfp8 bcm01,845.0,3.7e-04
+4096,2048,256,8,8,uniform,situv2,per_token,8192,mega_large cadd bcm01,858.6,5.1e-05
+4096,2048,256,8,8,uniform,situv2,per_token,8192,mega p16 l4 bcm01,864.7,5.1e-05
+4096,2048,256,8,8,uniform,situv2,per_token,8192,mega p8 l4 bcm01,872.4,5.1e-05
+4096,2048,256,8,8,uniform,situv2,per_token,8192,mega p32 l4 bcm01,873.2,5.1e-05
+4096,2048,256,8,8,uniform,situv2,per_token,8192,mega p16 l2 bcm01,877.3,5.1e-05
+4096,2048,256,8,8,uniform,situv2,per_token,8192,mega_large cfp8 bcm22,886.2,3.7e-04
+4096,2048,256,8,8,uniform,situv2,per_token,8192,mega p8 l1 bcm01,888.7,5.1e-05
+4096,2048,256,8,8,uniform,situv2,per_token,8192,mega p16 l1 bcm01,890.1,5.1e-05
+4096,2048,256,8,8,uniform,situv2,per_token,8192,mega p8 l2 bcm01,890.2,5.1e-05
+4096,2048,256,8,8,uniform,situv2,per_token,8192,mega p32 l2 bcm01,890.9,5.1e-05
+4096,2048,256,8,8,uniform,situv2,per_token,8192,mega p16 l4 bcm22,892.4,5.1e-05
+4096,2048,256,8,8,uniform,situv2,per_token,8192,mega p32 l1 bcm01,893.8,5.1e-05
+4096,2048,256,8,8,uniform,situv2,per_token,8192,mega p8 l4 bcm22,896.7,5.1e-05
+4096,2048,256,8,8,uniform,situv2,per_token,8192,mega p32 l4 bcm22,900.9,5.1e-05
+4096,2048,256,8,8,uniform,situv2,per_token,8192,mega p16 l2 bcm22,901.2,5.1e-05
+4096,2048,256,8,8,uniform,situv2,per_token,8192,mega p16 l1 bcm22,907.1,5.1e-05
+4096,2048,256,8,8,uniform,situv2,per_token,8192,mega p8 l1 bcm22,908.3,5.1e-05
+4096,2048,256,8,8,uniform,situv2,per_token,8192,mega p8 l2 bcm22,909.8,5.1e-05
+4096,2048,256,8,8,uniform,situv2,per_token,8192,mega p32 l2 bcm22,910.7,5.1e-05
+4096,2048,256,8,8,uniform,situv2,per_token,8192,mega_large cadd bcm22,912.8,5.1e-05
+4096,2048,256,8,8,uniform,situv2,per_token,8192,mega p32 l1 bcm22,919.7,5.1e-05
+4096,2048,256,8,8,uniform,situv2,per_token,16384,mega_large cadd bcm01,1523.5,4.6e-05
+4096,2048,256,8,8,uniform,situv2,per_token,16384,mega p16 l4 bcm01,1560.3,4.6e-05
+4096,2048,256,8,8,uniform,situv2,per_token,16384,mega p16 l1 bcm01,1573.5,4.6e-05
+4096,2048,256,8,8,uniform,situv2,per_token,16384,mega p8 l4 bcm01,1580.6,4.6e-05
+4096,2048,256,8,8,uniform,situv2,per_token,16384,mega p16 l2 bcm01,1586.2,4.6e-05
+4096,2048,256,8,8,uniform,situv2,per_token,16384,mega p32 l4 bcm01,1586.8,4.6e-05
+4096,2048,256,8,8,uniform,situv2,per_token,16384,mega_large cfp8 bcm01,1587.1,3.7e-04
+4096,2048,256,8,8,uniform,situv2,per_token,16384,mega p32 l1 bcm01,1594.7,4.6e-05
+4096,2048,256,8,8,uniform,situv2,per_token,16384,mega p32 l2 bcm01,1596.4,4.6e-05
+4096,2048,256,8,8,uniform,situv2,per_token,16384,mega p8 l1 bcm01,1604.0,4.6e-05
+4096,2048,256,8,8,uniform,situv2,per_token,16384,mega p8 l2 bcm01,1611.9,4.6e-05
+4096,2048,256,8,8,uniform,situv2,per_token,16384,mega p32 l2 bcm22,1640.7,4.6e-05
+4096,2048,256,8,8,uniform,situv2,per_token,16384,mega_large cadd bcm22,1645.3,4.6e-05
+4096,2048,256,8,8,uniform,situv2,per_token,16384,mega p8 l2 bcm22,1667.2,4.6e-05
+4096,2048,256,8,8,uniform,situv2,per_token,16384,mega p16 l2 bcm22,1679.6,4.6e-05
+4096,2048,256,8,8,uniform,situv2,per_token,16384,mega_large cfp8 bcm22,1681.2,3.7e-04
+4096,2048,256,8,8,uniform,situv2,per_token,16384,mega p32 l4 bcm22,1693.7,4.6e-05
+4096,2048,256,8,8,uniform,situv2,per_token,16384,mega p16 l1 bcm22,1710.5,4.6e-05
+4096,2048,256,8,8,uniform,situv2,per_token,16384,mega p32 l1 bcm22,1715.6,4.6e-05
+4096,2048,256,8,8,uniform,situv2,per_token,16384,mega p8 l1 bcm22,1718.4,4.6e-05
+4096,2048,256,8,8,uniform,situv2,per_token,16384,mega p16 l4 bcm22,1718.9,4.6e-05
+4096,2048,256,8,8,uniform,situv2,per_token,16384,mega p8 l4 bcm22,1730.3,4.6e-05
+4096,2048,256,8,8,uniform,situv2,per_token,32768,mega p16 l2 bcm01,2898.7,4.5e-05
+4096,2048,256,8,8,uniform,situv2,per_token,32768,mega p16 l4 bcm01,2900.1,4.5e-05
+4096,2048,256,8,8,uniform,situv2,per_token,32768,mega p32 l4 bcm01,2916.1,4.5e-05
+4096,2048,256,8,8,uniform,situv2,per_token,32768,mega p16 l1 bcm01,2922.9,4.5e-05
+4096,2048,256,8,8,uniform,situv2,per_token,32768,mega p32 l2 bcm01,2952.0,4.5e-05
+4096,2048,256,8,8,uniform,situv2,per_token,32768,mega p8 l2 bcm01,2954.2,4.5e-05
+4096,2048,256,8,8,uniform,situv2,per_token,32768,mega p32 l1 bcm01,2964.9,4.5e-05
+4096,2048,256,8,8,uniform,situv2,per_token,32768,mega_large cfp8 bcm01,2985.9,3.7e-04
+4096,2048,256,8,8,uniform,situv2,per_token,32768,mega p8 l1 bcm01,2986.4,4.5e-05
+4096,2048,256,8,8,uniform,situv2,per_token,32768,mega p8 l4 bcm01,3041.3,4.5e-05
+4096,2048,256,8,8,uniform,situv2,per_token,32768,mega_large cadd bcm01,3046.4,4.5e-05
+4096,2048,256,8,8,uniform,situv2,per_token,32768,mega_large cfp8 bcm22,3131.4,3.7e-04
+4096,2048,256,8,8,uniform,situv2,per_token,32768,mega p16 l4 bcm22,3213.3,4.5e-05
+4096,2048,256,8,8,uniform,situv2,per_token,32768,mega p8 l1 bcm22,3297.6,4.5e-05
+4096,2048,256,8,8,uniform,situv2,per_token,32768,mega p32 l2 bcm22,3313.6,4.5e-05
+4096,2048,256,8,8,uniform,situv2,per_token,32768,mega p8 l2 bcm22,3326.5,4.5e-05
+4096,2048,256,8,8,uniform,situv2,per_token,32768,mega p16 l2 bcm22,3387.1,4.5e-05
+4096,2048,256,8,8,uniform,situv2,per_token,32768,mega p16 l1 bcm22,3397.1,4.5e-05
+4096,2048,256,8,8,uniform,situv2,per_token,32768,mega p8 l4 bcm22,3468.4,4.5e-05
+4096,2048,256,8,8,uniform,situv2,per_token,32768,mega p32 l4 bcm22,3481.2,4.5e-05
+4096,2048,256,8,8,uniform,situv2,per_token,32768,mega p32 l1 bcm22,3488.0,4.5e-05
+4096,2048,256,8,8,uniform,situv2,per_token,32768,mega_large cadd bcm22,3592.6,4.5e-05

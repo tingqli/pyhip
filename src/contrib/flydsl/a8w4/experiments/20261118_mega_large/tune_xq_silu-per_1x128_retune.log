@@ -1,0 +1,9 @@
+[kernelkit] moe_ep runs on 8 GPUs here (@multi_gpu): 8 ranks; rank 0 prints, the others write /tmp/kernelkit_ranks_187yan_m/rank<r>.log
+[08:15:19] moe_ep mimo-flash2.6-ep8-silu-per_1x128 {'model_dim': 4096, 'inter_dim': 2048, 'experts_global': 256, 'world': 8, 'topk': 8, 'routing': 'uniform', 'act': 'silu', 'x_quant': 'per_1x128'}: 36 configs, 8 copies of ['W']
+[08:15:46] tokens    128: mega_small bm64 153.9 | mega_small bm32 154.4 | mega_large cadd bcm22 178.0
+[08:15:53] tokens    512: mega_small bm64 174.0 | mega_small bm32 174.3 | mega_large cadd bcm22 194.4
+[08:16:00] tokens   1024: mega_small bm64 229.3 | mega_large cadd bcm22 231.0 | mega_large cfp8 bcm22 237.7
+
+real	1m11.606s
+user	5m23.722s
+sys	5m16.733s

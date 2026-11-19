@@ -27,6 +27,7 @@ from kernelkit.timing import copies as weight_copies  # noqa: F401
 from kernelkit.timing import flush_cache, time_cold  # noqa: F401
 
 from ._ops import op_register
+from .kernels._protocol import X_QUANTS  # noqa: F401 - the dim x_quant of moe_ep
 from .weights import prepare_weights, shuffle_mxfp4, weight_shape
 
 ACTS = ("silu", "situv2")
@@ -164,6 +165,20 @@ def quant_fp8_groups(x, group=128):
     g = x.float().view(x.shape[0], -1, group)
     s = g.abs().amax(-1, keepdim=True).clamp(min=1e-30) / 240.0
     return (g / s).to(torch.float8_e4m3fnuz).view(x.shape), s.view(x.shape[0], -1)
+
+
+def quant_fp8_rows(x):
+    """x [M, H] -> (fp8 FNUZ [M, H], f32 scale [M]), one scale per row."""
+    xf = x.float()
+    s = xf.abs().amax(-1, keepdim=True).clamp(min=1e-30) / 240.0
+    return (xf / s).to(torch.float8_e4m3fnuz), s.view(-1)
+
+
+def quant_x(x, x_quant):
+    """f32 x [M, H] as an fp8 dispatch with ``x_quant`` (``X_QUANTS``) carries it: one
+    scale per (row, 128 columns), or per row."""
+    assert x_quant in X_QUANTS, x_quant
+    return dequant_fp8(*(quant_fp8_groups(x) if x_quant == "per_1x128" else quant_fp8_rows(x)))
 
 
 def dequant_fp8(x, x_scale):

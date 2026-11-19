@@ -29,6 +29,10 @@ graphs mix freely as long as every rank makes the same calls in the same order.
 ``MegaMoeSmallEpA8W4``: the same layer for decode-sized batches (<= ``tmax`` tokens over
 all ranks, 1024 by default) as ONE kernel per call (``kernels/ep_mega_small.py``: x quant
 and dispatch into fixed per-expert slots, gemm1 / gemm2, the combine), same contract.
+
+``MegaMoeLargeEpA8W4``: the layer for prefill-sized batches as ONE kernel per call
+(``kernels/ep_mega_large.py``, after aiter's MegaMoEV2 large-input kernel: x quant, the
+count exchange and plan, dispatch, gemm1 / gemm2 and the combine), same contract.
 """
 
 import torch
@@ -38,16 +42,22 @@ from .kernels._protocol import (
     ARRIVED,
     BLOCK_M,
     E_LOCAL,
+    LC_PLAN,
     NPES,
     QUEUES,
     ROW_BITS,
     SC_TILE,
     SCHED_EXPECTED,
+    large_ctl_ints,
+    large_scap,
+    large_sym_layout,
+    qx_of,
     small_max_tiles,
     small_sym_layout,
 )
 from .kernels import ep_mega as K
 from .kernels import ep_mega_comm as C
+from .kernels import ep_mega_large as KL
 from .kernels import ep_mega_small as KS
 
 
@@ -57,10 +67,12 @@ class MegaMoeEpA8W4:
     ``s_cap``: rows this rank can receive (default: twice the uniform-routing average
     plus one partial block per expert; routes past it are dropped, see ``rows_needed``).
     ``producers``: producer workgroups (a multiple of 8); ``lag``: gemm2 trails gemm1 by
-    this many block pairs of a queue. ``act`` / ``situ``: as ``a8w4_moe``."""
+    this many block pairs of a queue. ``act`` / ``situ``: as ``a8w4_moe``. ``x_quant``:
+    the fp8 x sent (``X_QUANTS``: one scale per (row, 128 columns) or per row; the same on
+    every rank; ``qx`` = its kernel key, which ``moe_ep``'s solver sets per call)."""
 
     def __init__(self, W, *, rank, max_tokens, topk=8, world=8, s_cap=None, producers=16,
-                 lag=2, act="silu", situ=None):
+                 lag=2, act="silu", situ=None, x_quant="per_1x128"):
         import mori.shmem as ms
         from mori.shmem import mori_shmem_create_tensor
 
@@ -123,16 +135,20 @@ class MegaMoeEpA8W4:
         # every call on its own weight copy, experiments/log_20261115.md)
         kw = dict(H=H, I=I, TOPK=topk, token_shift=self.token_shift, producers=producers,
                   lag=lag, ACT=act)
+        self.qx = qx_of(x_quant)
+        if not self.qx:
+            kw["QX"] = 0
         self.launch = K.ep_mega_kernel.get(**kw)
         self.launch_big = K.ep_mega_kernel.get(**kw, BCM1=0, BCM2=1)
         self.big_tokens = BLOCK_M * E_LOCAL // topk
-        self.quant_k, self.prep_k = C.mega_quant_kernel.get(H=H), C.mega_prep_kernel.get()
+        self.quant_ks = [C.mega_quant_kernel.get(H=H, QX=qx) for qx in (0, 1)]
+        self.prep_k = C.mega_prep_kernel.get()
         self.plan_k, self.finish_k = C.mega_plan_kernel.get(), C.mega_finish_kernel.get()
 
     def __call__(self, x, topk_ids, topk_weights, x_scale=None, marks=None):
         """x: bf16 [T, H] (quantized here), or fp8 FNUZ [T, H] with ``x_scale`` f32
-        [T, H/128]; topk_ids int32 [T, topk] (global ids; negative: no route, e.g. padding),
-        topk_weights f32 [T, topk].
+        [T, H/128] (``qx`` 1) / [T] (``qx`` 0); topk_ids int32 [T, topk] (global ids;
+        negative: no route, e.g. padding), topk_weights f32 [T, topk].
         Returns bf16 [T, H], a view of the symmetric output buffer (valid until the next
         call). ``marks``: a list that gets (stage, CUDA event) after every stage (timing)."""
 
@@ -153,11 +169,13 @@ class MegaMoeEpA8W4:
         if quant:
             x8, xs = self.x8, self.xs
         else:
-            assert x_scale.shape == (T, H // 128) and x_scale.dtype == torch.float32
+            shape = (T, H // 128) if self.qx else (T,)
+            assert x_scale.shape == shape and x_scale.dtype == torch.float32, (x_scale.shape, shape)
             x8, xs = x.contiguous().view(torch.uint8), x_scale.contiguous()
         if T:
-            waves = T * (H // 512)
-            self.quant_k(x if quant else None, x8, xs, self.out, T, int(quant), -(-waves // 4))
+            waves = T * (H // 512) if self.qx else T
+            self.quant_ks[self.qx](x if quant else None, x8, xs, self.out, T, int(quant),
+                                   -(-waves // 4))
         mark("quant")
         self.prep_k(topk_ids, self.route_idx, self.ws, tab["ws"], self.num_valid, self.status,
                     self.sched, self.plan, routes, self.rank, self.s_cap)
@@ -178,6 +196,15 @@ class MegaMoeEpA8W4:
         self.finish_k(self.ws, tab["ws"], self.status, self.rank)
         mark("finish")
         return self.out[:T]
+
+    def x_ref(self, n):
+        """f32 [n, H]: the last call's x as the quant kernel quantized it (bf16 x; n: its
+        tokens)."""
+        H = self.H
+        x8 = self.x8[:n].view(torch.float8_e4m3fnuz).float()
+        if self.qx:
+            return (x8.view(n, H // 128, 128) * self.xs[:n].unsqueeze(-1)).view(n, H)
+        return x8 * self.xs.view(-1)[:n].view(n, 1)
 
     def rows_needed(self):
         """Rows the last call needed on this rank (> s_cap: routes were dropped)."""
@@ -229,25 +256,122 @@ class MegaMoeSmallEpA8W4:
         self.a2s = torch.empty((rows, self.I // 128), dtype=torch.float32, device=dev)
         self.out = torch.empty((tmax, self.H), dtype=torch.bfloat16, device=dev)
 
-    def kernel(self, act="silu", **knobs):
+    def kernel(self, act="silu", x_quant="per_1x128", **knobs):
         """The kernel specialization of ``knobs`` (``SMALL_KNOBS`` names)."""
         k = dict(SMALL_KNOBS, **knobs)
         return KS.ep_mega_small_kernel.get(H=self.H, I=self.I, TOPK=self.topk, TMAX=self.tmax,
-                                           ACT=act, **{SMALL_KEYS[n]: v for n, v in k.items()})
+                                           ACT=act, QX=qx_of(x_quant),
+                                           **{SMALL_KEYS[n]: v for n, v in k.items()})
 
-    def __call__(self, x, topk_ids, topk_weights, W=None, act="silu", situ=None, **knobs):
+    def __call__(self, x, topk_ids, topk_weights, W=None, act="silu", situ=None,
+                 x_quant="per_1x128", **knobs):
         """x bf16 [T, H] (this rank's tokens), topk_ids int32 [T, topk] (global ids;
         negative: no route), topk_weights f32 [T, topk]; ``W``: the call's experts (default:
-        the constructor's). Returns bf16 [T, H], a view of this object's output buffer
-        (valid until the next call)."""
+        the constructor's); ``x_quant``: the fp8 x sent (``X_QUANTS``; the same on every
+        rank). Returns bf16 [T, H], a view of this object's output buffer (valid until the
+        next call)."""
         T, H = x.shape
         assert T <= self.tmax and H == self.H, (T, self.tmax, H)
         assert x.dtype == torch.bfloat16 and topk_ids.dtype == torch.int32
         assert topk_weights.dtype == torch.float32 and topk_ids.shape == (T, self.topk)
         W = self.W if W is None else W
         x, topk_ids, topk_weights = x.contiguous(), topk_ids.contiguous(), topk_weights.contiguous()
-        self.kernel(act, **knobs)(
+        self.kernel(act, x_quant, **knobs)(
             x, topk_ids, topk_weights, self.out, self.sym, self.stab, self.ctl, self.a2,
             self.a2s, W["w1"], W["w1_scale"], W["w1_exp"], W["w2"], W["w2_scale"], W["w2_exp"],
             T, self.rank, *situ_args(**(situ or {})))
         return self.out[:T]
+
+
+# kernel keys of MegaMoeLargeEpA8W4's knobs: producer workgroups, gemm2 cols per unit, A bytes
+# per K tile, W prefetch depth, the combine ("add": BF16 atomics, "fp8": fp8 rows summed by
+# the source rank), gemm1 / gemm2 W cache modifier (experiments/20261118_mega_large)
+LARGE_KNOBS = dict(producers=16, no=256, arb=128, pf=2, comb="add", bcm1=2, bcm2=2)
+LARGE_KEYS = dict(producers="P", no="NO", arb="ARB", pf="PF", comb="COMB", bcm1="BCM1",
+                  bcm2="BCM2")
+
+
+class MegaMoeLargeEpA8W4:
+    """One rank's EP8 MoE layer for prefill-sized batches: ONE kernel per call
+    (``kernels/ep_mega_large.py``, after aiter's MegaMoEV2 large-input kernel): x quant
+    (``x_quant``: one fp8 scale per (row, 128 columns), or per row as ``a8w4_moe``), the
+    count exchange and the plan, the dispatch, gemm1 / gemm2 and the combine (BF16 atomics
+    into the source ranks' outputs, or fp8 rows the source ranks sum: knob ``comb``).
+
+    ``W``: ``prepare_weights`` of the rank's 32 experts (global experts [32 rank, 32 rank +
+    32)), for the shape; ``max_tokens``: tokens per rank and call (rounded up to a power of
+    2, ``tcap``). A rank receives at most ``s_cap`` = 2 tcap topk + 32 x 128 rows (twice the
+    uniform-routing average); rows past it are dropped (``rows_needed``). Symmetric heap:
+    0.47 GB at tcap 4096 (H 4096, top-8; ~linear in tcap). Same contract as
+    ``MegaMoeEpA8W4`` otherwise: every rank makes the same calls (with the same ``comb`` and
+    ``x_quant``: they are the wire format), negative topk ids are no routes (their rows stay
+    0), CUDA graph capture after one eager call."""
+
+    def __init__(self, W, *, rank, max_tokens, topk=8, world=8):
+        import mori.shmem as ms
+        from mori.shmem import mori_shmem_create_tensor
+
+        from .kernels._protocol import E_GLOBAL
+
+        E, N2, _ = W["w1"].shape
+        assert world == NPES and E == E_LOCAL, "EP8 x 32 local experts"
+        self.W, self.rank, self.topk = W, rank, topk
+        self.H, self.I = W["w2"].shape[1], N2 // 2
+        self.tcap = 1 << max(int(max_tokens - 1).bit_length(), 1)
+        self.s_cap = large_scap(topk, self.tcap)
+        dev = torch.device("cuda", torch.cuda.current_device())
+        off, nbytes = large_sym_layout(self.H, topk, self.tcap)
+        self.sym = mori_shmem_create_tensor((nbytes,), torch.uint8)
+        self.sym.zero_()
+        torch.cuda.synchronize()
+        ms.shmem_barrier_all()
+        self.stab = torch.tensor([ms.shmem_ptr_p2p(self.sym.data_ptr(), rank, p)
+                                  for p in range(world)], dtype=torch.int64, device=dev)
+        self.ctl = torch.zeros(large_ctl_ints(topk, self.tcap)[1], dtype=torch.int32, device=dev)
+        H, I, S = self.H, self.I, self.s_cap
+        self.x8 = torch.empty((self.tcap, H), dtype=torch.uint8, device=dev)
+        self.xs = torch.empty(self.tcap * (H // 128), dtype=torch.float32, device=dev)
+        self.lists = torch.empty(E_GLOBAL * self.tcap, dtype=torch.int32, device=dev)
+        self.a2 = torch.empty((S, I), dtype=torch.uint8, device=dev)
+        self.a2s = torch.empty((S, I // 128), dtype=torch.float32, device=dev)
+        o = off["out"]
+        self.out = self.sym[o:o + self.tcap * H * 2].view(torch.bfloat16).view(self.tcap, H)
+        self._qx = 1
+
+    def kernel(self, act="silu", x_quant="per_1x128", **knobs):
+        """The kernel specialization of ``knobs`` (``LARGE_KNOBS`` names)."""
+        k = dict(LARGE_KNOBS, **knobs)
+        return KL.ep_mega_large_kernel.get(H=self.H, I=self.I, TOPK=self.topk, TCAP=self.tcap,
+                                           ACT=act, QX=qx_of(x_quant),
+                                           **{LARGE_KEYS[n]: v for n, v in k.items()})
+
+    def __call__(self, x, topk_ids, topk_weights, W=None, act="silu", situ=None,
+                 x_quant="per_1x128", **knobs):
+        """x bf16 [T, H] (this rank's tokens), topk_ids int32 [T, topk] (global ids;
+        negative: no route), topk_weights f32 [T, topk]; ``W``: the call's experts (default:
+        the constructor's). Returns bf16 [T, H], a view of the symmetric output buffer
+        (valid until the next call)."""
+        T, H = x.shape
+        assert T <= self.tcap and H == self.H, (T, self.tcap, H)
+        assert x.dtype == torch.bfloat16 and topk_ids.dtype == torch.int32
+        assert topk_weights.dtype == torch.float32 and topk_ids.shape == (T, self.topk)
+        W = self.W if W is None else W
+        x, topk_ids, topk_weights = x.contiguous(), topk_ids.contiguous(), topk_weights.contiguous()
+        self.kernel(act, x_quant, **knobs)(
+            x, topk_ids, topk_weights, self.sym, self.stab, self.ctl, self.x8, self.xs,
+            self.lists, self.a2, self.a2s, W["w1"], W["w1_scale"], W["w1_exp"], W["w2"],
+            W["w2_scale"], W["w2_exp"], T, self.rank, *situ_args(**(situ or {})))
+        self._qx = qx_of(x_quant)
+        return self.out[:T]
+
+    def x_ref(self, n):
+        """f32 [n, H]: the last call's x as the kernel quantized it (n: its tokens)."""
+        x8 = self.x8[:n].view(torch.float8_e4m3fnuz).float()
+        if self._qx:
+            s = self.xs[:n * (self.H // 128)].view(n, self.H // 128)
+            return (x8.view(n, self.H // 128, 128) * s.unsqueeze(-1)).view(n, self.H)
+        return x8 * self.xs[:n].view(n, 1)
+
+    def rows_needed(self):
+        """Rows the last call needed on this rank (> s_cap: routes were dropped)."""
+        return int(self.ctl[LC_PLAN + 2].item())

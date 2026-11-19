@@ -1,0 +1,22 @@
+model_dim=4096 inter_dim=2048 experts_global=256 world=8 topk=8 routing=uniform act=silu ~tokens=64  old mega_small bm32                 142.5  new mega_small bm32                 143.0  old-cfg-now    143.0  +0.0%
+model_dim=4096 inter_dim=2048 experts_global=256 world=8 topk=8 routing=uniform act=silu ~tokens=128  old mega_small bm64                 154.3  new mega_small bm64                 153.5  old-cfg-now    153.5  +0.0%
+model_dim=4096 inter_dim=2048 experts_global=256 world=8 topk=8 routing=uniform act=silu ~tokens=256  old mega_small bm64                 158.8  new mega_small bm64                 159.4  old-cfg-now    159.4  +0.0%
+model_dim=4096 inter_dim=2048 experts_global=256 world=8 topk=8 routing=uniform act=silu ~tokens=512  old mega_small bm64                 173.6  new mega_small bm64                 174.4  old-cfg-now    174.4  +0.0%
+model_dim=4096 inter_dim=2048 experts_global=256 world=8 topk=8 routing=uniform act=silu ~tokens=1024  old mega_small bm64                 228.4  new mega_large cadd xrow bcm22      221.7  old-cfg-now    229.2  -3.3%  *
+model_dim=4096 inter_dim=2048 experts_global=256 world=8 topk=8 routing=uniform act=silu ~tokens=2048  old mega p16 l2 bcm22               364.8  new mega_large cadd xrow bcm22      330.8  old-cfg-now    366.2  -9.7%  *
+model_dim=4096 inter_dim=2048 experts_global=256 world=8 topk=8 routing=uniform act=silu ~tokens=4096  old mega p16 l4 bcm01               531.3  new mega_large cfp8 xrow bcm01      489.3  old-cfg-now    530.5  -7.8%  *
+model_dim=4096 inter_dim=2048 experts_global=256 world=8 topk=8 routing=uniform act=silu ~tokens=8192  old mega p16 l4 bcm01               897.7  new mega_large cfp8 xrow bcm01      828.3  old-cfg-now    902.5  -8.2%  *
+model_dim=4096 inter_dim=2048 experts_global=256 world=8 topk=8 routing=uniform act=silu ~tokens=16384  old mega p16 l4 bcm01              1637.4  new mega_large cadd xrow bcm01     1496.5  old-cfg-now   1619.1  -7.6%  *
+model_dim=4096 inter_dim=2048 experts_global=256 world=8 topk=8 routing=uniform act=silu ~tokens=32768  old mega p32 l4 bcm01              3158.9  new mega_large cfp8 xrow bcm01     2934.4  old-cfg-now   3465.9 -15.3%  *
+model_dim=4096 inter_dim=2048 experts_global=256 world=8 topk=8 routing=uniform act=situv2 ~tokens=64  old mega_small bm64                 144.3  new mega_small bm64                 144.7  old-cfg-now    144.7  +0.0%
+model_dim=4096 inter_dim=2048 experts_global=256 world=8 topk=8 routing=uniform act=situv2 ~tokens=128  old mega_small bm64                 154.6  new mega_small bm64                 155.4  old-cfg-now    155.4  +0.0%
+model_dim=4096 inter_dim=2048 experts_global=256 world=8 topk=8 routing=uniform act=situv2 ~tokens=256  old mega_small bm64                 160.1  new mega_small bm64                 160.5  old-cfg-now    160.5  +0.0%
+model_dim=4096 inter_dim=2048 experts_global=256 world=8 topk=8 routing=uniform act=situv2 ~tokens=512  old mega_small bm64                 175.3  new mega_small bm64                 175.4  old-cfg-now    175.4  +0.0%
+model_dim=4096 inter_dim=2048 experts_global=256 world=8 topk=8 routing=uniform act=situv2 ~tokens=1024  old mega_small bm64                 232.5  new mega_small bm64                 231.9  old-cfg-now    231.9  +0.0%
+model_dim=4096 inter_dim=2048 experts_global=256 world=8 topk=8 routing=uniform act=situv2 ~tokens=2048  old mega p16 l2 bcm22               373.5  new mega_large cadd x128 bcm22      362.2  old-cfg-now    374.6  -3.3%  *
+model_dim=4096 inter_dim=2048 experts_global=256 world=8 topk=8 routing=uniform act=situv2 ~tokens=4096  old mega p16 l4 bcm01               544.1  new mega_large cfp8 x128 bcm01      526.4  old-cfg-now    544.1  -3.3%  *
+model_dim=4096 inter_dim=2048 experts_global=256 world=8 topk=8 routing=uniform act=situv2 ~tokens=8192  old mega p16 l4 bcm01               920.6  new mega_large cadd x128 bcm01      900.6  old-cfg-now    924.3  -2.6%  *
+model_dim=4096 inter_dim=2048 experts_global=256 world=8 topk=8 routing=uniform act=situv2 ~tokens=16384  old mega p16 l4 bcm01              1640.6  new mega_large cadd x128 bcm01     1645.7  old-cfg-now   1722.2  -4.4%  *
+model_dim=4096 inter_dim=2048 experts_global=256 world=8 topk=8 routing=uniform act=situv2 ~tokens=32768  old mega p32 l4 bcm01              3268.9  new mega_large cfp8 x128 bcm01     3201.4  old-cfg-now   3297.1  -2.9%  *
+
+11 of 20 points changed winner (*); old-cfg-now: the old winner's time in the new table, the % is what the new winner gains over it

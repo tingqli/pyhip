@@ -197,8 +197,7 @@ def check_megamoe(mega, raw, ns, x, tw, ti, act, situ, run=None):
     -> [(rows needed, cos diff)] of every rank; asserts every rank is within tolerance."""
     rank, n = mega.rank, ns[mega.rank]
     y = (run() if run else mega(x, ti, tw))[:n].float()
-    x_ref = (mega.x8[:n].view(FP8).float().view(n, H // 128, 128)
-             * mega.xs[:n].unsqueeze(-1)).view(n, H)
+    x_ref = mega.x_ref(n)
     X, TW, TI = (gather_rows(t, ns) for t in (x_ref, tw, ti))
     ref = R.ref_moe(X, TW, TI, raw, rank * E_LOCAL, act, situ, quant_x=False)
     dist.all_reduce(ref)

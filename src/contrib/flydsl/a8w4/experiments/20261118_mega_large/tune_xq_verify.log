@@ -1,0 +1,37 @@
+[kernelkit] moe_ep runs on 8 GPUs here (@multi_gpu): 8 ranks; rank 0 prints, the others write /tmp/kernelkit_ranks_xh8ysbbl/rank<r>.log
+[08:05:00] tokens     20 -> point     64: mega_small bm64              88.6 us (table    142.4) | cos 2.1e-04
+[08:05:00] tokens    100 -> point    128: mega_small bm64             152.2 us (table    154.0) | cos 2.0e-04
+[08:05:00] tokens    300 -> point    512: mega_small bm64             160.3 us (table    174.1) | cos 1.7e-04
+[08:05:01] tokens   1000 -> point   1024: mega_small bm64             224.4 us (table    228.6) | cos 1.6e-04
+[08:05:01] tokens   1500 -> point   2048: mega_large cadd bcm22       272.5 us (table    353.4) | cos 1.7e-04
+[08:05:01] tokens   3000 -> point   4096: mega_large cfp8 bcm01       433.4 us (table    519.0) | cos 4.8e-04
+[08:05:02] tokens   6000 -> point   8192: mega_large cfp8 bcm01       691.4 us (table    877.7) | cos 4.8e-04
+[08:05:02] tokens  20000 -> point  32768: mega_large cfp8 bcm01      1971.3 us (table   2994.1) | cos 4.8e-04
+[08:05:02] tokens     20 -> point     64: mega_small bm64              89.0 us (table    139.8) | cos 1.1e-04
+[08:05:02] tokens    100 -> point    128: mega_small bm64             153.0 us (table    151.5) | cos 6.8e-05
+[08:05:02] tokens    300 -> point    512: mega_small bm64             159.0 us (table    170.5) | cos 3.9e-05
+[08:05:02] tokens   1000 -> point   1024: mega_small bm64             215.3 us (table    218.1) | cos 2.6e-05
+[08:05:03] tokens   1500 -> point   2048: mega_large cadd bcm22       256.8 us (table    333.0) | cos 4.0e-05
+[08:05:03] tokens   3000 -> point   4096: mega_large cfp8 bcm01       428.9 us (table    491.0) | cos 3.5e-04
+[08:05:04] tokens   6000 -> point   8192: mega_large cadd bcm01       663.0 us (table    835.8) | cos 3.3e-05
+[08:05:05] tokens  20000 -> point  32768: mega p16 l2 bcm01          1810.2 us (table   2833.2) | cos 3.1e-05
+[08:05:05] tokens     20 -> point     64: mega_small bm32              90.6 us (table    145.4) | cos 2.1e-04
+[08:05:05] tokens    100 -> point    128: mega_small bm64             156.4 us (table    154.6) | cos 2.0e-04
+[08:05:05] tokens    300 -> point    512: mega_small bm32             162.3 us (table    175.0) | cos 1.8e-04
+[08:05:06] tokens   1000 -> point   1024: mega_small bm64             228.4 us (table    232.0) | cos 1.6e-04
+[08:05:06] tokens   1500 -> point   2048: mega_large cadd bcm22       274.2 us (table    360.7) | cos 1.7e-04
+[08:05:06] tokens   3000 -> point   4096: mega_large cfp8 bcm01       443.9 us (table    524.2) | cos 4.8e-04
+[08:05:07] tokens   6000 -> point   8192: mega_large cfp8 bcm01       701.6 us (table    900.6) | cos 4.8e-04
+[08:05:07] tokens  20000 -> point  32768: mega_large cfp8 bcm01      1977.8 us (table   3081.2) | cos 4.7e-04
+[08:05:07] tokens     20 -> point     64: mega_small bm64              88.6 us (table    140.8) | cos 1.5e-04
+[08:05:07] tokens    100 -> point    128: mega_small bm32             153.6 us (table    152.8) | cos 8.3e-05
+[08:05:08] tokens    300 -> point    512: mega_small bm64             160.5 us (table    171.1) | cos 7.6e-05
+[08:05:08] tokens   1000 -> point   1024: mega_small bm64             218.5 us (table    221.3) | cos 2.9e-05
+[08:05:08] tokens   1500 -> point   2048: mega_large cadd bcm22       262.0 us (table    341.4) | cos 6.0e-05
+[08:05:09] tokens   3000 -> point   4096: mega_large cfp8 bcm01       428.0 us (table    497.7) | cos 3.6e-04
+[08:05:09] tokens   6000 -> point   8192: mega_large cfp8 bcm01       657.9 us (table    845.0) | cos 3.7e-04
+[08:05:09] tokens  20000 -> point  32768: mega p16 l2 bcm01          1936.8 us (table   2898.7) | cos 4.3e-05
+
+real	0m51.042s
+user	3m32.996s
+sys	4m22.298s

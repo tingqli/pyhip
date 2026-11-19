@@ -10,9 +10,10 @@ experts, add the routes back into this rank's output.
 The interface is one rank's call: its tokens ``x`` bf16 [n, H] and ``topk_*`` (global
 expert ids), its experts ``W`` (``prepare_weights``; rank r holds global experts
 [r E, r E + E)), ``comm`` (``EpComm``: the rank's communication buffers), ``tokens`` (the
-batch over all ranks, DP metadata: the same on every rank), ``act`` / ``situ``. The
-problem: ``tokens`` split evenly over ``world`` ranks, ``experts_global`` experts, the
-shape, routing and act.
+batch over all ranks, DP metadata: the same on every rank), ``act`` / ``situ`` and
+``x_quant`` (``R.X_QUANTS``: the fp8 x the layer sends, one scale per (token, 128 columns)
+or per token; the same on every rank). The problem: ``tokens`` split evenly over
+``world`` ranks, ``experts_global`` experts, the shape, routing, act and x_quant.
 
 Solvers, all ``@multi_gpu("world")`` (``python -m kernelkit tune / verify / ab / check
 a8w4.tune:EP_TUNING ...`` start ``world`` ranks; ``mori_init``: MORI shmem):
@@ -24,12 +25,21 @@ a8w4.tune:EP_TUNING ...`` start ``world`` ranks; ``mori_init``: MORI shmem):
               kernel): x quant, dispatch into fixed per-expert slots, gemm1 / gemm2 and
               the combine as ONE kernel launch; knob ``bm`` (m-tile rows); ``tokens`` <=
               ``EpComm.small_tmax`` (1024), EP8 x 32 local experts only
+  mega_large  ``megamoe.MegaMoeLargeEpA8W4`` (after aiter's MegaMoEV2 large-input
+              kernel): x quant, count exchange, plan, dispatch, gemm1 / gemm2 and the
+              combine as ONE kernel launch for prefill batches; knobs ``comb`` (BF16
+              atomics / fp8 rows), ``bcm``; EP8 x 32 local experts only
   mori        sglang's MORI path (``tests/test_a8w4_mori_ep8.py``): fp8 quant per (token,
               128), MORI dispatch, ``a8w4_moe_dyn`` ep3k (knob ``cfg``) on the whole
               receive buffer (the received count stays on the device, row estimate
-              ``tokens``: sglang's CUDA-graph call), MORI combine
+              ``tokens``: sglang's CUDA-graph call), MORI combine; x_quant "per_1x128"
+              only ("per_token": n/a)
   mori_eager  the same with sglang's eager call: the received count read on the host, ep3k
               on those rows (``@no_capture``)
+
+The mega solvers run both x quants: "per_token" (one scale per row, as ``a8w4_moe``)
+skips gemm1's rescaling at every 128-K group; it is less accurate when x has outlier
+channels (``experiments/log_20261118c.md``).
 
 The other a8w4 kernels (tp1k, tp2k, ep1k) take bf16 rows with a host-known count (MORI
 would send bf16, twice the bytes); on EP8 rows ep3k is faster than all of them at every
@@ -46,7 +56,7 @@ from . import ref as R
 from ._ops import ep_ops, ep_register
 from .kernels import ep_mega as K
 from .kernels._act import situ_args
-from .kernels._protocol import QUEUES
+from .kernels._protocol import QUEUES, qx_of
 from .moe import EP_CFGS, MOE_DYN, _ep_cached, ep_preset
 from .weights import weight_shape
 
@@ -74,7 +84,7 @@ class EpComm:
     def __init__(self, *, rank, world, max_tokens, small_tmax=1024):
         self.rank, self.world, self.max_tokens = rank, world, max_tokens
         self.small_tmax = small_tmax
-        self._mega = self._mori = self._small = None
+        self._mega = self._mori = self._small = self._large = None
 
     def mega(self, W, topk):
         """The ``MegaMoeEpA8W4`` (built for W's shape; the calls pass their own W)."""
@@ -93,6 +103,15 @@ class EpComm:
             self._small = MegaMoeSmallEpA8W4(W, rank=self.rank, tmax=self.small_tmax,
                                              topk=topk, world=self.world)
         return self._small
+
+    def large(self, W, topk):
+        """The ``MegaMoeLargeEpA8W4`` (built for W's shape; the calls pass their own W)."""
+        if self._large is None:
+            from .megamoe import MegaMoeLargeEpA8W4
+
+            self._large = MegaMoeLargeEpA8W4(W, rank=self.rank, max_tokens=self.max_tokens,
+                                             topk=topk, world=self.world)
+        return self._large
 
     def mori(self, W, topk):
         """(MORI op, fp8 quant per (token, 128)) as sglang builds them for one node with
@@ -135,12 +154,13 @@ def _comm(rank, world, cap):
 # ---- the problem ----------------------------------------------------------------------
 
 @ep_register
-def moe_ep_ref(x, W, topk_weights, topk_ids, *, comm, tokens, act="silu", situ=None):
+def moe_ep_ref(x, W, topk_weights, topk_ids, *, comm, tokens, act="silu", situ=None,
+               x_quant="per_1x128"):
     """fp32 reference of this rank's rows (collective: every rank runs it). x is quantized to
-    fp8 per (row, 128 columns) as the solvers do; every rank evaluates its experts on all
-    ranks' tokens, and the ranks' sums are added."""
+    fp8 as the solvers do (``x_quant``: per (row, 128 columns) or per row); every rank
+    evaluates its experts on all ranks' tokens, and the ranks' sums are added."""
     world, rank, n = dist.get_world_size(), dist.get_rank(), x.shape[0]
-    xf = R.dequant_fp8(*R.quant_fp8_groups(x)) if n else x.float()
+    xf = R.quant_x(x, x_quant) if n else x.float()
     ns = [None] * world
     dist.all_gather_object(ns, n)
     X, TW, TI = (_gather_rows(t, ns) for t in (xf, topk_weights, topk_ids))
@@ -155,13 +175,14 @@ def moe_ep_ref(x, W, topk_weights, topk_ids, *, comm, tokens, act="silu", situ=N
 @ep_register
 @dim("act", R.ACTS, id="{}")
 @dim("routing", R.ROUTINGS, id="{}")
+@dim("x_quant", R.X_QUANTS, id="{}")
 def moe_ep_problem(tokens, model_dim=4096, inter_dim=2048, experts_global=256, world=8, topk=8,
-                   routing="uniform", act="silu", *, seed=0):
+                   routing="uniform", act="silu", x_quant="per_1x128", *, seed=0):
     """This rank's inputs: a batch of ``tokens`` (``make_routing`` over the ``experts_global``
     experts, the same seed on every rank) split evenly over the ``world`` ranks as DP
     attention does, this rank's rows; its ``experts_global / world`` experts
     (``make_weights``, seed = rank) and its ``EpComm`` (>= ``CAP`` tokens per rank), both
-    cached; SiTUv2 with ``R.SITU``."""
+    cached; SiTUv2 with ``R.SITU``; the fp8 x quant ``x_quant``."""
     rank = dist.get_rank()
     assert world == dist.get_world_size(), (world, dist.get_world_size())
     assert experts_global % world == 0, f"{experts_global} experts over {world} ranks"
@@ -174,7 +195,7 @@ def moe_ep_problem(tokens, model_dim=4096, inter_dim=2048, experts_global=256, w
                                                    inter_dim),
                 topk_weights=tw[rows].contiguous(), topk_ids=ti[rows].contiguous(),
                 comm=_comm(rank, world, cap), tokens=tokens, act=act,
-                situ=R.SITU if act == "situv2" else None)
+                situ=R.SITU if act == "situv2" else None, x_quant=x_quant)
 
 
 @ep_register
@@ -185,7 +206,8 @@ def moe_ep_check(out, expected, **_):
 
 
 @ep_register
-def moe_ep_dims(x, W, topk_weights, topk_ids, *, comm, tokens, act="silu", situ=None):
+def moe_ep_dims(x, W, topk_weights, topk_ids, *, comm, tokens, act="silu", situ=None,
+                x_quant="per_1x128"):
     """The dims of a call, the same on every rank (also checks the arguments); not
     ``routing`` (a hint)."""
     E, H, I = weight_shape(W)
@@ -194,19 +216,22 @@ def moe_ep_dims(x, W, topk_weights, topk_ids, *, comm, tokens, act="silu", situ=
         x.dtype, x.shape, comm.max_tokens)
     assert topk_ids.dtype == torch.int32 and topk_weights.dtype == torch.float32
     assert topk_weights.shape == (M, topk), topk_weights.shape
+    assert x_quant in R.X_QUANTS, x_quant
     return dict(tokens=tokens, model_dim=H, inter_dim=I, experts_global=E * comm.world,
-                world=comm.world, topk=topk, act=act)
+                world=comm.world, topk=topk, act=act, x_quant=x_quant)
 
 
 # ---- solver mega -------------------------------------------------------------------------
 
 @functools.lru_cache(maxsize=None)
-def _mega_variant(H, I, topk, token_shift, nblk, producers, lag, act, bcm):
-    """(mega kernel, ep_plan slices, grid) of a MegaMoeEpA8W4 with these knobs."""
+def _mega_variant(H, I, topk, token_shift, nblk, producers, lag, act, bcm, qx=1):
+    """(mega kernel, ep_plan slices, grid) of a MegaMoeEpA8W4 with these knobs (``qx``: the
+    x scales, 1 per (row, 128 columns), 0 per row)."""
     slices = producers * 8  # ep_plan: one workgroup per producer wave, <= 1024 routes each
     assert producers % QUEUES == 0 and (topk << token_shift) <= slices * 1024, (
         f"producers {producers}: a multiple of {QUEUES}, >= {topk << token_shift} routes / 8192")
-    kw = dict(H=H, I=I, TOPK=topk, token_shift=token_shift, producers=producers, lag=lag, ACT=act)
+    kw = dict(H=H, I=I, TOPK=topk, token_shift=token_shift, producers=producers, lag=lag, ACT=act,
+              QX=qx)
     if bcm != BCM_NT:
         kw.update(BCM1=bcm[0], BCM2=bcm[1])
     cus = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
@@ -220,19 +245,22 @@ def _mega_variant(H, I, topk, token_shift, nblk, producers, lag, act, bcm):
 @knob("bcm", {"bcm22": BCM_NT, "bcm01": BCM_BIG})
 @meta(cached_loads=lambda bcm: bcm != BCM_NT)
 def moe_ep_mega(x, W, topk_weights, topk_ids, *, comm, tokens, act="silu", situ=None,
-                producers=16, lag=2, bcm=BCM_NT):
-    """``comm.mega`` with the knobs (``W`` / ``situ`` / the knobs' kernel, slices and grid
-    set on it for the call, as ``bench/dist.py`` does)."""
+                x_quant="per_1x128", producers=16, lag=2, bcm=BCM_NT):
+    """``comm.mega`` with the knobs (``W`` / ``situ`` / the x quant / the knobs' kernel,
+    slices and grid set on it for the call, as ``bench/dist.py`` does)."""
     mega = comm.mega(W, topk_ids.shape[1])
+    qx = qx_of(x_quant)
     launch, slices, grid = _mega_variant(mega.H, mega.I, mega.topk, mega.token_shift, mega.nblk,
-                                         producers, lag, act, bcm)
-    saved = mega.launch, mega.launch_big, mega.slices, mega.grid, mega.W, mega.situ
+                                         producers, lag, act, bcm, qx)
+    saved = mega.launch, mega.launch_big, mega.slices, mega.grid, mega.W, mega.situ, mega.qx
     mega.launch = mega.launch_big = launch
     mega.slices, mega.grid, mega.W, mega.situ = slices, grid, W, situ_args(**(situ or {}))
+    mega.qx = qx
     try:
         return mega(x, topk_ids, topk_weights)
     finally:
-        mega.launch, mega.launch_big, mega.slices, mega.grid, mega.W, mega.situ = saved
+        (mega.launch, mega.launch_big, mega.slices, mega.grid, mega.W, mega.situ,
+         mega.qx) = saved
 
 
 # ---- solver mega_small -------------------------------------------------------------------
@@ -242,21 +270,42 @@ def moe_ep_mega(x, W, topk_weights, topk_ids, *, comm, tokens, act="silu", situ=
 @knob("bm", (32, 64), id="bm{}")
 @meta(cached_loads=False)
 def moe_ep_mega_small(x, W, topk_weights, topk_ids, *, comm, tokens, act="silu", situ=None,
-                      bm=64, **over):
+                      x_quant="per_1x128", bm=64, **over):
     """``comm.small``: one kernel per call, m-tiles of ``bm`` rows; ``over``: the other
     kernel knobs of ``megamoe.SMALL_KNOBS`` (experiments)."""
     small = comm.small(W, topk_ids.shape[1])
     assert tokens <= small.tmax, (
         f"mega_small: {tokens} tokens over all ranks > its fixed slots ({small.tmax} per expert)")
-    return small(x, topk_ids, topk_weights, W=W, act=act, situ=situ, bm=bm, **over)
+    return small(x, topk_ids, topk_weights, W=W, act=act, situ=situ, x_quant=x_quant, bm=bm,
+                 **over)
+
+
+# ---- solver mega_large -------------------------------------------------------------------
+
+@ep_register
+@multi_gpu("world", init=mori_init)
+@knob("comb", ("add", "fp8"), id="c{}")
+@knob("bcm", {"bcm22": BCM_NT, "bcm01": BCM_BIG})
+@meta(cached_loads=lambda bcm: bcm != BCM_NT)
+def moe_ep_mega_large(x, W, topk_weights, topk_ids, *, comm, tokens, act="silu", situ=None,
+                      x_quant="per_1x128", comb="add", bcm=BCM_NT, **over):
+    """``comm.large``: one kernel per call; ``comb`` the combine ("add": BF16 atomics into
+    the source ranks' outputs, "fp8": fp8 rows the source ranks sum, half the bytes),
+    ``bcm`` the (gemm1, gemm2) W cache modifiers; ``over``: the other kernel knobs of
+    ``megamoe.LARGE_KNOBS`` (experiments)."""
+    large = comm.large(W, topk_ids.shape[1])
+    kw = dict(comb=comb, bcm1=bcm[0], bcm2=bcm[1])
+    kw.update(over)
+    return large(x, topk_ids, topk_weights, W=W, act=act, situ=situ, x_quant=x_quant, **kw)
 
 
 # ---- solvers mori, mori_eager ------------------------------------------------------------
 
-def _mori(x, W, topk_weights, topk_ids, comm, act, situ, cfg, est):
+def _mori(x, W, topk_weights, topk_ids, comm, act, situ, cfg, est, x_quant):
     """fp8 quant -> MORI dispatch -> a8w4_moe_dyn ep3k ``cfg`` -> MORI combine (this rank's
     rows). ``est``: the row estimate of a call on the whole receive buffer, or None: read
     the received count on the host and run on those rows (est = count)."""
+    assert x_quant == "per_1x128", f"mori: blockwise fp8 dispatch only, not {x_quant}"
     op, quant = comm.mori(W, topk_ids.shape[1])
     E, H, _ = weight_shape(W)
     n = x.shape[0]
@@ -283,10 +332,10 @@ def _mori(x, W, topk_weights, topk_ids, comm, act, situ, cfg, est):
 @knob("cfg", EP_CFGS, id="{}")
 @meta(cached_loads=lambda cfg: _ep_cached(ep_preset(cfg)))
 def moe_ep_mori(x, W, topk_weights, topk_ids, *, comm, tokens, act="silu", situ=None,
-                cfg="l128"):
+                x_quant="per_1x128", cfg="l128"):
     """MORI dispatch / combine around ep3k ``cfg`` on the whole receive buffer (row
     estimate: ``tokens``); no host sync."""
-    return _mori(x, W, topk_weights, topk_ids, comm, act, situ, cfg, tokens)
+    return _mori(x, W, topk_weights, topk_ids, comm, act, situ, cfg, tokens, x_quant)
 
 
 @ep_register
@@ -295,10 +344,10 @@ def moe_ep_mori(x, W, topk_weights, topk_ids, *, comm, tokens, act="silu", situ=
 @no_capture("reads the received count on the host")
 @meta(cached_loads=lambda cfg: _ep_cached(ep_preset(cfg)))
 def moe_ep_mori_eager(x, W, topk_weights, topk_ids, *, comm, tokens, act="silu", situ=None,
-                      cfg="l128"):
+                      x_quant="per_1x128", cfg="l128"):
     """MORI dispatch / combine around ep3k ``cfg`` on the received rows (count read on the
     host)."""
-    return _mori(x, W, topk_weights, topk_ids, comm, act, situ, cfg, None)
+    return _mori(x, W, topk_weights, topk_ids, comm, act, situ, cfg, None, x_quant)
 
 
 MOE_EP = ep_ops.moe_ep

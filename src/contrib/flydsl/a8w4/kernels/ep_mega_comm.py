@@ -24,7 +24,7 @@ SCHED_EXPECTED + s_cap / BLOCK_M + b. ``plan`` (local, int32): ep_prep -> ep_pla
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import gpu, range_constexpr, rocdl
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
@@ -94,15 +94,16 @@ def _scan(v, lane, seg):
 
 
 @flydsl_kernel
-def mega_quant_kernel(*, H):
-    """x bf16 [T, H] -> x8 fp8 [T, H] + xs f32 [T, H / 128] (one scale per (token, 128
-    columns): amax / 240, 1 for an all-zero group), and out [T, H] bf16 (the combine
-    target) zeroed; quant == 0: only the zeroing. One wave per (token, 512 columns): a
-    lane holds 8 columns, a 128-column group is 16 lanes."""
+def mega_quant_kernel(*, H, QX=1):
+    """x bf16 [T, H] -> x8 fp8 [T, H] + xs f32 scales (QX 1: [T, H / 128], one per (token,
+    128 columns); QX 0: [T], one per token; amax / 240, 1 for an all-zero group / row), and
+    out [T, H] bf16 (the combine target) zeroed; quant == 0: only the zeroing. QX 1: one
+    wave per (token, 512 columns): a lane holds 8 columns, a 128-column group is 16 lanes;
+    QX 0: one wave per token: a lane holds 8 columns of every 512."""
     NT = 256
     CH = H // 512
     G = H // 128
-    assert H % 512 == 0
+    assert H % 512 == 0 and QX in (0, 1), (H, QX)
 
     @flyc.kernel(name=f"a8w4_megamoe_quant_h{H}", known_block_size=[NT, 1, 1])
     def kernel(x: fx.Int64, x8: fx.Int64, xs: fx.Int64, out: fx.Int64, tokens: fx.Int32,
@@ -137,11 +138,50 @@ def mega_quant_kernel(*, H):
                     t * fx.Int32(G) + c * fx.Int32(4) + lane // fx.Int32(16),
                     mask=lane % fx.Int32(16) == fx.Int32(0))
 
+    @flyc.kernel(name=f"a8w4_megamoe_quant_h{H}_xrow", known_block_size=[NT, 1, 1])
+    def kernel_row(x: fx.Int64, x8: fx.Int64, xs: fx.Int64, out: fx.Int64, tokens: fx.Int32,
+                   quant: fx.Int32):
+        tx = fx.Int32(gpu.thread_id("x"))
+        lane = tx % fx.Int32(64)
+        t = fx.Int32(gpu.block_id("x")) * fx.Int32(NT // 64) + _u(tx // fx.Int32(64))
+        if t < tokens:
+            u16 = [(t * fx.Int32(H) + fx.Int32(c * 512)) // fx.Int32(8) + lane for c in range(CH)]
+            out_rs = _rsrc(out, fx.Int64(tokens) * fx.Int64(H * 2))
+            for c in range_constexpr(CH):
+                buffer_store(Vec.filled(4, 0, fx.Int32), out_rs, u16[c] * fx.Int32(4))
+            if quant != fx.Int32(0):
+                x_rs = _rsrc(x, fx.Int64(tokens) * fx.Int64(H * 2))
+                fs = []
+                am = fx.Float32(0.0)
+                for c in range_constexpr(CH):
+                    v = Vec(_ld(x_rs, u16[c] * fx.Int32(4), 4))
+                    f = Vec(v.bitcast(fx.BFloat16)).to(fx.Float32)
+                    fc = [fx.Float32(f[i]) for i in range(8)]
+                    for e in fc:
+                        am = fx.maxnumf(am, fx.absf(e))
+                    fs.append(fc)
+                for s in range_constexpr(6):
+                    am = fx.maxnumf(am, am.shuffle_xor(1 << s, 64))
+                scale = (am == fx.Float32(0.0)).select(fx.Float32(1.0), am / fx.Float32(240.0))
+                inv = fx.Float32(1.0) / scale
+                x8_rs = _rsrc(x8, fx.Int64(tokens) * fx.Int64(H))
+                for c in range_constexpr(CH):
+                    q = Vec.from_elements(
+                        [_fp8x4_pack(*[fs[c][4 * h + i] * inv for i in range(4)])
+                         for h in range(2)], fx.Int32)
+                    buffer_store(q, x8_rs, u16[c] * fx.Int32(2))
+                buffer_store(scale, _rsrc(xs, fx.Int64(tokens) * fx.Int64(4)), t,
+                             mask=lane == fx.Int32(0))
+
     @flyc.jit
     def launch(x: fx.Int64, x8: fx.Int64, xs: fx.Int64, out: fx.Int64, tokens: fx.Int32,
                quant: fx.Int32, i32_grid: fx.Int32, stream: fx.Stream):
-        kernel(x, x8, xs, out, tokens, quant).launch(
-            grid=(fx.Int64(i32_grid), 1, 1), block=(NT, 1, 1), stream=stream)
+        if const_expr(QX):
+            kernel(x, x8, xs, out, tokens, quant).launch(
+                grid=(fx.Int64(i32_grid), 1, 1), block=(NT, 1, 1), stream=stream)
+        else:
+            kernel_row(x, x8, xs, out, tokens, quant).launch(
+                grid=(fx.Int64(i32_grid), 1, 1), block=(NT, 1, 1), stream=stream)
 
     return launch
 

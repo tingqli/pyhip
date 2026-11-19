@@ -1,0 +1,12 @@
+[kernelkit] moe_ep runs on 8 GPUs here (@multi_gpu): 8 ranks; rank 0 prints, the others write /tmp/kernelkit_ranks_pa96tbeh/rank<r>.log
+[07:39:18] moe_ep mimo-flash2.6-ep8-silu-per_token {'model_dim': 4096, 'inter_dim': 2048, 'experts_global': 256, 'world': 8, 'topk': 8, 'routing': 'uniform', 'act': 'silu', 'x_quant': 'per_token'}: 36 configs, 8 copies of ['W']
+[07:42:08] tokens     64: mega_small bm64 139.8 | mega_small bm32 140.0 | mega_large cadd bcm22 158.7  (12 n/a: AssertionError)
+[07:42:16] tokens    128: mega_small bm64 151.5 | mega_small bm32 151.8 | mega_large cadd bcm22 168.9  (12 n/a: AssertionError)
+[07:42:21] tokens    256: mega_small bm32 156.4 | mega_small bm64 157.8 | mega_large cadd bcm22 176.9  (12 n/a: AssertionError)
+[07:42:28] tokens    512: mega_small bm64 170.5 | mega_small bm32 171.1 | mega_large cadd bcm22 186.8  (12 n/a: AssertionError)
+[07:42:33] tokens   1024: mega_small bm64 218.1 | mega_large cadd bcm22 221.3 | mega_large cfp8 bcm22 227.2  (12 n/a: AssertionError)
+[07:42:40] tokens   2048: mega_large cadd bcm22 333.0 | mega_large cfp8 bcm22 336.1 | mega_large cadd bcm01 340.5  (14 n/a: AssertionError)
+[07:42:44] tokens   4096: mega_large cfp8 bcm01 491.0 | mega_large cfp8 bcm22 503.6 | mega p16 l4 bcm01 513.7  (14 n/a: AssertionError)
+[07:42:49] tokens   8192: mega_large cadd bcm01 835.8 | mega_large cfp8 bcm01 837.2 | mega p16 l4 bcm01 855.0  (14 n/a: AssertionError)
+[07:42:55] tokens  16384: mega_large cadd bcm01 1498.7 | mega_large cfp8 bcm01 1519.7 | mega p16 l4 bcm01 1532.4  (14 n/a: AssertionError)
+[07:43:03] tokens  32768: mega p16 l2 bcm01 2833.2 | mega p16 l4 bcm01 2835.4 | mega p16 l1 bcm01 2849.4  (14 n/a: AssertionError)

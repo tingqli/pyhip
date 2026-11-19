@@ -17,7 +17,8 @@ Run from the directory that holds ``a8w4/``; needs 8 gfx942 GPUs and mori.
 
 Correctness: every point runs twice, the points interleaved (stale data from an earlier
 call would show up); each rank's output vs the reference (each rank evaluates its experts
-on all ranks' fp8 tokens, summed over the ranks), cos diff < 5e-3.
+on all ranks' fp8 tokens, summed over the ranks), cos diff < 5e-3; with both fp8 x quants
+(``x_quant``: one scale per (token, 128 columns) or per token).
 CUDA graph replay (``test_megamoe_ep8_graph``): two graphs (96 and 1536 tokens per rank;
 the second runs the big-batch W cache variant, its experts span several blocks) captured
 after one eager call each, as sglang's graph runner does, replayed several times in a row,
@@ -36,8 +37,12 @@ slowest rank): quant / prep (count exchange) / plan / mega / finish (wait for al
 
 The small-batch layer ``a8w4.megamoe.MegaMoeSmallEpA8W4`` (one kernel per call, <= 1024
 tokens over all ranks): ``test_megamoe_small_ep8`` (eager: uneven batches with idle ranks
-and a single token, dropped slots, both routings, m-tiles of 32 and 64 rows) and
-``test_megamoe_small_ep8_graph`` (the replay schedule above, with batches of its range).
+and a single token, dropped slots, both routings, m-tiles of 32 and 64 rows, both x
+quants) and ``test_megamoe_small_ep8_graph`` (the replay schedule above, with batches of
+its range; the two graphs use different x quants).
+The prefill layer ``a8w4.megamoe.MegaMoeLargeEpA8W4`` (``-k large``): the same two tests
+(eager also at the full capacity, both combines, both x quants; then rows past its receive
+capacity, which must be dropped).
 """
 
 import argparse
@@ -89,15 +94,20 @@ def _worker(rank, port, points, iters, warmup, acts):
     max_tokens = max(max(ns) for ns in points)
     megas = {act: MegaMoeEpA8W4(W, rank=rank, max_tokens=max_tokens, topk=TOPK, act=act,
                                 situ=R.SITU if act == "situv2" else None) for act in acts}
+    # the correctness check also runs every act with one x scale per row
+    checked = [(act, "per_1x128", m) for act, m in megas.items()] + [
+        (act, "per_token", MegaMoeEpA8W4(W, rank=rank, max_tokens=max_tokens, topk=TOPK, act=act,
+                                         situ=R.SITU if act == "situv2" else None,
+                                         x_quant="per_token")) for act in acts]
     data = [R.make_routing(ns[rank], H, E_GLOBAL, TOPK, seed=7919 * rank + ns[rank])
             for ns in points]
     # correctness: every point twice, interleaved
     for rep in range(2):
         for ns, (x, tw, ti) in zip(points, data):
-            for act, mega in megas.items():
+            for act, xq, mega in checked:
                 res = _check(mega, raw, ns, x, tw, ti, act, R.SITU if act == "situv2" else None)
                 if rank == 0:
-                    print(f"{sum(ns)} tokens {ns} ({act}, call {rep + 1}): rows needed "
+                    print(f"{sum(ns)} tokens {ns} ({act}, {xq}, call {rep + 1}): rows needed "
                           f"{[r for r, _ in res]} (cap {mega.s_cap}), cos diff vs reference <= "
                           f"{max(d for _, d in res):.1e}", flush=True)
     if iters:
@@ -277,14 +287,15 @@ SMALL_TMAX = 1024  # tokens over all ranks
 SMALL_CHECK_TOKENS = [[8] * WORLD, [0, 1, 37, 300, 5, 128, 99, 0], [1] + [0] * (WORLD - 1),
                       [0] * WORLD, [SMALL_TMAX // WORLD] * WORLD]
 SMALL_GRAPH_TOKENS = {"a": 12, "b": 96, "e": 40}
+SMALL_GRAPH_XQ = {"a": "per_1x128", "b": "per_token", "e": "per_token"}
 
 
-def _check_small(m, raw, ns, x, tw, ti, act, situ, run, **knobs):
+def _check_small(m, raw, ns, x, tw, ti, act, situ, run, x_quant="per_1x128", **knobs):
     """One small-layer call (``run()``) vs the fp32 reference on every rank's fp8 tokens
-    (quantized per (token, 128 columns) as the kernel does); asserts on every rank."""
+    (quantized per ``x_quant`` as the kernel does); asserts on every rank."""
     rank, n = m.rank, ns[m.rank]
     y = run()[:n].float()
-    xq = R.dequant_fp8(*R.quant_fp8_groups(x)) if n else x.float()
+    xq = R.quant_x(x, x_quant) if n else x.float()
     X, TW, TI = (D.gather_rows(t, ns) for t in (xq, tw, ti))
     ref = R.ref_moe(X, TW, TI, raw, rank * E_LOCAL, act, situ, quant_x=False)
     dist.all_reduce(ref)
@@ -293,7 +304,7 @@ def _check_small(m, raw, ns, x, tw, ti, act, situ, run, **knobs):
     res = [None] * len(ns)
     dist.all_gather_object(res, diff)
     bad = [(r, d) for r, d in enumerate(res) if not d < COS_TOL]
-    assert not bad, f"tokens per rank {ns} {knobs}: (rank, cos diff) {bad}"
+    assert not bad, f"tokens per rank {ns} {x_quant} {knobs}: (rank, cos diff) {bad}"
     return max(res)
 
 
@@ -313,13 +324,13 @@ def _small_worker(rank, port, act):
             else:
                 x, tw, ti = R.make_routing(ns[rank], H, E_GLOBAL, TOPK, seed=seed,
                                            routing=routing)
-            for bm in (32, 64):
-                call = functools.partial(
-                    _bounded, functools.partial(m, x, ti, tw, act=act, situ=situ, bm=bm))
-                d = _check_small(m, raw, ns, x, tw, ti, act, situ, call, bm=bm)
+            for bm, xq in itertools.product((32, 64), R.X_QUANTS):
+                call = functools.partial(_bounded, functools.partial(
+                    m, x, ti, tw, act=act, situ=situ, x_quant=xq, bm=bm))
+                d = _check_small(m, raw, ns, x, tw, ti, act, situ, call, x_quant=xq, bm=bm)
                 if rank == 0:
-                    print(f"small {act} bm{bm} {routing}, tokens per rank {ns} (call {rep + 1})"
-                          f": cos diff vs reference <= {d:.1e}", flush=True)
+                    print(f"small {act} bm{bm} {xq} {routing}, tokens per rank {ns} (call "
+                          f"{rep + 1}): cos diff vs reference <= {d:.1e}", flush=True)
     D.finish()
 
 
@@ -339,29 +350,29 @@ def _small_graph_worker(rank, port, act):
     m = MegaMoeSmallEpA8W4(W, rank=rank, tmax=SMALL_TMAX, topk=TOPK)
     graphs = {}
     for kind in "ab":
-        n = SMALL_GRAPH_TOKENS[kind]
+        n, xq = SMALL_GRAPH_TOKENS[kind], SMALL_GRAPH_XQ[kind]
         x, tw, ti = _padded_routing(n, n, seed=rank)  # the graph's static inputs
-        m(x, ti, tw, act=act, situ=situ)  # warm-up (compiles), then capture
+        m(x, ti, tw, act=act, situ=situ, x_quant=xq)  # warm-up (compiles), then capture
         torch.cuda.synchronize()
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g):
-            y = m(x, ti, tw, act=act, situ=situ)
+            y = m(x, ti, tw, act=act, situ=situ, x_quant=xq)
         graphs[kind] = (g, y, (x, tw, ti))
     for step, kind in enumerate(GRAPH_STEPS):
-        n = SMALL_GRAPH_TOKENS[kind]
+        n, xq = SMALL_GRAPH_TOKENS[kind], SMALL_GRAPH_XQ[kind]
         n_valid = _valid_tokens(n, step, rank)
         x, tw, ti = _padded_routing(n, n_valid, seed=7919 * rank + 31 * step + 1,
                                     routing=R.ROUTINGS[step % 2])
         if kind == "e":
             call = functools.partial(
-                _bounded, functools.partial(m, x, ti, tw, act=act, situ=situ))
+                _bounded, functools.partial(m, x, ti, tw, act=act, situ=situ, x_quant=xq))
         else:
             g, y, static = graphs[kind]
             for dst, src in zip(static, (x, tw, ti)):
                 dst.copy_(src)
             x, tw, ti = static
             call = functools.partial(_bounded, _replay, g, y)
-        d = _check_small(m, raw, [n] * WORLD, x, tw, ti, act, situ, call)
+        d = _check_small(m, raw, [n] * WORLD, x, tw, ti, act, situ, call, x_quant=xq)
         assert not m.out[n_valid:n].any(), f"rank {rank} step {step}: padded rows not 0"
         if rank == 0:
             what = "eager call" if kind == "e" else f"replay of graph {kind}"
@@ -376,6 +387,156 @@ def test_megamoe_small_ep8_graph():
     if reason:
         pytest.skip(reason)
     D.spawn(_small_graph_worker, ("silu",))
+
+
+# ---- MegaMoeLargeEpA8W4 --------------------------------------------------------------
+
+LARGE_MAX_TOKENS = 4096  # per rank
+# tokens per rank: uneven (idle ranks, a single token), every rank idle, one rank alone,
+# prefill-sized, the full capacity
+LARGE_CHECK_TOKENS = [[0, 1, 37, 300, 5, 128, 999, 0], [0] * WORLD, [1] + [0] * (WORLD - 1),
+                      [1024] * WORLD, [LARGE_MAX_TOKENS] * WORLD]
+LARGE_KNOB_SETS = (dict(), dict(x_quant="per_token"),
+                   dict(comb="fp8", bcm1=0, bcm2=1, producers=32),
+                   dict(comb="fp8", x_quant="per_token"))
+LARGE_GRAPH_TOKENS = {"a": 96, "b": 1536, "e": 300}
+LARGE_GRAPH_KNOBS = {"a": dict(), "b": dict(comb="fp8", bcm1=0, bcm2=1, x_quant="per_token"),
+                     "e": dict(x_quant="per_token")}
+
+
+def _check_large(m, raw, ns, x, tw, ti, act, situ, run, **knobs):
+    """One large-layer call (``run()``) vs the fp32 reference on every rank's fp8 tokens as
+    the kernel quantized them (``m.x_ref``); asserts on every rank."""
+    rank, n = m.rank, ns[m.rank]
+    y = run()[:n].float()
+    xq = m.x_ref(n) if n else x.float()
+    X, TW, TI = (D.gather_rows(t, ns) for t in (xq, tw, ti))
+    ref = R.ref_moe(X, TW, TI, raw, rank * E_LOCAL, act, situ, quant_x=False)
+    dist.all_reduce(ref)
+    off = sum(ns[:rank])
+    diff = R.cos_diff(ref[off:off + n], y) if n else 0.0
+    res = [None] * len(ns)
+    dist.all_gather_object(res, (m.rows_needed(), diff))
+    bad = [(r, *v) for r, v in enumerate(res) if v[0] > m.s_cap or not v[1] < COS_TOL]
+    assert not bad, f"tokens per rank {ns} {knobs}: (rank, rows needed, cos diff) {bad}"
+    return max(d for _, d in res)
+
+
+def _check_large_overflow(m, raw, act, situ, **knobs):
+    """Rows past s_cap: every rank's LARGE_MAX_TOKENS / 2 tokens send their TOPK slots to
+    rank 0's experts 0 .. TOPK - 1 (a permutation per token), 8 x the uniform average. Rank
+    0's layout: expert e's rows from e WORLD n, source s's from + s n (sources from rank 0
+    on); rows past s_cap are dropped, here whole (source, expert) segments -> the reference
+    without those routes (they must add nothing: not the rows of an earlier call)."""
+    rank, n = m.rank, LARGE_MAX_TOKENS // 2
+    x, tw, _ = R.make_routing(n, H, E_GLOBAL, TOPK, seed=97 * rank + 5)
+    g = torch.Generator(device="cuda").manual_seed(rank)
+    ti = torch.argsort(torch.rand((n, TOPK), device="cuda", generator=g), dim=1).to(torch.int32)
+    starts = torch.arange(TOPK * WORLD).view(TOPK, WORLD).T * n  # [source, expert]
+    assert ((starts + n <= m.s_cap) | (starts >= m.s_cap)).all(), "a segment cut"
+    kept = (starts + n <= m.s_cap).cuda()
+    ns = [n] * WORLD
+    y = _bounded(functools.partial(m, x, ti, tw, act=act, situ=situ, **knobs))[:n].float()
+    X, TW, TI = (D.gather_rows(t, ns) for t in (m.x_ref(n), tw, ti))
+    src = torch.arange(WORLD, device="cuda").repeat_interleave(n).unsqueeze(1)
+    TI = TI.masked_fill(~kept[src, TI.long()], -1)
+    ref = R.ref_moe(X, TW, TI, raw, rank * E_LOCAL, act, situ, quant_x=False)
+    dist.all_reduce(ref)
+    d = R.cos_diff(ref[rank * n:(rank + 1) * n], y)
+    res = [None] * WORLD
+    dist.all_gather_object(res, (m.rows_needed(), d))
+    assert res[0][0] == WORLD * TOPK * n and all(r[1] < COS_TOL for r in res), (
+        f"overflow {knobs}: (rows needed, cos diff) per rank {res} (cap {m.s_cap})")
+    return max(r[1] for r in res)
+
+
+def _large_worker(rank, port, act):
+    D.init(rank, port)
+    from a8w4.megamoe import MegaMoeLargeEpA8W4
+
+    situ = R.SITU if act == "situv2" else None
+    W, raw = R.make_weights(E_LOCAL, H, I, seed=rank)
+    m = MegaMoeLargeEpA8W4(W, rank=rank, max_tokens=LARGE_MAX_TOKENS, topk=TOPK)
+    for rep in range(2):
+        for i, ns in enumerate(LARGE_CHECK_TOKENS):
+            routing = R.ROUTINGS[(rep + i) % 2]
+            seed = 7919 * rank + 31 * i + rep
+            if rep:  # about 1/16 of the slots dropped (topk_ids -1)
+                x, tw, ti = _padded_routing(ns[rank], ns[rank], seed=seed, routing=routing)
+            else:
+                x, tw, ti = R.make_routing(ns[rank], H, E_GLOBAL, TOPK, seed=seed,
+                                           routing=routing)
+            for knobs in LARGE_KNOB_SETS:
+                call = functools.partial(
+                    _bounded, functools.partial(m, x, ti, tw, act=act, situ=situ, **knobs))
+                d = _check_large(m, raw, ns, x, tw, ti, act, situ, call, **knobs)
+                if rank == 0:
+                    print(f"large {act} {knobs} {routing}, tokens per rank {ns} (call {rep + 1})"
+                          f": cos diff vs reference <= {d:.1e}", flush=True)
+    for knobs in LARGE_KNOB_SETS[0::2]:  # both combines, their slots written by the calls above
+        d = _check_large_overflow(m, raw, act, situ, **knobs)
+        if rank == 0:
+            print(f"large {act} {knobs}, rows past s_cap dropped: cos diff vs reference <= "
+                  f"{d:.1e}", flush=True)
+    D.finish()
+
+
+def test_megamoe_large_ep8():
+    reason = _skip_reason()
+    if reason:
+        pytest.skip(reason)
+    D.spawn(_large_worker, ("silu",))
+
+
+def _large_graph_worker(rank, port, act):
+    D.init(rank, port)
+    from a8w4.kernels._protocol import qx_of
+    from a8w4.megamoe import MegaMoeLargeEpA8W4
+
+    situ = R.SITU if act == "situv2" else None
+    W, raw = R.make_weights(E_LOCAL, H, I, seed=rank)
+    m = MegaMoeLargeEpA8W4(W, rank=rank, max_tokens=LARGE_MAX_TOKENS, topk=TOPK)
+    knobs = LARGE_GRAPH_KNOBS
+    graphs = {}
+    for kind in "ab":
+        n = LARGE_GRAPH_TOKENS[kind]
+        x, tw, ti = _padded_routing(n, n, seed=rank)  # the graph's static inputs
+        m(x, ti, tw, act=act, situ=situ, **knobs[kind])  # warm-up (compiles), then capture
+        torch.cuda.synchronize()
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            y = m(x, ti, tw, act=act, situ=situ, **knobs[kind])
+        graphs[kind] = (g, y, (x, tw, ti))
+    for step, kind in enumerate(GRAPH_STEPS):
+        n = LARGE_GRAPH_TOKENS[kind]
+        n_valid = _valid_tokens(n, step, rank)
+        x, tw, ti = _padded_routing(n, n_valid, seed=7919 * rank + 31 * step + 1,
+                                    routing=R.ROUTINGS[step % 2])
+        if kind == "e":
+            call = functools.partial(
+                _bounded, functools.partial(m, x, ti, tw, act=act, situ=situ, **knobs[kind]))
+        else:
+            g, y, static = graphs[kind]
+            for dst, src in zip(static, (x, tw, ti)):
+                dst.copy_(src)
+            x, tw, ti = static
+            m._qx = qx_of(knobs[kind].get("x_quant", "per_1x128"))  # the replay's (x_ref)
+            call = functools.partial(_bounded, _replay, g, y)
+        d = _check_large(m, raw, [n] * WORLD, x, tw, ti, act, situ, call)
+        assert not m.out[n_valid:n].any(), f"rank {rank} step {step}: padded rows not 0"
+        if rank == 0:
+            what = "eager call" if kind == "e" else f"replay of graph {kind}"
+            print(f"large step {step} {what}, {n} tokens per rank, {R.ROUTINGS[step % 2]} "
+                  f"routing, real {[_valid_tokens(n, step, r) for r in range(WORLD)]}: cos "
+                  f"diff vs reference <= {d:.1e}", flush=True)
+    D.finish()
+
+
+def test_megamoe_large_ep8_graph():
+    reason = _skip_reason()
+    if reason:
+        pytest.skip(reason)
+    D.spawn(_large_graph_worker, ("silu",))
 
 
 if __name__ == "__main__":
