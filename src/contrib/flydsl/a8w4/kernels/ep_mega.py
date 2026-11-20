@@ -81,7 +81,7 @@ def ep_mega_kernel(*, H, I, TOPK, token_shift, producers=16, lag=2, ROWV=(32, 64
     token in a row's down id (max tokens per rank <= 1 << token_shift). ``QX``: x scales
     (``mega_quant_kernel``), 1 one per (row, 128 cols), 0 one per row. ``BCM1`` /
     ``BCM2``: gemm1 / gemm2 W load cache modifier (2 = nt)."""
-    assert ACT in ("silu", "situv2") and QX in (0, 1), (ACT, QX)
+    assert ACT in ("silu", "silu_clamp", "situv2") and QX in (0, 1), (ACT, QX)
     BM = BLOCK_M
     NT = 64 * NW
     N2 = 2 * I
@@ -386,7 +386,7 @@ def ep_mega_kernel(*, H, I, TOPK, token_shift, producers=16, lag=2, ROWV=(32, 64
                 fac = {k: _channel_factor(v) for k, v in exps.items()}
                 rsc = [fx.Float32(lds_f32[fx.Int32(RATIO // 4 + G1N * BM) + r]) for r in rows]
                 situ = None
-                if const_expr(ACT == "situv2"):
+                if const_expr(ACT != "silu"):
                     situ = situ_params(*[fx.Float32(a[k]) for k in NAMESF])
                 ys = {}
                 for mi in range_constexpr(MR):

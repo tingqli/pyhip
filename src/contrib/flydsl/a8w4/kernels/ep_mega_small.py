@@ -122,7 +122,7 @@ def ep_mega_small_kernel(*, H, I, TOPK, TMAX, BM=64, NO=256, ARB=256, PF=2, P=16
     W prefetch distance of both GEMMs; ``P``: producer workgroups; ``WPC``: workgroups per
     CU; ``QX``: x scales, 1 one per (row, 128 cols), 0 one per row; ``BCM1`` / ``BCM2``:
     gemm1 / gemm2 W load cache modifier (2 = nt)."""
-    assert ACT in ("silu", "situv2") and QX in (0, 1), (ACT, QX)
+    assert ACT in ("silu", "silu_clamp", "situv2") and QX in (0, 1), (ACT, QX)
     NW = 8
     NT = 64 * NW
     NI = 128
@@ -481,7 +481,7 @@ def ep_mega_small_kernel(*, H, I, TOPK, TMAX, BM=64, NO=256, ARB=256, PF=2, P=16
                 fac = {k: _channel_factor(v) for k, v in exps.items()}
                 rsc = [fx.Float32(lds_f32[fx.Int32(RATIO // 4 + G1N * BM) + r]) for r in rows]
                 situ = None
-                if const_expr(ACT == "situv2"):
+                if const_expr(ACT != "silu"):
                     situ = situ_params(*[fx.Float32(a[k]) for k in NAMESF])
                 ys = {}
                 for mi in range_constexpr(MR):

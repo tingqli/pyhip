@@ -151,7 +151,7 @@ def ep_mega_large_kernel(*, H, I, TOPK, TCAP, P=16, NO=256, ARB=128, PF=2, QX=1,
     as ep_mega), 0 one per token row; ``COMB``: "add" (BF16 atomics into the source rank's
     ``out``) or "fp8" (fp8 rows + scales into its ``cin``, summed there); ``BCM1`` /
     ``BCM2``: gemm1 / gemm2 W load cache modifier (2 = nt)."""
-    assert ACT in ("silu", "situv2"), ACT
+    assert ACT in ("silu", "silu_clamp", "situv2"), ACT
     assert QX in (0, 1) and COMB in ("add", "fp8"), (QX, COMB)
     FP8C = COMB == "fp8"
     NW = 8
@@ -689,7 +689,7 @@ def ep_mega_large_kernel(*, H, I, TOPK, TCAP, P=16, NO=256, ARB=128, PF=2, QX=1,
                 fac = {k: _channel_factor(v) for k, v in exps.items()}
                 rsc = [fx.Float32(lds_f32[fx.Int32(L_FIN) + r]) for r in rows]
                 situ = None
-                if const_expr(ACT == "situv2"):
+                if const_expr(ACT != "silu"):
                     situ = situ_params(*[fx.Float32(a[k]) for k in NAMESF])
                 ys = {}
                 for mi in range_constexpr(MR):

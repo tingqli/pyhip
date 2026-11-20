@@ -111,17 +111,22 @@ def situ_params(beta, beta_rcp, linear_beta, linear_beta_rcp, swiglu_limit):
 def gate_up_act(act, gs, us, situ=None):
     """Fused gate+up epilogue activation: ``act(gate) * up``.
 
-    ``act`` is a compile-time string, "silu" or "situv2"; ``situ`` carries the
-    runtime situv2 parameters.
+    ``act`` is a compile-time string: "silu", "silu_clamp" (silu after the
+    ``swiglu_limit`` clamp of ``situ``, as DeepSeek-V4) or "situv2"; ``situ`` carries
+    the runtime situv2 parameters.
     """
     if const_expr(act == "situv2"):
         return situ_mul_batch(gs, us, *situ)
+    if const_expr(act == "silu_clamp"):
+        gu = [clamp_gate_up(g, u, situ.neg_clamp_limit) for g, u in zip(gs, us)]
+        return silu_mul_batch([g for g, _ in gu], [u for _, u in gu])
     return silu_mul_batch(gs, us)
 
 
 def situ_args(situ_beta=1.0, situ_linear_beta=1.0, swiglu_limit=float("inf")):
     """Runtime SiTUv2 launch args (beta, 1/beta, linear_beta, 1/linear_beta,
-    clamp limit; +inf = no clamp), as flydsl_a16w4_gemm1. Ignored by silu."""
+    clamp limit; +inf = no clamp), as flydsl_a16w4_gemm1. Ignored by silu; silu_clamp
+    reads only the limit."""
     beta, lbeta = float(situ_beta), float(situ_linear_beta)
     if beta <= 0.0 or lbeta <= 0.0:
         raise ValueError(f"situ_beta/situ_linear_beta must be > 0, got {beta}/{lbeta}")
