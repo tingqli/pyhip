@@ -95,7 +95,7 @@ class MegaMoeEpA8W4:
         self.s_cap = -(-s_cap // bm) * bm
         assert self.s_cap < 1 << ROW_BITS
         assert self.s_cap * self.H < BUFFER_BYTES_MAX, (
-            f"{self.s_cap} receive rows of {self.H} bytes pass 4 GiB: lower max_tokens")
+            f"{self.s_cap} receive rows of {self.H} bytes pass 2 GiB: lower max_tokens")
         self.nblk = self.s_cap // bm
         H, I, S = self.H, self.I, self.s_cap
         dev = torch.device("cuda", torch.cuda.current_device())

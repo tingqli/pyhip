@@ -34,8 +34,9 @@ SCHED_EXPECTED = QUEUES * QSTRIDE
 # expert << ROW_BITS; 8 expert bits and the sign bit (-1: not sent) leave 23 row bits
 ROW_BITS = 23
 BLOCK_M = 128
-# buffer offsets are 32-bit: a buffer the kernels address by row stays below 4 GiB
-BUFFER_BYTES_MAX = 1 << 32
+# A buffer the kernels address by row stays below 2 GiB: byte offsets are i32, and a
+# masked lane's buffer access goes to offset 0x7FFFFFFF, out of range only below 2 GiB.
+BUFFER_BYTES_MAX = 1 << 31
 # status (local, i32 [8]): [1] rows the last call needed (ep_prep); [STATUS_EPOCH] calls
 # completed (ep_finish advances it; ep_prep / ep_finish flag the call with it + 1)
 STATUS_EPOCH = 2

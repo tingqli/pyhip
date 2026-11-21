@@ -176,7 +176,7 @@ def ep_mega_large_kernel(*, H, I, TOPK, TCAP, P=16, NO=256, ARB=128, PF=2, QX=1,
     EPP = E_LOCAL // KP  # (destination, expert) segments per producer
     NQ = GRID - 1 - P  # quant workgroups
     SCAP = large_scap(ROUTES, TCAP)
-    assert SCAP * H < BUFFER_BYTES_MAX, f"{SCAP} receive rows of {H} bytes pass 4 GiB"
+    assert SCAP * H < BUFFER_BYTES_MAX, f"{SCAP} receive rows of {H} bytes pass 2 GiB"
     MAXT = SCAP // BM
     TSH = TCAP.bit_length() - 1  # token bits of a source id
     TOPK_SHIFT = TOPK.bit_length() - 1
