@@ -30,9 +30,9 @@ streamed into VGPRs, fp8 A through LDS):
   m-tile (W prefetch already in flight), then writes every row (times the route weight,
   bf16) into ``cin[token, slot]`` of the route's source rank: one wave per row.
 - Combine: the last workgroup to finish (two-level count) resets the counters and sets
-  ``cflag[me]`` = epoch on every rank; workgroup b < n (this rank's tokens) waits for
-  ``cflag`` of all ranks and sums the topk rows of tokens b, b + GRID, ... into ``out``
-  (f32, slot order; a negative id contributes nothing).
+  ``cflag[me]`` = epoch on every rank; workgroup b < max(n, 1) (n: this rank's tokens)
+  waits for ``cflag`` of all ranks and sums the topk rows of tokens b, b + GRID, ... into
+  ``out`` (f32, slot order; a negative id contributes nothing).
 
 Epoch: ``ctl[SC_EPOCH] + 1``, stored back by the last workgroup: the same on every rank
 as long as every rank makes the same calls, right in CUDA graph replays. A rank enters
@@ -729,8 +729,11 @@ def ep_mega_small_kernel(*, H, I, TOPK, TMAX, BM=64, NO=256, ARB=256, PF=2, P=16
                                   + fx.Int64(a["me"] * fx.Int32(LINE)), epoch)
 
         def combine(a):
-            """this rank's tokens b, b + GRID, ...: out[t] = sum of its valid slots' rows."""
-            if bid < a["n"]:
+            """this rank's tokens b, b + GRID, ...: out[t] = sum of its valid slots' rows.
+            Workgroup 0 waits for every rank's flag even without tokens: a call must not
+            end before all ranks finished it, or this rank's next call adds to ``done``
+            on a rank whose plan still waits for this call's count."""
+            if bid < fx.max(a["n"], fx.Int32(1)):
                 wait_flags(sym0 + fx.Int64(O_CFLAG), epoch)
                 cin_rs = _rsrc(sym0 + fx.Int64(O_CIN), TMAX * TOPK * H * 2)
                 out_rs = _rsrc(a["out"], fx.Int64(a["n"]) * fx.Int64(H * 2))
