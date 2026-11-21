@@ -98,6 +98,7 @@ from ._mem import (
     lds_vec_load,
 )
 from ._protocol import (
+    BUFFER_BYTES_MAX,
     E_GLOBAL,
     E_LOCAL,
     LARGE_BM,
@@ -143,16 +144,20 @@ def _wave_scan(v, lane):
 
 @flydsl_kernel
 def ep_mega_large_kernel(*, H, I, TOPK, TCAP, P=16, NO=256, ARB=128, PF=2, QX=1, COMB="add",
-                         ACT="silu", BCM1=2, BCM2=2):
+                         ACT="silu", BCM1=2, BCM2=2, ROUTES=None):
     """The large megamoe kernel for (H, I, top-k) and up to TCAP tokens per rank (a power of
     2). ``P``: producer workgroups (a multiple of 8); ``NO``: gemm2 output cols per unit;
     ``ARB`` / ``PF``: K bytes per A tile / W prefetch distance of both GEMMs; ``QX``: x
     scales, 1 one per (row, 128 cols) (gemm1 rescales its accumulator at every 128-K group,
     as ep_mega), 0 one per token row; ``COMB``: "add" (BF16 atomics into the source rank's
     ``out``) or "fp8" (fp8 rows + scales into its ``cin``, summed there); ``BCM1`` /
-    ``BCM2``: gemm1 / gemm2 W load cache modifier (2 = nt)."""
+    ``BCM2``: gemm1 / gemm2 W load cache modifier (2 = nt); ``ROUTES``: routes per token,
+    the real top-k when the TOPK slots are padded with -1 (default TOPK): sizes the receive
+    rows (``large_scap``)."""
     assert ACT in ("silu", "silu_clamp", "situv2"), ACT
     assert QX in (0, 1) and COMB in ("add", "fp8"), (QX, COMB)
+    ROUTES = ROUTES or TOPK
+    assert 0 < ROUTES <= TOPK, (ROUTES, TOPK)
     FP8C = COMB == "fp8"
     NW = 8
     NT = 64 * NW
@@ -170,7 +175,8 @@ def ep_mega_large_kernel(*, H, I, TOPK, TCAP, P=16, NO=256, ARB=128, PF=2, QX=1,
     KP = P // NPES  # producers per destination
     EPP = E_LOCAL // KP  # (destination, expert) segments per producer
     NQ = GRID - 1 - P  # quant workgroups
-    SCAP = large_scap(TOPK, TCAP)
+    SCAP = large_scap(ROUTES, TCAP)
+    assert SCAP * H < BUFFER_BYTES_MAX, f"{SCAP} receive rows of {H} bytes pass 4 GiB"
     MAXT = SCAP // BM
     TSH = TCAP.bit_length() - 1  # token bits of a source id
     TOPK_SHIFT = TOPK.bit_length() - 1
@@ -182,7 +188,7 @@ def ep_mega_large_kernel(*, H, I, TOPK, TCAP, P=16, NO=256, ARB=128, PF=2, QX=1,
     ROWV = (32, 64, 128)
     RPS = NT // 32  # gemm2 scatter rows per pass (32 lanes x 2 cols per row)
     SCAN_B = 8  # producer scan: route ids per thread with their loads issued together
-    off, _ = large_sym_layout(H, TOPK, TCAP)
+    off, _ = large_sym_layout(H, TOPK, TCAP, ROUTES)
     O_RX, O_RSX, O_RW, O_RID = off["rx"], off["rsx"], off["rw"], off["rid"]
     O_CNT, O_PBASE, O_CDONE = off["cnt"], off["pbase"], off["cdone"]
     O_PFLAG, O_FFLAG, O_TREADY, O_OUT = off["pflag"], off["fflag"], off["tready"], off["out"]
@@ -191,7 +197,7 @@ def ep_mega_large_kernel(*, H, I, TOPK, TCAP, P=16, NO=256, ARB=128, PF=2, QX=1,
     SRP = NT // LPR  # rows per pass
     assert not FP8C or (H == 8 * NT and NT % LPR == 0 and NO % 128 == 0), (
         "fp8 combine: a row is 8 cols per thread, 16 lanes a 128-col group")
-    LC_G1 = large_ctl_ints(TOPK, TCAP)[0]
+    LC_G1 = large_ctl_ints(TOPK, TCAP, ROUTES)[0]
     assert 1 << TOPK_SHIFT == TOPK and TOPK <= 8 and TCAP == 1 << TSH and TSH + 3 <= 24, (
         TOPK, TCAP)
     assert P % NPES == 0 and KP & (KP - 1) == 0 and E_LOCAL % KP == 0 and DONE_UNIT % KP == 0
@@ -215,6 +221,7 @@ def ep_mega_large_kernel(*, H, I, TOPK, TCAP, P=16, NO=256, ARB=128, PF=2, QX=1,
                     BM * NO * 2, BM * NW * 4, (L_TOT + E_LOCAL) * 4, (L_CHP + 65) * 4)
     assert LDS_BYTES <= LDS_BYTES_MAX, LDS_BYTES
     kname = (f"a8w4_megamoe_large_h{H}_i{I}_k{TOPK}_t{TCAP}_p{P}_no{NO}_a{ARB}_pf{PF}"
+             + ("" if ROUTES == TOPK else f"_r{ROUTES}")
              + ("" if QX else "_xrow") + ("_cfp8" if FP8C else "")
              + ("" if (BCM1, BCM2) == (2, 2) else f"_bcm{BCM1}{BCM2}")
              + ("" if ACT == "silu" else f"_{ACT}"))

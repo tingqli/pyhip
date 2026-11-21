@@ -171,7 +171,7 @@ a8w4/
   tests/test_a8w4_moe.py       pytest：参考实现、查表、CUDA graph 等其余性质
   tests/test_a8w4_mori_ep8.py  8 卡 EP8 整层（MORI dispatch → a8w4_moe_dyn → MORI combine）：pytest 查正确性，命令行测性能（8.1 节）
   tests/test_a8w4_mori_tp8.py  8 卡 TP8 整层（a8w4_moe → all-reduce），EP8 脚本的 TP 对照：pytest 查正确性，命令行测性能（8.2 节）
-  tests/test_a8w4_megamoe_ep8.py  8 卡 megamoe 整层：pytest 查正确性（eager，以及带 -1 padding 的 CUDA graph 连续回放；MegaMoeEpA8W4、MegaMoeSmallEpA8W4 和 MegaMoeLargeEpA8W4 各两个测试；large 另查超出接收容量时被丢弃的路由），命令行与 MORI 路径比性能
+  tests/test_a8w4_megamoe_ep8.py  8 卡 megamoe 整层：pytest 查正确性（eager，以及带 -1 padding 的 CUDA graph 连续回放；MegaMoeEpA8W4、MegaMoeSmallEpA8W4 和 MegaMoeLargeEpA8W4 各两个测试；MegaMoeEpA8W4 和 large 另查所有路由打到同一张卡：接收容量按最坏情况分配，超过 2^18 行也一条不丢），命令行与 MORI 路径比性能
   kernels/                     FlyDSL device 代码
     row_quant.py               x 按行 fp8 量化（行数是运行时参数）
     tp_prep.py                 TP 族的 prep：全部专家的路由排序 + x 量化 + out 清零，1 次 launch

@@ -41,8 +41,10 @@ and a single token, dropped slots, both routings, m-tiles of 32 and 64 rows, bot
 quants) and ``test_megamoe_small_ep8_graph`` (the replay schedule above, with batches of
 its range; the two graphs use different x quants).
 The prefill layer ``a8w4.megamoe.MegaMoeLargeEpA8W4`` (``-k large``): the same two tests
-(eager also at the full capacity, both combines, both x quants; then rows past its receive
-capacity, which must be dropped).
+(eager also at the full capacity, both combines, both x quants; then every route of every
+rank to one rank, which must all be received).
+``test_megamoe_ep8_all_to_one``: the same for ``MegaMoeEpA8W4``. Both receive every route
+of every rank (8 x the uniform average) without dropping any, past 2^18 rows.
 """
 
 import argparse
@@ -279,6 +281,59 @@ def test_megamoe_ep8_graph():
     D.spawn(_graph_worker, ("silu",))
 
 
+def _all_to_one_routing(rank, n):
+    """Every route of every rank to rank 0: each of the ``n`` tokens sends its TOPK slots to
+    TOPK of rank 0's experts, a random choice per token (the experts' rows are not whole
+    m-tiles, so the padded rows pass 2^18 at ``n`` = 4095)."""
+    x, tw, _ = R.make_routing(n, H, E_GLOBAL, TOPK, seed=97 * rank + 5)
+    g = torch.Generator(device="cuda").manual_seed(rank)
+    order = torch.argsort(torch.rand((n, E_LOCAL), device="cuda", generator=g), dim=1)
+    return x, tw, order[:, :TOPK].to(torch.int32).contiguous()
+
+
+def _check_all_to_one(m, raw, act, situ, run_of, **knobs):
+    """``_all_to_one_routing`` through ``run_of(x, tw, ti)`` (a call) vs the reference: rank 0
+    receives all the routes (none dropped); -> cos diff, worst rank."""
+    rank, n = m.rank, m.tcap - 1
+    x, tw, ti = _all_to_one_routing(rank, n)
+    y = _bounded(run_of(x, tw, ti))[:n].float()
+    ns = [n] * WORLD
+    X, TW, TI = (D.gather_rows(t, ns) for t in (m.x_ref(n), tw, ti))
+    ref = R.ref_moe(X, TW, TI, raw, rank * E_LOCAL, act, situ, quant_x=False)
+    dist.all_reduce(ref)
+    d = R.cos_diff(ref[rank * n:(rank + 1) * n], y)
+    res = [None] * WORLD
+    dist.all_gather_object(res, (m.rows_needed(), d))
+    rows = res[0][0]
+    assert WORLD * TOPK * n <= rows <= m.s_cap and rows > 1 << 18 and all(
+        r[1] < COS_TOL for r in res), (
+        f"all to one {knobs}: (rows needed, cos diff) per rank {res} (cap {m.s_cap})")
+    return max(r[1] for r in res)
+
+
+def _all_to_one_worker(rank, port, act):
+    D.init(rank, port)
+    from a8w4.megamoe import MegaMoeEpA8W4
+
+    situ = R.SITU if act == "situv2" else None
+    W, raw = R.make_weights(E_LOCAL, H, I, seed=rank)
+    mega = MegaMoeEpA8W4(W, rank=rank, max_tokens=MAX_TOKENS, topk=TOPK, act=act, situ=situ)
+    for rep in range(2):
+        d = _check_all_to_one(mega, raw, act, situ,
+                              lambda x, tw, ti: functools.partial(mega, x, ti, tw))
+        if rank == 0:
+            print(f"{act}: every route to rank 0 (call {rep + 1}): cos diff vs reference <= "
+                  f"{d:.1e}", flush=True)
+    D.finish()
+
+
+def test_megamoe_ep8_all_to_one():
+    reason = _skip_reason()
+    if reason:
+        pytest.skip(reason)
+    D.spawn(_all_to_one_worker, ("silu",))
+
+
 # ---- MegaMoeSmallEpA8W4 --------------------------------------------------------------
 
 SMALL_TMAX = 1024  # tokens over all ranks
@@ -422,32 +477,14 @@ def _check_large(m, raw, ns, x, tw, ti, act, situ, run, **knobs):
     return max(d for _, d in res)
 
 
-def _check_large_overflow(m, raw, act, situ, **knobs):
-    """Rows past s_cap: every rank's LARGE_MAX_TOKENS / 2 tokens send their TOPK slots to
-    rank 0's experts 0 .. TOPK - 1 (a permutation per token), 8 x the uniform average. Rank
-    0's layout: expert e's rows from e WORLD n, source s's from + s n (sources from rank 0
-    on); rows past s_cap are dropped, here whole (source, expert) segments -> the reference
-    without those routes (they must add nothing: not the rows of an earlier call)."""
-    rank, n = m.rank, LARGE_MAX_TOKENS // 2
-    x, tw, _ = R.make_routing(n, H, E_GLOBAL, TOPK, seed=97 * rank + 5)
-    g = torch.Generator(device="cuda").manual_seed(rank)
-    ti = torch.argsort(torch.rand((n, TOPK), device="cuda", generator=g), dim=1).to(torch.int32)
-    starts = torch.arange(TOPK * WORLD).view(TOPK, WORLD).T * n  # [source, expert]
-    assert ((starts + n <= m.s_cap) | (starts >= m.s_cap)).all(), "a segment cut"
-    kept = (starts + n <= m.s_cap).cuda()
-    ns = [n] * WORLD
-    y = _bounded(functools.partial(m, x, ti, tw, act=act, situ=situ, **knobs))[:n].float()
-    X, TW, TI = (D.gather_rows(t, ns) for t in (m.x_ref(n), tw, ti))
-    src = torch.arange(WORLD, device="cuda").repeat_interleave(n).unsqueeze(1)
-    TI = TI.masked_fill(~kept[src, TI.long()], -1)
-    ref = R.ref_moe(X, TW, TI, raw, rank * E_LOCAL, act, situ, quant_x=False)
-    dist.all_reduce(ref)
-    d = R.cos_diff(ref[rank * n:(rank + 1) * n], y)
-    res = [None] * WORLD
-    dist.all_gather_object(res, (m.rows_needed(), d))
-    assert res[0][0] == WORLD * TOPK * n and all(r[1] < COS_TOL for r in res), (
-        f"overflow {knobs}: (rows needed, cos diff) per rank {res} (cap {m.s_cap})")
-    return max(r[1] for r in res)
+def _check_large_all_to_one(m, raw, act, situ, **knobs):
+    """``_all_to_one_routing`` (LARGE_MAX_TOKENS - 1 tokens per rank): rank 0 receives
+    every route of every rank, none dropped (they must not add the rows of an earlier
+    call either)."""
+    return _check_all_to_one(
+        m, raw, act, situ,
+        lambda x, tw, ti: functools.partial(m, x, ti, tw, act=act, situ=situ, **knobs),
+        **knobs)
 
 
 def _large_worker(rank, port, act):
@@ -474,9 +511,9 @@ def _large_worker(rank, port, act):
                     print(f"large {act} {knobs} {routing}, tokens per rank {ns} (call {rep + 1})"
                           f": cos diff vs reference <= {d:.1e}", flush=True)
     for knobs in LARGE_KNOB_SETS[0::2]:  # both combines, their slots written by the calls above
-        d = _check_large_overflow(m, raw, act, situ, **knobs)
+        d = _check_large_all_to_one(m, raw, act, situ, **knobs)
         if rank == 0:
-            print(f"large {act} {knobs}, rows past s_cap dropped: cos diff vs reference <= "
+            print(f"large {act} {knobs}, every route to rank 0: cos diff vs reference <= "
                   f"{d:.1e}", flush=True)
     D.finish()
 

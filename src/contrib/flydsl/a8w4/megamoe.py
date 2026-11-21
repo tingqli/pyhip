@@ -41,6 +41,7 @@ from .kernels._act import situ_args
 from .kernels._protocol import (
     ARRIVED,
     BLOCK_M,
+    BUFFER_BYTES_MAX,
     E_LOCAL,
     LC_PLAN,
     NPES,
@@ -64,15 +65,17 @@ from .kernels import ep_mega_small as KS
 class MegaMoeEpA8W4:
     """One rank's EP8 MoE layer. ``W``: ``prepare_weights`` of the rank's 32 experts
     (global experts [32 rank, 32 rank + 32)); ``max_tokens``: tokens per rank and call.
-    ``s_cap``: rows this rank can receive (default: twice the uniform-routing average
-    plus one partial block per expert; routes past it are dropped, see ``rows_needed``).
+    ``routes``: routes per token, the real top-k when the ``topk`` slots are padded with -1
+    (default ``topk``). ``s_cap``: rows this rank can receive (default: every route of every
+    rank, 8 x max_tokens x routes, plus one partial block per expert, so no route is
+    dropped; with a smaller ``s_cap`` the routes past it are, see ``rows_needed``).
     ``producers``: producer workgroups (a multiple of 8); ``lag``: gemm2 trails gemm1 by
     this many block pairs of a queue. ``act`` / ``situ``: as ``a8w4_moe``. ``x_quant``:
     the fp8 x sent (``X_QUANTS``: one scale per (row, 128 columns) or per row; the same on
     every rank; ``qx`` = its kernel key, which ``moe_ep``'s solver sets per call)."""
 
     def __init__(self, W, *, rank, max_tokens, topk=8, world=8, s_cap=None, producers=16,
-                 lag=2, act="silu", situ=None, x_quant="per_1x128"):
+                 lag=2, act="silu", situ=None, x_quant="per_1x128", routes=None):
         import mori.shmem as ms
         from mori.shmem import mori_shmem_create_tensor
 
@@ -80,15 +83,19 @@ class MegaMoeEpA8W4:
         assert world == NPES and E == E_LOCAL, "EP8 x 32 local experts"
         assert topk in (1, 2, 4, 8) and producers % QUEUES == 0
         self.W, self.rank, self.topk = W, rank, topk
+        self.routes = routes or topk
+        assert 0 < self.routes <= topk, (self.routes, topk)
         self.H, self.I = W["w2"].shape[1], N2 // 2
         self.producers, self.lag, self.act = producers, lag, act
         self.situ = situ_args(**(situ or {}))
         self.token_shift = max(int(max_tokens - 1).bit_length(), 1)
         self.tcap = 1 << self.token_shift
         bm = BLOCK_M
-        s_cap = s_cap or 2 * self.tcap * topk + E_LOCAL * bm
+        s_cap = s_cap or NPES * self.tcap * self.routes + E_LOCAL * bm
         self.s_cap = -(-s_cap // bm) * bm
         assert self.s_cap < 1 << ROW_BITS
+        assert self.s_cap * self.H < BUFFER_BYTES_MAX, (
+            f"{self.s_cap} receive rows of {self.H} bytes pass 4 GiB: lower max_tokens")
         self.nblk = self.s_cap // bm
         H, I, S = self.H, self.I, self.s_cap
         dev = torch.device("cuda", torch.cuda.current_device())
@@ -300,14 +307,15 @@ class MegaMoeLargeEpA8W4:
 
     ``W``: ``prepare_weights`` of the rank's 32 experts (global experts [32 rank, 32 rank +
     32)), for the shape; ``max_tokens``: tokens per rank and call (rounded up to a power of
-    2, ``tcap``). A rank receives at most ``s_cap`` = 2 tcap topk + 32 x 128 rows (twice the
-    uniform-routing average); rows past it are dropped (``rows_needed``). Symmetric heap:
-    0.47 GB at tcap 4096 (H 4096, top-8; ~linear in tcap). Same contract as
+    2, ``tcap``); ``routes``: routes per token, the real top-k when the ``topk`` slots are
+    padded with -1 (default ``topk``). A rank receives at most ``s_cap`` = 8 tcap routes +
+    32 x 128 rows: every route of every rank, so no route is dropped. Symmetric heap:
+    1.30 GB at tcap 4096 (H 4096, top-8; ~linear in tcap). Same contract as
     ``MegaMoeEpA8W4`` otherwise: every rank makes the same calls (with the same ``comb`` and
     ``x_quant``: they are the wire format), negative topk ids are no routes (their rows stay
     0), CUDA graph capture after one eager call."""
 
-    def __init__(self, W, *, rank, max_tokens, topk=8, world=8):
+    def __init__(self, W, *, rank, max_tokens, topk=8, world=8, routes=None):
         import mori.shmem as ms
         from mori.shmem import mori_shmem_create_tensor
 
@@ -316,18 +324,20 @@ class MegaMoeLargeEpA8W4:
         E, N2, _ = W["w1"].shape
         assert world == NPES and E == E_LOCAL, "EP8 x 32 local experts"
         self.W, self.rank, self.topk = W, rank, topk
+        self.routes = routes or topk
         self.H, self.I = W["w2"].shape[1], N2 // 2
         self.tcap = 1 << max(int(max_tokens - 1).bit_length(), 1)
-        self.s_cap = large_scap(topk, self.tcap)
+        self.s_cap = large_scap(self.routes, self.tcap)
         dev = torch.device("cuda", torch.cuda.current_device())
-        off, nbytes = large_sym_layout(self.H, topk, self.tcap)
+        off, nbytes = large_sym_layout(self.H, topk, self.tcap, self.routes)
         self.sym = mori_shmem_create_tensor((nbytes,), torch.uint8)
         self.sym.zero_()
         torch.cuda.synchronize()
         ms.shmem_barrier_all()
         self.stab = torch.tensor([ms.shmem_ptr_p2p(self.sym.data_ptr(), rank, p)
                                   for p in range(world)], dtype=torch.int64, device=dev)
-        self.ctl = torch.zeros(large_ctl_ints(topk, self.tcap)[1], dtype=torch.int32, device=dev)
+        self.ctl = torch.zeros(large_ctl_ints(topk, self.tcap, self.routes)[1],
+                               dtype=torch.int32, device=dev)
         H, I, S = self.H, self.I, self.s_cap
         self.x8 = torch.empty((self.tcap, H), dtype=torch.uint8, device=dev)
         self.xs = torch.empty(self.tcap * (H // 128), dtype=torch.float32, device=dev)
@@ -342,7 +352,7 @@ class MegaMoeLargeEpA8W4:
         """The kernel specialization of ``knobs`` (``LARGE_KNOBS`` names)."""
         k = dict(LARGE_KNOBS, **knobs)
         return KL.ep_mega_large_kernel.get(H=self.H, I=self.I, TOPK=self.topk, TCAP=self.tcap,
-                                           ACT=act, QX=qx_of(x_quant),
+                                           ACT=act, QX=qx_of(x_quant), ROUTES=self.routes,
                                            **{LARGE_KEYS[n]: v for n, v in k.items()})
 
     def __call__(self, x, topk_ids, topk_weights, W=None, act="silu", situ=None,

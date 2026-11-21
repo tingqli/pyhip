@@ -30,8 +30,12 @@ ARRIVED = FFLAG + NPES
 QUEUES = 8
 QSTRIDE = 16  # i32 between two ticket counters (separate cache lines)
 SCHED_EXPECTED = QUEUES * QSTRIDE
-ROW_BITS = 18
+# a route's send info (ep_mega_comm plan -> ep_mega producers): destination row | global
+# expert << ROW_BITS; 8 expert bits and the sign bit (-1: not sent) leave 23 row bits
+ROW_BITS = 23
 BLOCK_M = 128
+# buffer offsets are 32-bit: a buffer the kernels address by row stays below 4 GiB
+BUFFER_BYTES_MAX = 1 << 32
 # status (local, i32 [8]): [1] rows the last call needed (ep_prep); [STATUS_EPOCH] calls
 # completed (ep_finish advances it; ep_prep / ep_finish flag the call with it + 1)
 STATUS_EPOCH = 2
@@ -75,14 +79,14 @@ SC_TILE = SC_HEAD + 8 * 16
 LARGE_BM = 128  # rows of an m-tile; each local expert's received rows are padded to it
 
 
-def large_scap(TOPK, TCAP):
-    """Rows a rank can receive (a multiple of LARGE_BM): twice the uniform-routing average
-    (TCAP tokens per rank x TOPK routes) plus one partial m-tile per local expert. Rows past
-    it are dropped (the plan reports the rows needed)."""
-    return 2 * TCAP * TOPK + E_LOCAL * LARGE_BM
+def large_scap(ROUTES, TCAP):
+    """Rows a rank can receive (a multiple of LARGE_BM): every route of every rank (NPES x
+    TCAP tokens, ``ROUTES`` routes each: the real top-k, the other slots are -1) plus one
+    partial m-tile per local expert, so no route is dropped."""
+    return NPES * TCAP * ROUTES + E_LOCAL * LARGE_BM
 
 
-def large_sym_layout(H, TOPK, TCAP):
+def large_sym_layout(H, TOPK, TCAP, ROUTES=None):
     """(byte offset of each region, total bytes) of a rank's symmetric buffer. Received
     rows, expert-major (local expert e's rows from its first m-tile on, padded to LARGE_BM;
     inside an expert the sources' segments follow each other, this rank's own first):
@@ -97,8 +101,8 @@ def large_sym_layout(H, TOPK, TCAP):
     per m-tile; ``out`` bf16 [TCAP, H], this rank's output (every rank's experts add into
     it, or the combine sums ``cin`` into it); ``cin`` fp8 [TCAP x TOPK, H] and ``cins`` its
     f32 scales [TCAP x TOPK, H / 128]: the expert rows of this rank's (token, slot) routes,
-    sent back (COMB "fp8")."""
-    S = large_scap(TOPK, TCAP)
+    sent back (COMB "fp8"). ``ROUTES``: routes per token, the real top-k (default TOPK)."""
+    S = large_scap(ROUTES or TOPK, TCAP)
     sizes = (("rx", S * H), ("rsx", S * (H // 128) * 4), ("rw", S * 4), ("rid", S * 4),
              ("cnt", NPES * E_LOCAL * 4), ("pbase", E_GLOBAL * 4), ("cdone", NPES * SMALL_LINE),
              ("pflag", NPES * SMALL_LINE), ("fflag", NPES * SMALL_LINE),
@@ -123,8 +127,8 @@ LC_HEAD = LC_TOP + 16
 LC_TE = LC_HEAD + 8 * 16
 
 
-def large_ctl_ints(TOPK, TCAP):
+def large_ctl_ints(TOPK, TCAP, ROUTES=None):
     """(LC_G1, ints of the control block)."""
-    tiles = large_scap(TOPK, TCAP) // LARGE_BM
+    tiles = large_scap(ROUTES or TOPK, TCAP) // LARGE_BM
     g1 = -(-(LC_TE + tiles) // 16) * 16
     return g1, g1 + 16 * tiles
