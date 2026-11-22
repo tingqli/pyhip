@@ -88,13 +88,13 @@ def parse_config(name):
 # =============================================================================
 
 
-def supported(cfg, shape, *, act="silu", capturing=False, tokens=None):
+def supported(cfg, shape, *, act="silu", capturing=False, tokens=None, prequantized=False):
     """Whether ``cfg`` can run ``shape`` = (H, I, E local, E global, topk) with this
     activation / under CUDA-graph capture / for ``tokens`` rows. Structural limits
     only; a tuned table holds just configs that ran on its shape."""
     H, I, E, EGl, topk = shape
     k = cfg["kind"]
-    if act not in ACTS:
+    if act not in ACTS or (prequantized and not k.startswith("tp")):
         return False
     if k.startswith("tp"):
         if I % 256 or H % 512:
@@ -143,12 +143,12 @@ def _sort(topk_ids, topk_weights, shape, e0, block_m):
                        expert_mask=mask)[:5]
 
 
-def _run_tp2k(cfg, x, W, tw, ti, shape, e0, akw):
+def _run_tp2k(cfg, x, W, tw, ti, shape, e0, akw, x_scale=None):
     H, I, E, _, topk = shape
     bm = cfg["block_m"]
     groups = I // 128
     sids, sw, seids, nv, out = _sort(ti, tw, shape, e0, bm)
-    x8, xs = quantize_rows(x)
+    x8, xs = quantize_rows(x) if x_scale is None else (x, x_scale)
     sorted_size = seids.numel() * bm
     buf = torch.empty(sorted_size * (I + groups * 4), dtype=torch.uint8, device=x.device)
     G1.a8w4_gemm1(x8, xs, W["w1"], W["w1_scale"], W["w1_exp"], sids, seids, nv, buf,
@@ -166,19 +166,19 @@ def _run_tp2k(cfg, x, W, tw, ti, shape, e0, akw):
     return out
 
 
-def _run_tp1k(cfg, x, W, tw, ti, shape, e0, akw):
+def _run_tp1k(cfg, x, W, tw, ti, shape, e0, akw, x_scale=None):
     I, topk = shape[1], shape[4]
     sids, sw, seids, nv, out = _sort(ti, tw, shape, e0, F.BM)
-    x8, xs = quantize_rows(x)
+    x8, xs = quantize_rows(x) if x_scale is None else (x, x_scale)
     ks = cfg["ksplit"]
     return F.a8w4_fmoe_bm64(x8, xs, W, sids, sw, seids, nv, out, topk=topk,
                             b_cache_mod=cfg["bcm"], waves_per_eu=2 if I // ks <= 256 else 1,
                             ksplit=ks, **akw)
 
 
-def _run_tp1kq(cfg, x, W, tw, ti, shape, e0, akw):
+def _run_tp1kq(cfg, x, W, tw, ti, shape, e0, akw, x_scale=None):
     sids, sw, seids, nv, out = _sort(ti, tw, shape, e0, Q.BM)
-    x8, xs = quantize_rows(x)
+    x8, xs = quantize_rows(x) if x_scale is None else (x, x_scale)
     return Q.a8w4_fmoe_bm64q(x8, xs, W, sids, sw, seids, nv, out, topk=shape[4],
                              b_cache_mod=cfg["bcm"], **akw)
 
@@ -195,14 +195,32 @@ RUNNERS = dict(tp2k=_run_tp2k, tp1k=_run_tp1k, tp1kq=_run_tp1kq, ep3k=_run_ep3k,
                ep1k=_run_ep1k)
 
 
+def _check_row_scale(x, x_scale, rows):
+    if (x.dtype != torch.float8_e4m3fnuz or x_scale.dtype != torch.float32
+            or x_scale.shape != (rows,) or x_scale.device != x.device
+            or not x_scale.is_contiguous()):
+        raise ValueError("expected FNUZ input with contiguous FP32 x_scale [M] on the input device")
+
+
 def run_config(cfg, x, W, topk_weights, topk_ids, *, expert_offset=0, num_experts=None,
-               act="silu", situ=None):
+               act="silu", situ=None, x_scale=None):
     """Run one explicit config (dict or name); no table lookup."""
     if isinstance(cfg, str):
         cfg = parse_config(cfg)
     E, H, I = weight_shape(W)
     shape = (H, I, E, num_experts or E, topk_ids.shape[1])
     akw = dict(act=act, **(situ or {}))
+    if x_scale is not None:
+        if x.shape != (topk_ids.shape[0], H) or not x.is_contiguous():
+            raise ValueError("expected contiguous activations [M,H]")
+        _check_row_scale(x, x_scale, topk_ids.shape[0])
+        if not cfg["kind"].startswith("tp"):
+            raise ValueError("prequantized standard MoE requires a TP-family config")
+        if not supported(cfg, shape, act=act, tokens=x.shape[0],
+                         capturing=torch.cuda.is_current_stream_capturing()):
+            raise ValueError(f"unsupported prequantized MoE config {cfg} for shape {shape}")
+        return RUNNERS[cfg["kind"]](cfg, x, W, topk_weights, topk_ids, shape,
+                                    expert_offset, akw, x_scale=x_scale)
     return RUNNERS[cfg["kind"]](cfg, x, W, topk_weights, topk_ids, shape, expert_offset, akw)
 
 
@@ -232,26 +250,26 @@ def _load_table(path, mtime):
             for k, v in pts.items()}
 
 
-def default_config(shape, tokens, act="silu", capturing=False):
+def default_config(shape, tokens, act="silu", capturing=False, prequantized=False):
     """No table row: the EP auto thresholds when the EP kernels fit, else tp2k."""
     for lim, name in EG.AUTO:
         if lim is None or tokens <= lim:
             cfg = dict(kind="ep3k", cfg=name)
-            if supported(cfg, shape, act=act, capturing=capturing, tokens=tokens):
+            if supported(cfg, shape, act=act, capturing=capturing, tokens=tokens, prequantized=prequantized):
                 return cfg
             break
     return dict(kind="tp2k", block_m=64, g1_bcm=1, g2="base")
 
 
 def lookup_config(shape, tokens, *, act="silu", capturing=False, routing="uniform",
-                  csv_path=DEFAULT_CSV):
+                  csv_path=DEFAULT_CSV, prequantized=False):
     """Fastest supported config of the first tuned point >= ``tokens`` (the largest
     point if beyond the table) among the rows of ``act``; ``default_config`` if the
     shape is not tuned."""
     rows = _table_rows(shape, routing, csv_path, act)
     if rows:
-        return _pick(rows, shape, tokens, act, capturing)
-    return default_config(shape, tokens, act, capturing)
+        return _pick(rows, shape, tokens, act, capturing, prequantized)
+    return default_config(shape, tokens, act, capturing, prequantized)
 
 
 def _table_rows(shape, routing, csv_path, act="silu"):
@@ -268,11 +286,11 @@ def _point(rows, tokens):
     return next((c for n, c in rows if n >= tokens), rows[-1][1])
 
 
-def _pick(rows, shape, tokens, act, capturing):
+def _pick(rows, shape, tokens, act, capturing, prequantized=False):
     for _, cfg in _point(rows, tokens):
-        if supported(cfg, shape, act=act, capturing=capturing, tokens=tokens):
+        if supported(cfg, shape, act=act, capturing=capturing, tokens=tokens, prequantized=prequantized):
             return cfg
-    return default_config(shape, tokens, act, capturing)
+    return default_config(shape, tokens, act, capturing, prequantized)
 
 
 def dyn_config(shape, tokens, *, act="silu", routing="uniform", csv_path=DEFAULT_CSV):
@@ -299,7 +317,7 @@ def dyn_config(shape, tokens, *, act="silu", routing="uniform", csv_path=DEFAULT
 
 
 def a8w4_moe(x, W, topk_weights, topk_ids, *, expert_offset=0, num_experts=None, act="silu",
-             situ=None, config=None, routing="uniform", csv_path=DEFAULT_CSV):
+             situ=None, config=None, routing="uniform", csv_path=DEFAULT_CSV, x_scale=None):
     """A8W4 MoE partial sum of this rank's experts: bf16 x [M, H] -> bf16 [M, H].
 
     W: ``prepare_weights`` output (E local experts). topk_weights f32 [M, topk],
@@ -308,21 +326,27 @@ def a8w4_moe(x, W, topk_weights, topk_ids, *, expert_offset=0, num_experts=None,
     (defaults: 0 / E = TP). act: "silu" | "situv2" (situ: dict(situ_beta,
     situ_linear_beta, swiglu_limit); all kernel families). config: a config (dict or
     name, see ``config_name``) to force, else the tuned table at ``csv_path`` decides.
+    For prequantized FNUZ input, pass contiguous FP32 x_scale [M], one scale per row.
+    The TP family consumes the supplied pair directly, including during graph capture.
     Under CUDA-graph capture only graph-safe configs are picked."""
     E, H, I = weight_shape(W)
     M, topk = topk_ids.shape
-    assert x.dtype == torch.bfloat16 and x.shape == (M, H) and x.is_contiguous(), x.shape
+    assert x.shape == (M, H) and x.is_contiguous(), x.shape
+    if x_scale is None:
+        assert x.dtype == torch.bfloat16, "FNUZ input requires per-row x_scale"
     assert topk_ids.dtype == torch.int32 and topk_weights.dtype == torch.float32
     assert topk_weights.shape == (M, topk)
     if M == 0:
-        return x.new_empty((0, H))
+        if x_scale is not None:
+            _check_row_scale(x, x_scale, M)
+        return x.new_empty((0, H), dtype=torch.bfloat16)
     shape = (H, I, E, num_experts or E, topk)
     if config is None:
         config = lookup_config(shape, M, act=act,
                                capturing=torch.cuda.is_current_stream_capturing(),
-                               routing=routing, csv_path=csv_path)
+                               routing=routing, csv_path=csv_path, prequantized=x_scale is not None)
     return run_config(config, x, W, topk_weights, topk_ids, expert_offset=expert_offset,
-                      num_experts=num_experts, act=act, situ=situ)
+                      num_experts=num_experts, act=act, situ=situ, x_scale=x_scale)
 
 
 def a8w4_moe_dyn(x, W, topk_weights, topk_ids, m_valid, *, x_scale=None, expert_offset=0,
