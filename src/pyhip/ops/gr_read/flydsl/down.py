@@ -228,7 +228,10 @@ def make_decode_down(rows, bm=None, dn=None, waves=4, bk=128, prefetch_unroll=No
     prefetch_unroll = tile_unroll if prefetch_unroll is None else prefetch_unroll
     split = 4
     assert dn % 16 == 0 and R % dn == 0 and bm % 16 == 0 and bm * dn * waves * 4 <= 65536
+    assert waves > 0 and bk > 0 and K % (waves * bk * split) == 0
+    assert prefetch_unroll in (1, 2)
     iterations = K // waves // bk // split
+    assert (iterations - 1) % prefetch_unroll == 0
     m_tiles = (rows + bm - 1) // bm
 
     @fx.struct
