@@ -205,12 +205,14 @@ def make_down(*, n_splits=1, block_m=64, num_waves=4, block_k=64, swizzle_shift=
     return launch_down
 
 
-# Decode T1..32: global split-K=4, compact FP32 P[4,rows,R].
+# Decode T1..64: global split-K=4, compact FP32 P[4,rows,R]. The defaults are the
+# original T<=32 tile; host._down_tile picks a wider column tile per row range.
 @cache
-def make_decode_down(rows):
-    (bm, bk, waves) = (16 if rows <= 16 else 32, 128, 4)
-    (split, dn) = (4, 16)
-    prefetch_unroll = 2 if rows <= 25 else 1
+def make_decode_down(rows, bm=None, dn=16, waves=4, bk=128, prefetch_unroll=None):
+    bm = bm if bm is not None else (16 if rows <= 16 else 32)
+    split = 4
+    prefetch_unroll = prefetch_unroll if prefetch_unroll is not None else (2 if rows <= 25 else 1)
+    assert dn % 16 == 0 and R % dn == 0 and bm % 16 == 0 and bm * dn * waves * 4 <= 65536
     iterations = K // waves // bk // split
     m_tiles = (rows + bm - 1) // bm
 

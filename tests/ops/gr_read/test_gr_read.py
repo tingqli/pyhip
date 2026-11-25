@@ -265,7 +265,7 @@ if "pytest" in sys.modules:
         assert all(ref() is None for ref in refs), 'compiled cache must not retain caller tensors'
 
 
-    @pytest.mark.parametrize('row_sizes', ((33, 64, 65, 127, 128),
+    @pytest.mark.parametrize('row_sizes', ((65, 96, 127, 128),
                                          (513, 768, 1023, 1024),
                                          (2049, 2304, 2559, 2560)))
     def test_api_prefill_runtime_rows(monkeypatch, row_sizes):
@@ -302,7 +302,13 @@ if "pytest" in sys.modules:
             assert len(host._compiled_calls) == 1
 
 
-    @pytest.mark.parametrize('rows', (17, 24, 33, 513))
+    def test_decode_row_limit_matches_testing():
+        from pyhip.ops.gr_read.flydsl import host
+        from pyhip.testing import gr_read as testing
+        assert testing.DECODE_MAX_ROWS == host.DECODE_MAX_ROWS
+
+
+    @pytest.mark.parametrize('rows', (17, 24, 33, 64, 65, 513))
     def test_api_graph_workspaces(monkeypatch, rows):
         import torch
         x, wd, wu, pd, pu = api_inputs(rows)
@@ -327,10 +333,10 @@ if "pytest" in sys.modules:
                 y2 = host.gr_read(x2, pd, pu)
         assert len(allocations) == 4
         assert len({t.data_ptr() for t, _ in allocations}) == 4
-        p_shape = (4 * rows * R,) if rows <= 32 else (rows, R)
+        p_shape = (4 * rows * R,) if rows <= host.DECODE_MAX_ROWS else (rows, R)
         partials = [t for t, _ in allocations if tuple(t.shape) == p_shape]
         assert len(partials) == 2
-        assert all(p.dtype == (torch.float32 if rows <= 32 else torch.bfloat16) for p in partials)
+        assert all(p.dtype == (torch.float32 if rows <= host.DECODE_MAX_ROWS else torch.bfloat16) for p in partials)
         for live in (rows, min(rows, 17), 0, rows):
             x[:live].mul_(.9).add_(.015625)
             x[live:].fill_(float('nan'))
@@ -340,10 +346,10 @@ if "pytest" in sys.modules:
             for t, _ in allocations:
                 t.fill_(float('nan'))
             graph.replay()
-            reference = (decode_reference(x[:live], wd, wu) if rows <= 32
+            reference = (decode_reference(x[:live], wd, wu) if rows <= host.DECODE_MAX_ROWS
                          else reference_bf16(x[:live], wd, wu)[1].double())
             assert_decode_close(y[:live], reference, 'fixed T and valid prefix')
-            reference2 = (decode_reference(x2, wd, wu) if rows <= 32
+            reference2 = (decode_reference(x2, wd, wu) if rows <= host.DECODE_MAX_ROWS
                           else reference_bf16(x2, wd, wu)[1].double())
             assert_decode_close(y2, reference2, 'independent P/Y for second call')
             torch.testing.assert_close(x, before, rtol=0, atol=0, equal_nan=True)
@@ -478,7 +484,7 @@ if "pytest" in sys.modules:
         assert path.read_text() == report
 
 
-    @pytest.mark.parametrize('rows,record_partials', ((33, True), (513, True), (33, False)))
+    @pytest.mark.parametrize('rows,record_partials', ((65, True), (513, True), (65, False)))
     def test_prefill_total_sample_addresses(monkeypatch, rows, record_partials):
         import weakref
         import torch
