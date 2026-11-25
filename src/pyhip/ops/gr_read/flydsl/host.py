@@ -128,26 +128,13 @@ class GRReadPrefill:
         return self.output
 
 
-# Split-K decode pair serves T1..64. Down tile by row range (gfx942, graph-timed): a wider
-# column tile cuts how often each N tile re-reads X while keeping 80 workgroups.
-#   T<=18: original tile (16x16 / 32x16; 16x32 measured 0.1-0.35 us slower at T17..18).
-#   T19..32: 16x32 (same K split, bit-exact).
-#   T33..64: 16x64 (previously the prefill pair; T64 30.1 -> 24.3 us).
+# The split-K decode pair serves T1..64; the Down tile per row range is down.decode_down_tile.
 DECODE_MAX_ROWS = 64
-
-
-def _down_tile(rows):
-    if rows <= 18:
-        return {}
-    if rows <= 32:
-        return dict(bm=16, dn=32, waves=4, bk=128, prefetch_unroll=2)
-    return dict(bm=16, dn=64, waves=4, bk=128, prefetch_unroll=2)
 
 
 @cache
 def _decode_pair_launcher(rows):
-    down = make_decode_down(rows, **_down_tile(rows))
-    up = make_decode_up(rows)
+    down, up = make_decode_down(rows), make_decode_up(rows)
 
     @flyc.jit
     def launch(X: fx.Tensor, WD: fx.Tensor, WU: fx.Tensor, P: fx.Tensor, Y: fx.Tensor, stream: fx.Stream):

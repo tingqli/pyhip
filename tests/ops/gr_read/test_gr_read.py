@@ -302,6 +302,13 @@ if "pytest" in sys.modules:
             assert len(host._compiled_calls) == 1
 
 
+    @pytest.mark.parametrize('rows', (1, 17, 19, 32, 33, 64))
+    def test_isolated_decode_stages_use_api_tile(rows):
+        """The isolated Down/Up check builds the same decode kernels as the public API."""
+        _, wd, wu, pd, pu = api_inputs(rows)
+        assert check_decode_stages(rows, wd, wu, pd, pu, seed=11)["passed"]
+
+
     def test_decode_row_limit_matches_testing():
         from pyhip.ops.gr_read.flydsl import host
         from pyhip.testing import gr_read as testing
