@@ -1,0 +1,231 @@
+# Output of: python tests/contrib/gemm/audit_gemm_2x4_lds_pipeline_gfx942.py --dump $ISA   (then --isa $ISA --report, and --self-test)
+# FlyDSL 0.4.0, gfx942, COMPILE_ONLY ISA dumps; $ISA = ISA dump directory
+
+== pf1_n4096_k16384_pre1: pf1 N=4096 K=16384 (KB=128) preshuffle_b=1  ($ISA/pf1_n4096_k16384_pre1/gemm_kernel_0/22_final_isa.s)
+resources: VGPR 240 (spill 0), AGPR 0, SGPR 50 (spill 0), scratch 0 B, LDS 65536 B
+emulated: workgroup 37 of M=4096, C tile rows 3072..3327 cols 1024..1279; 8 waves, 387392 instructions, 1026 barrier epochs
+barriers: 1026 s_barrier per wave (all waves equal); group-conditional: line 240 (waves 0-3 x0, waves 4-7 x1), line 1183 (waves 0-3 x1, waves 4-7 x0)
+stagger: first MFMA in epoch 2 (waves 0-3) and 3 (waves 4-7): waves 4-7 trail by 1 barrier
+registers: 0 async hazards (0 VGPR, 0 SGPR/AGPR) over all VMEM/LDS/SMEM loads incl. inline-asm s_buffer_load
+LDS: 32832 ds ops of 8 waves checked per dword; 0 RAW/WAR/WAW violations, 0 reads of unwritten LDS
+  min slack in barriers, across groups, all epochs: RAW A0:0 A1:2 A2:4 A3:4 B0:0 B1:0 B2:0 B3:0; WAR A0:0 A1:0 A2:0 A3:0 B0:0 B1:2 B2:4 B3:4
+  min slack in barriers, across groups, epoch >= 10: RAW A0:4 A1:4 A2:4 A3:4 B0:4 B1:2 B2:0 B3:0; WAR A0:0 A1:0 A2:0 A3:0 B0:0 B1:2 B2:4 B3:4
+  min slack in barriers, within a group, all epochs: RAW A0:0 A1:2 A2:4 A3:5 B0:0 B1:0 B2:0 B3:0; WAR A0:1 A1:1 A2:1 A3:1 B0:1 B1:3 B2:5 B3:5
+data path: 131072 MFMA operand checks, 131072 FMA retirements, 256 BF16x2 stores (65536 BF16 values bit-checked on synthetic accumulators); C tile covered exactly once
+LDS writes: 0 ds_write instructions with lanes writing the same dword
+partials (wave 0): retired 0..2 epochs after their last MFMA
+K block 2, wave 0 (group 0; group 1 runs every epoch one barrier later):
+ epoch | phase    | ds_write          | ds_read                          | loads issued (data K block)          | waits vm/lgkm (retired) | MFMA | VALU
+    17 | k2.s0 M  | A3(k2)            | B0(k2) B1(k2) B0(k2) B1(k2) B2(k2) B3(k2) B2(k2) B3(k2) A0(k2)x4 | sA1.0(k2) sA1.1(k2) A0(k3) B0(k3)    | vm0(3) lgkm0(13)        |    0 | 0
+    18 | k2.s0 C  |                   |                                  | s:sB0(k3) s:sB1(k3)                  | vm5(0) vm4(0)           |   32 | 36
+    19 | k2.s1 M  | A0(k3) B0(k3)     | A1(k2)x4                         | sA2.0(k2) sA2.1(k2) A1(k3) B1(k3)    | vm1(3) vm0(1) lgkm0(8)  |    0 | 0
+    20 | k2.s1 C  |                   |                                  |                                      |                         |   32 | 36
+    21 | k2.s2 M  | A1(k3) B1(k3)     | A2(k2)x4                         | sA3.0(k2) sA3.1(k2) A2(k3) B2(k3) B3(k3) | vm1(3) vm0(1) lgkm0(6)  |    0 | 0
+    22 | k2.s2 C  |                   |                                  |                                      |                         |   32 | 36
+    23 | k2.s3 M  | A2(k3) B2(k3) B3(k3) | A3(k2)x4                         | sA0.0(k3) sA0.1(k3) A3(k3)           | vm2(3) vm1(1) vm0(1) lgkm0(7) |    0 | 0
+    24 | k2.s3 C  |                   |                                  |                                      |                         |   32 | 36
+RESULT: PASS
+
+== pf1_n4096_k16384_pre0: pf1 N=4096 K=16384 (KB=128) preshuffle_b=0  ($ISA/pf1_n4096_k16384_pre0/gemm_kernel_0/22_final_isa.s)
+resources: VGPR 236 (spill 0), AGPR 0, SGPR 48 (spill 0), scratch 0 B, LDS 65536 B
+emulated: workgroup 37 of M=4096, C tile rows 3072..3327 cols 1024..1279; 8 waves, 386216 instructions, 1026 barrier epochs
+barriers: 1026 s_barrier per wave (all waves equal); group-conditional: line 221 (waves 0-3 x0, waves 4-7 x1), line 1162 (waves 0-3 x1, waves 4-7 x0)
+stagger: first MFMA in epoch 2 (waves 0-3) and 3 (waves 4-7): waves 4-7 trail by 1 barrier
+registers: 0 async hazards (0 VGPR, 0 SGPR/AGPR) over all VMEM/LDS/SMEM loads incl. inline-asm s_buffer_load
+LDS: 32832 ds ops of 8 waves checked per dword; 0 RAW/WAR/WAW violations, 0 reads of unwritten LDS
+  min slack in barriers, across groups, all epochs: RAW A0:0 A1:2 A2:4 A3:4 B0:0 B1:0 B2:0 B3:0; WAR A0:0 A1:0 A2:0 A3:0 B0:0 B1:2 B2:4 B3:4
+  min slack in barriers, across groups, epoch >= 10: RAW A0:4 A1:4 A2:4 A3:4 B0:4 B1:2 B2:0 B3:0; WAR A0:0 A1:0 A2:0 A3:0 B0:0 B1:2 B2:4 B3:4
+  min slack in barriers, within a group, all epochs: RAW A0:0 A1:2 A2:4 A3:5 B0:0 B1:0 B2:0 B3:0; WAR A0:1 A1:1 A2:1 A3:1 B0:1 B1:3 B2:5 B3:5
+data path: 131072 MFMA operand checks, 131072 FMA retirements, 256 BF16x2 stores (65536 BF16 values bit-checked on synthetic accumulators); C tile covered exactly once
+LDS writes: 0 ds_write instructions with lanes writing the same dword
+partials (wave 0): retired 0..2 epochs after their last MFMA
+K block 2, wave 0 (group 0; group 1 runs every epoch one barrier later):
+ epoch | phase    | ds_write          | ds_read                          | loads issued (data K block)          | waits vm/lgkm (retired) | MFMA | VALU
+    17 | k2.s0 M  | A3(k2)            | B0(k2) B1(k2) B0(k2) B1(k2) B2(k2) B3(k2) B2(k2) B3(k2) A0(k2)x4 | sA1.0(k2) sA1.1(k2) A0(k3) B0(k3)    | vm0(3) lgkm0(13)        |    0 | 0
+    18 | k2.s0 C  |                   |                                  | s:sB0(k3) s:sB1(k3)                  | vm5(0) vm4(0)           |   32 | 36
+    19 | k2.s1 M  | A0(k3) B0(k3)     | A1(k2)x4                         | sA2.0(k2) sA2.1(k2) A1(k3) B1(k3)    | vm1(3) vm0(1) lgkm0(8)  |    0 | 0
+    20 | k2.s1 C  |                   |                                  |                                      |                         |   32 | 36
+    21 | k2.s2 M  | A1(k3) B1(k3)     | A2(k2)x4                         | sA3.0(k2) sA3.1(k2) A2(k3) B2(k3) B3(k3) | vm1(3) vm0(1) lgkm0(6)  |    0 | 0
+    22 | k2.s2 C  |                   |                                  |                                      |                         |   32 | 36
+    23 | k2.s3 M  | A2(k3) B2(k3) B3(k3) | A3(k2)x4                         | sA0.0(k3) sA0.1(k3) A3(k3)           | vm2(3) vm1(1) vm0(1) lgkm0(7) |    0 | 0
+    24 | k2.s3 C  |                   |                                  |                                      |                         |   32 | 36
+RESULT: PASS
+
+== pf1_n4096_k640_pre1: pf1 N=4096 K=640 (KB=5) preshuffle_b=1  ($ISA/pf1_n4096_k640_pre1/gemm_kernel_0/22_final_isa.s)
+resources: VGPR 238 (spill 0), AGPR 0, SGPR 44 (spill 0), scratch 0 B, LDS 65536 B
+emulated: workgroup 37 of M=4096, C tile rows 3072..3327 cols 1024..1279; 8 waves, 20216 instructions, 42 barrier epochs
+barriers: 42 s_barrier per wave (all waves equal); group-conditional: line 244 (waves 0-3 x0, waves 4-7 x1), line 1418 (waves 0-3 x1, waves 4-7 x0)
+stagger: first MFMA in epoch 2 (waves 0-3) and 3 (waves 4-7): waves 4-7 trail by 1 barrier
+registers: 0 async hazards (0 VGPR, 0 SGPR/AGPR) over all VMEM/LDS/SMEM loads incl. inline-asm s_buffer_load
+LDS: 1344 ds ops of 8 waves checked per dword; 0 RAW/WAR/WAW violations, 0 reads of unwritten LDS
+  min slack in barriers, across groups, all epochs: RAW A0:0 A1:2 A2:4 A3:4 B0:0 B1:0 B2:0 B3:0; WAR A0:0 A1:0 A2:0 A3:0 B0:0 B1:2 B2:4 B3:4
+  min slack in barriers, across groups, epoch >= 10: RAW A0:4 A1:4 A2:4 A3:4 B0:4 B1:2 B2:0 B3:0; WAR A0:0 A1:0 A2:0 A3:0 B0:0 B1:2 B2:4 B3:4
+  min slack in barriers, within a group, all epochs: RAW A0:0 A1:2 A2:4 A3:5 B0:0 B1:0 B2:0 B3:0; WAR A0:1 A1:1 A2:1 A3:1 B0:1 B1:3 B2:5 B3:5
+data path: 5120 MFMA operand checks, 5120 FMA retirements, 256 BF16x2 stores (65536 BF16 values bit-checked on synthetic accumulators); C tile covered exactly once
+LDS writes: 0 ds_write instructions with lanes writing the same dword
+partials (wave 0): retired 0..2 epochs after their last MFMA
+K block 2, wave 0 (group 0; group 1 runs every epoch one barrier later):
+ epoch | phase    | ds_write          | ds_read                          | loads issued (data K block)          | waits vm/lgkm (retired) | MFMA | VALU
+    17 | k2.s0 M  | A3(k2)            | B0(k2) B1(k2) B0(k2) B1(k2) B2(k2) B3(k2) B2(k2) B3(k2) A0(k2)x4 | sA1.0(k2) sA1.1(k2) A0(k3) B0(k3)    | vm0(3) lgkm0(13)        |    0 | 0
+    18 | k2.s0 C  |                   |                                  | s:sB0(k3) s:sB1(k3)                  |                         |   32 | 36
+    19 | k2.s1 M  | A0(k3) B0(k3)     | A1(k2)x4                         | sA2.0(k2) sA2.1(k2) A1(k3) B1(k3)    | vm1(3) vm0(1) lgkm0(8)  |    0 | 0
+    20 | k2.s1 C  |                   |                                  |                                      |                         |   32 | 36
+    21 | k2.s2 M  | A1(k3) B1(k3)     | A2(k2)x4                         | sA3.0(k2) sA3.1(k2) A2(k3) B2(k3) B3(k3) | vm1(3) vm0(1) lgkm0(6)  |    0 | 0
+    22 | k2.s2 C  |                   |                                  |                                      |                         |   32 | 36
+    23 | k2.s3 M  | A2(k3) B2(k3) B3(k3) | A3(k2)x4                         | sA0.0(k3) sA0.1(k3) A3(k3)           | vm2(3) vm1(1) vm0(1) lgkm0(7) |    0 | 0
+    24 | k2.s3 C  |                   |                                  |                                      |                         |   32 | 36
+RESULT: PASS
+
+== pf1_n4096_k128_pre1: pf1 N=4096 K=128 (KB=1) preshuffle_b=1  ($ISA/pf1_n4096_k128_pre1/gemm_kernel_0/22_final_isa.s)
+resources: VGPR 174 (spill 0), AGPR 0, SGPR 37 (spill 0), scratch 0 B, LDS 65536 B
+emulated: workgroup 37 of M=4096, C tile rows 3072..3327 cols 1024..1279; 8 waves, 7960 instructions, 10 barrier epochs
+barriers: 10 s_barrier per wave (all waves equal); group-conditional: line 237 (waves 0-3 x0, waves 4-7 x1), line 484 (waves 0-3 x1, waves 4-7 x0)
+stagger: first MFMA in epoch 2 (waves 0-3) and 3 (waves 4-7): waves 4-7 trail by 1 barrier
+registers: 8 async hazards (0 VGPR, 8 SGPR/AGPR) over all VMEM/LDS/SMEM loads incl. inline-asm s_buffer_load
+LDS: 320 ds ops of 8 waves checked per dword; 0 RAW/WAR/WAW violations, 0 reads of unwritten LDS
+  min slack in barriers, across groups, all epochs: RAW A0:0 A1:2 A2:4 A3:4 B0:0 B1:0 B2:0 B3:0; WAR A0:0 A1:0 A2:0 B0:0 B1:2 B2:4 B3:4
+  min slack in barriers, across groups, epoch >= 10: -
+  min slack in barriers, within a group, all epochs: RAW A0:0 A1:2 A2:4 A3:5 B0:0 B1:0 B2:0 B3:0; WAR A0:1 A1:1 A2:1 B0:1 B1:3 B2:5 B3:5
+data path: 1024 MFMA operand checks, 1024 FMA retirements, 256 BF16x2 stores (65536 BF16 values bit-checked on synthetic accumulators); C tile covered exactly once
+LDS writes: 0 ds_write instructions with lanes writing the same dword
+partials (wave 0): retired 2..8 epochs after their last MFMA
+K block 0, wave 0 (group 0; group 1 runs every epoch one barrier later):
+ epoch | phase    | ds_write          | ds_read                          | loads issued (data K block)          | waits vm/lgkm (retired) | MFMA | VALU
+     1 | k0.s0 M  | A3(k0)            | B0(k0) B1(k0) B0(k0) B1(k0) B2(k0) B3(k0) B2(k0) B3(k0) A0(k0)x4 | sA1.0(k0) sA1.1(k0) A0(k0) B0(k0)    | lgkm0(13)               |    0 | 32
+     2 | k0.s0 C  |                   |                                  | s:sB0(k0) s:sB1(k0)                  |                         |   32 | 0
+     3 | k0.s1 M  | A0(k0) B0(k0)     | A1(k0)x4                         | sA2.0(k0) sA2.1(k0) A1(k0) B1(k0)    | vm1(5) vm0(1) lgkm0(8)  |    0 | 0
+     4 | k0.s1 C  |                   |                                  |                                      |                         |   32 | 0
+     5 | k0.s2 M  | A1(k0) B1(k0)     | A2(k0)x4                         | sA3.0(k0) sA3.1(k0) A2(k0) B2(k0) B3(k0) | vm1(3) vm0(1) lgkm0(6)  |    0 | 0
+     6 | k0.s2 C  |                   |                                  |                                      |                         |   32 | 0
+     7 | k0.s3 M  | A2(k0) B2(k0) B3(k0) | A3(k0)x4                         |                                      | vm2(3) vm1(1) vm0(1) lgkm0(7) |    0 | 0
+     8 | k0.s3 C  |                   |                                  |                                      |                         |   32 | 0
+  FAIL [register] WAW s10: wave 0 line 300 's_buffer_load_dword s10, s[16:19], s28' while line 296 's_buffer_load_dword s10, s[16:19], s27' (epoch 2) is in flight
+  FAIL [register] WAW s10: wave 1 line 300 's_buffer_load_dword s10, s[16:19], s28' while line 296 's_buffer_load_dword s10, s[16:19], s27' (epoch 2) is in flight
+  FAIL [register] WAW s10: wave 2 line 300 's_buffer_load_dword s10, s[16:19], s28' while line 296 's_buffer_load_dword s10, s[16:19], s27' (epoch 2) is in flight
+  FAIL [register] WAW s10: wave 3 line 300 's_buffer_load_dword s10, s[16:19], s28' while line 296 's_buffer_load_dword s10, s[16:19], s27' (epoch 2) is in flight
+  FAIL [register] WAW s10: wave 4 line 300 's_buffer_load_dword s10, s[16:19], s28' while line 296 's_buffer_load_dword s10, s[16:19], s27' (epoch 3) is in flight
+  FAIL [register] WAW s10: wave 5 line 300 's_buffer_load_dword s10, s[16:19], s28' while line 296 's_buffer_load_dword s10, s[16:19], s27' (epoch 3) is in flight
+  FAIL [register] WAW s10: wave 6 line 300 's_buffer_load_dword s10, s[16:19], s28' while line 296 's_buffer_load_dword s10, s[16:19], s27' (epoch 3) is in flight
+  FAIL [register] WAW s10: wave 7 line 300 's_buffer_load_dword s10, s[16:19], s28' while line 296 's_buffer_load_dword s10, s[16:19], s27' (epoch 3) is in flight
+RESULT: FAIL (8)
+
+== pf2_n4096_k16384_pre1: pf2 N=4096 K=16384 (KB=128) preshuffle_b=1  ($ISA/pf2_n4096_k16384_pre1/gemm_kernel_0/22_final_isa.s)
+resources: VGPR 250 (spill 0), AGPR 0, SGPR 42 (spill 0), scratch 0 B, LDS 65536 B
+emulated: workgroup 37 of M=4096, C tile rows 1280..1535 cols 1024..1279; 8 waves, 410624 instructions, 1026 barrier epochs
+barriers: 1026 s_barrier per wave (all waves equal); group-conditional: line 187 (waves 0-3 x0, waves 4-7 x1), line 748 (waves 0-3 x1, waves 4-7 x0)
+stagger: first MFMA in epoch 2 (waves 0-3) and 3 (waves 4-7): waves 4-7 trail by 1 barrier
+registers: 0 async hazards (0 VGPR, 0 SGPR/AGPR) over all VMEM/LDS/SMEM loads incl. inline-asm s_buffer_load
+LDS: 32824 ds ops of 8 waves checked per dword; 0 RAW/WAR/WAW violations, 0 reads of unwritten LDS
+  min slack in barriers, across groups, all epochs: RAW A0:0 A1:2 A2:4 A3:4 B0:0 B1:0 B2:1 B3:1; WAR A0:0 A1:0 A2:0 A3:0 B0:0 B1:2 B2:1 B3:3
+  min slack in barriers, across groups, epoch >= 10: RAW A0:4 A1:4 A2:4 A3:4 B0:4 B1:2 B2:3 B3:1; WAR A0:0 A1:0 A2:0 A3:0 B0:0 B1:2 B2:1 B3:3
+  min slack in barriers, within a group, all epochs: RAW A0:0 A1:2 A2:4 A3:5 B0:0 B1:0 B2:1 B3:1; WAR A0:1 A1:1 A2:1 A3:1 B0:1 B1:3 B2:2 B3:4
+data path: 131072 MFMA operand checks, 131072 FMA retirements, 256 BF16x2 stores (65536 BF16 values bit-checked on synthetic accumulators); C tile covered exactly once
+LDS writes: 0 ds_write instructions with lanes writing the same dword
+partials (wave 0): retired 0..2 epochs after their last MFMA
+K block 2, wave 0 (group 0; group 1 runs every epoch one barrier later):
+ epoch | phase    | ds_write          | ds_read                          | loads issued (data K block)          | waits vm/lgkm (retired) | MFMA | VALU
+    17 | k2.s0 M  | A3(k2)            | B0(k2) B1(k2) B0(k2) B1(k2) A0(k2)x4 | sB0(k3) sB1(k3) sA3.0(k2) sA3.1(k2) A1(k3) B2(k3) | vm13(3) lgkm0(9)        |    0 | 6
+    18 | k2.s0 C  |                   | B2(k2) B3(k2) B2(k2) B3(k2)      |                                      | vm7(6) lgkm3(1) vm6(1) lgkm2(1) lgkm1(1) lgkm0(1) |   32 | 36
+    19 | k2.s1 M  | A0(k3) B0(k3)     | A1(k2)x4                         | A2(k3) B3(k3) sA0.0(k3) sA0.1(k3)    | lgkm0(6)                |    0 | 2
+    20 | k2.s1 C  |                   |                                  |                                      |                         |   32 | 36
+    21 | k2.s2 M  | A1(k3) B1(k3) B2(k3) | A2(k2)x4                         | A3(k3) B0(k4) sA1.0(k3) sA1.1(k3)    | vm9(5) vm8(1) lgkm0(7)  |    0 | 2
+    22 | k2.s2 C  |                   |                                  |                                      |                         |   32 | 36
+    23 | k2.s3 M  | A2(k3) B3(k3)     | A3(k2)x4                         | A0(k4) B1(k4) sA2.0(k3) sA2.1(k3)    | vm11(1) vm10(1) lgkm0(6) |    0 | 2
+    24 | k2.s3 C  |                   |                                  |                                      |                         |   32 | 36
+RESULT: PASS
+
+== pf2_n4096_k16384_pre0: pf2 N=4096 K=16384 (KB=128) preshuffle_b=0  ($ISA/pf2_n4096_k16384_pre0/gemm_kernel_0/22_final_isa.s)
+resources: VGPR 244 (spill 0), AGPR 0, SGPR 41 (spill 0), scratch 0 B, LDS 65536 B
+emulated: workgroup 37 of M=4096, C tile rows 1280..1535 cols 1024..1279; 8 waves, 410480 instructions, 1026 barrier epochs
+barriers: 1026 s_barrier per wave (all waves equal); group-conditional: line 168 (waves 0-3 x0, waves 4-7 x1), line 729 (waves 0-3 x1, waves 4-7 x0)
+stagger: first MFMA in epoch 2 (waves 0-3) and 3 (waves 4-7): waves 4-7 trail by 1 barrier
+registers: 0 async hazards (0 VGPR, 0 SGPR/AGPR) over all VMEM/LDS/SMEM loads incl. inline-asm s_buffer_load
+LDS: 32824 ds ops of 8 waves checked per dword; 0 RAW/WAR/WAW violations, 0 reads of unwritten LDS
+  min slack in barriers, across groups, all epochs: RAW A0:0 A1:2 A2:4 A3:4 B0:0 B1:0 B2:1 B3:1; WAR A0:0 A1:0 A2:0 A3:0 B0:0 B1:2 B2:1 B3:3
+  min slack in barriers, across groups, epoch >= 10: RAW A0:4 A1:4 A2:4 A3:4 B0:4 B1:2 B2:3 B3:1; WAR A0:0 A1:0 A2:0 A3:0 B0:0 B1:2 B2:1 B3:3
+  min slack in barriers, within a group, all epochs: RAW A0:0 A1:2 A2:4 A3:5 B0:0 B1:0 B2:1 B3:1; WAR A0:1 A1:1 A2:1 A3:1 B0:1 B1:3 B2:2 B3:4
+data path: 131072 MFMA operand checks, 131072 FMA retirements, 256 BF16x2 stores (65536 BF16 values bit-checked on synthetic accumulators); C tile covered exactly once
+LDS writes: 0 ds_write instructions with lanes writing the same dword
+partials (wave 0): retired 0..2 epochs after their last MFMA
+K block 2, wave 0 (group 0; group 1 runs every epoch one barrier later):
+ epoch | phase    | ds_write          | ds_read                          | loads issued (data K block)          | waits vm/lgkm (retired) | MFMA | VALU
+    17 | k2.s0 M  | A3(k2)            | B0(k2) B1(k2) B0(k2) B1(k2) A0(k2)x4 | A1(k3) B2(k3) sB0(k3) sB1(k3) sA3.0(k2) sA3.1(k2) | vm13(3) lgkm0(9)        |    0 | 6
+    18 | k2.s0 C  |                   | B2(k2) B3(k2) B2(k2) B3(k2)      |                                      | vm7(6) lgkm3(1) vm6(1) lgkm2(1) lgkm1(1) lgkm0(1) |   32 | 36
+    19 | k2.s1 M  | A0(k3) B0(k3)     | A1(k2)x4                         | A2(k3) B3(k3) sA0.0(k3) sA0.1(k3)    | lgkm0(6)                |    0 | 2
+    20 | k2.s1 C  |                   |                                  |                                      |                         |   32 | 36
+    21 | k2.s2 M  | A1(k3) B1(k3) B2(k3) | A2(k2)x4                         | A3(k3) B0(k4) sA1.0(k3) sA1.1(k3)    | vm13(1) vm12(1) lgkm0(7) |    0 | 2
+    22 | k2.s2 C  |                   |                                  |                                      |                         |   32 | 36
+    23 | k2.s3 M  | A2(k3) B3(k3)     | A3(k2)x4                         | A0(k4) B1(k4) sA2.0(k3) sA2.1(k3)    | vm11(5) vm10(1) lgkm0(6) |    0 | 2
+    24 | k2.s3 C  |                   |                                  |                                      |                         |   32 | 36
+RESULT: PASS
+
+== pf2_n4096_k640_pre1: pf2 N=4096 K=640 (KB=5) preshuffle_b=1  ($ISA/pf2_n4096_k640_pre1/gemm_kernel_0/22_final_isa.s)
+resources: VGPR 250 (spill 0), AGPR 0, SGPR 41 (spill 0), scratch 0 B, LDS 65536 B
+emulated: workgroup 37 of M=4096, C tile rows 1280..1535 cols 1024..1279; 8 waves, 25960 instructions, 42 barrier epochs
+barriers: 42 s_barrier per wave (all waves equal); group-conditional: line 190 (waves 0-3 x0, waves 4-7 x1), line 754 (waves 0-3 x1, waves 4-7 x0)
+stagger: first MFMA in epoch 2 (waves 0-3) and 3 (waves 4-7): waves 4-7 trail by 1 barrier
+registers: 0 async hazards (0 VGPR, 0 SGPR/AGPR) over all VMEM/LDS/SMEM loads incl. inline-asm s_buffer_load
+LDS: 1336 ds ops of 8 waves checked per dword; 0 RAW/WAR/WAW violations, 0 reads of unwritten LDS
+  min slack in barriers, across groups, all epochs: RAW A0:0 A1:2 A2:4 A3:4 B0:0 B1:0 B2:1 B3:1; WAR A0:0 A1:0 A2:0 A3:0 B0:0 B1:2 B2:1 B3:3
+  min slack in barriers, across groups, epoch >= 10: RAW A0:4 A1:4 A2:4 A3:4 B0:4 B1:2 B2:3 B3:1; WAR A0:0 A1:0 A2:0 A3:0 B0:0 B1:2 B2:1 B3:3
+  min slack in barriers, within a group, all epochs: RAW A0:0 A1:2 A2:4 A3:5 B0:0 B1:0 B2:1 B3:1; WAR A0:1 A1:1 A2:1 A3:1 B0:1 B1:3 B2:2 B3:4
+data path: 5120 MFMA operand checks, 5120 FMA retirements, 256 BF16x2 stores (65536 BF16 values bit-checked on synthetic accumulators); C tile covered exactly once
+LDS writes: 0 ds_write instructions with lanes writing the same dword
+partials (wave 0): retired 0..2 epochs after their last MFMA
+K block 2, wave 0 (group 0; group 1 runs every epoch one barrier later):
+ epoch | phase    | ds_write          | ds_read                          | loads issued (data K block)          | waits vm/lgkm (retired) | MFMA | VALU
+    17 | k2.s0 M  | A3(k2)            | B0(k2) B1(k2) B0(k2) B1(k2) A0(k2)x4 | sB0(k3) sB1(k3) sA3.0(k2) sA3.1(k2) A1(k3) B2(k3) | vm13(3) lgkm0(9)        |    0 | 6
+    18 | k2.s0 C  |                   | B2(k2) B3(k2) B2(k2) B3(k2)      |                                      | vm7(6) lgkm3(1) vm6(1) lgkm2(1) lgkm1(1) lgkm0(1) |   32 | 36
+    19 | k2.s1 M  | A0(k3) B0(k3)     | A1(k2)x4                         | A2(k3) B3(k3) sA0.0(k3) sA0.1(k3)    | lgkm0(6)                |    0 | 2
+    20 | k2.s1 C  |                   |                                  |                                      |                         |   32 | 36
+    21 | k2.s2 M  | A1(k3) B1(k3) B2(k3) | A2(k2)x4                         | A3(k3) B0(k4) sA1.0(k3) sA1.1(k3)    | vm9(5) vm8(1) lgkm0(7)  |    0 | 2
+    22 | k2.s2 C  |                   |                                  |                                      |                         |   32 | 36
+    23 | k2.s3 M  | A2(k3) B3(k3)     | A3(k2)x4                         | A0(k4) B1(k4) sA2.0(k3) sA2.1(k3)    | vm11(1) vm10(1) lgkm0(6) |    0 | 2
+    24 | k2.s3 C  |                   |                                  |                                      |                         |   32 | 36
+RESULT: PASS
+
+== pf2_n4096_k128_pre1: pf2 N=4096 K=128 (KB=1) preshuffle_b=1  ($ISA/pf2_n4096_k128_pre1/gemm_kernel_0/22_final_isa.s)
+resources: VGPR 201 (spill 0), AGPR 0, SGPR 34 (spill 0), scratch 0 B, LDS 65536 B
+emulated: workgroup 37 of M=4096, C tile rows 1280..1535 cols 1024..1279; 8 waves, 11336 instructions, 10 barrier epochs
+barriers: 10 s_barrier per wave (all waves equal); group-conditional: line 182 (waves 0-3 x0, waves 4-7 x1), line 391 (waves 0-3 x1, waves 4-7 x0)
+stagger: first MFMA in epoch 2 (waves 0-3) and 3 (waves 4-7): waves 4-7 trail by 1 barrier
+registers: 0 async hazards (0 VGPR, 0 SGPR/AGPR) over all VMEM/LDS/SMEM loads incl. inline-asm s_buffer_load
+LDS: 312 ds ops of 8 waves checked per dword; 0 RAW/WAR/WAW violations, 0 reads of unwritten LDS
+  min slack in barriers, across groups, all epochs: RAW A0:0 A1:2 A2:4 A3:4 B0:0 B1:0 B2:1 B3:1; WAR A0:0 A1:0 A2:0 B0:0 B1:2 B2:1 B3:3
+  min slack in barriers, across groups, epoch >= 10: -
+  min slack in barriers, within a group, all epochs: RAW A0:0 A1:2 A2:4 A3:5 B0:0 B1:0 B2:1 B3:1; WAR A0:1 A1:1 A2:1 B0:1 B1:3 B2:2 B3:4
+data path: 1024 MFMA operand checks, 1024 FMA retirements, 256 BF16x2 stores (65536 BF16 values bit-checked on synthetic accumulators); C tile covered exactly once
+LDS writes: 0 ds_write instructions with lanes writing the same dword
+partials (wave 0): retired 2..8 epochs after their last MFMA
+K block 0, wave 0 (group 0; group 1 runs every epoch one barrier later):
+ epoch | phase    | ds_write          | ds_read                          | loads issued (data K block)          | waits vm/lgkm (retired) | MFMA | VALU
+     1 | k0.s0 M  | A3(k0)            | B0(k0) B1(k0) B0(k0) B1(k0) A0(k0)x4 | A1(k0) B2(k0) sA3.0(k0) sA3.1(k0)    | lgkm0(9)                |    0 | 15
+     2 | k0.s0 C  |                   | B2(k0) B3(k0) B2(k0) B3(k0)      |                                      | lgkm3(1) lgkm2(1) lgkm1(1) lgkm0(1) |   32 | 0
+     3 | k0.s1 M  | A0(k0) B0(k0)     | A1(k0)x4                         | A2(k0) B3(k0)                        | lgkm0(6)                |    0 | 0
+     4 | k0.s1 C  |                   |                                  |                                      |                         |   32 | 0
+     5 | k0.s2 M  | A1(k0) B1(k0) B2(k0) | A2(k0)x4                         |                                      | vm5(9) vm4(1) lgkm0(7)  |    0 | 0
+     6 | k0.s2 C  |                   |                                  |                                      |                         |   32 | 0
+     7 | k0.s3 M  | A2(k0) B3(k0)     | A3(k0)x4                         |                                      | vm1(3) vm0(1) lgkm0(6)  |    0 | 0
+     8 | k0.s3 C  |                   |                                  |                                      |                         |   32 | 0
+RESULT: PASS
+
+
+== mutation self-test (each injects one defect into the real KB=5 ISA; 'no stagger' is expected to stay correct)
+self-test pf1_n4096_k640_pre1    waves 4-7 trail by 2 barriers                     : FAIL (expected FAIL) {'fma': 1952, 'lds': 356, 'mfma': 1536, 'store': 225}
+self-test pf1_n4096_k640_pre1    no stagger: both groups in phase                  : PASS (expected PASS) {}
+self-test pf1_n4096_k640_pre1    drop the loop's last lgkmcnt(0) before s_barrier  : FAIL (expected FAIL) {'fma': 768, 'lds': 60, 'mfma': 512, 'register': 1056, 'store': 129}
+self-test pf1_n4096_k640_pre1    drop a vmcnt wait in front of ds_write            : FAIL (expected FAIL) {'fma': 2560, 'lds': 32, 'mfma': 704, 'register': 320, 'store': 705}
+self-test pf1_n4096_k640_pre1    ds_write one barrier early                        : FAIL (expected FAIL) {'fma': 256, 'lds': 32, 'mfma': 128, 'store': 33}
+self-test pf1_n4096_k640_pre1    read a scale load's register right after issue    : FAIL (expected FAIL) {'register': 32}
+self-test pf1_n4096_k640_pre1    ds_read 8 KiB off (wrong packet)                  : FAIL (expected FAIL) {'fma': 1024, 'mfma': 1024, 'store': 129}
+self-test pf1_n4096_k640_pre1    two lanes of one ds_write hit the same dword      : FAIL (expected FAIL) {'fma': 3328, 'lds': 128, 'mfma': 3328, 'store': 513}
+self-test pf1_n4096_k640_pre1    BF16 packing puts the wrong halfword              : FAIL (expected FAIL) {'store': 512}
+self-test pf2_n4096_k640_pre1    waves 4-7 trail by 2 barriers                     : FAIL (expected FAIL) {'fma': 1440, 'lds': 324, 'mfma': 1024, 'store': 161}
+self-test pf2_n4096_k640_pre1    no stagger: both groups in phase                  : PASS (expected PASS) {}
+self-test pf2_n4096_k640_pre1    drop the loop's last lgkmcnt(0) before s_barrier  : FAIL (expected FAIL) {'fma': 1280, 'lds': 176, 'mfma': 640, 'register': 2560, 'store': 193}
+self-test pf2_n4096_k640_pre1    drop a vmcnt wait in front of ds_write            : FAIL (expected FAIL) {'fma': 1152, 'lds': 128, 'mfma': 1408, 'register': 256, 'store': 145}
+self-test pf2_n4096_k640_pre1    ds_write one barrier early                        : FAIL (expected FAIL) {'fma': 320, 'lds': 80, 'mfma': 256, 'store': 33}
+self-test pf2_n4096_k640_pre1    read a scale load's register right after issue    : FAIL (expected FAIL) {'register': 80}
+self-test pf2_n4096_k640_pre1    ds_read 8 KiB off (wrong packet)                  : FAIL (expected FAIL) {'fma': 1280, 'mfma': 2560, 'store': 129}
+self-test pf2_n4096_k640_pre1    two lanes of one ds_write hit the same dword      : FAIL (expected FAIL) {'fma': 4352, 'lds': 161, 'mfma': 4352, 'store': 513}
+self-test pf2_n4096_k640_pre1    BF16 packing puts the wrong halfword              : FAIL (expected FAIL) {'store': 512}
