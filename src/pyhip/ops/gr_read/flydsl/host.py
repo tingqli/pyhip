@@ -130,13 +130,14 @@ class GRReadPrefill:
 
 # Split-K decode pair serves T1..64. Down tile by row range (gfx942, graph-timed): a wider
 # column tile cuts how often each N tile re-reads X while keeping 80 workgroups.
-#   T<=16: original 16x16.  T17..32: 16x32 (same K split, bit-exact).
+#   T<=18: original tile (16x16 / 32x16; 16x32 measured 0.1-0.35 us slower at T17..18).
+#   T19..32: 16x32 (same K split, bit-exact).
 #   T33..64: 16x64 (previously the prefill pair; T64 30.1 -> 24.3 us).
 DECODE_MAX_ROWS = 64
 
 
 def _down_tile(rows):
-    if rows <= 16:
+    if rows <= 18:
         return {}
     if rows <= 32:
         return dict(bm=16, dn=32, waves=4, bk=128, prefetch_unroll=2)
