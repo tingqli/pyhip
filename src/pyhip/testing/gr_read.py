@@ -16,8 +16,10 @@ C, H, R = 4, 2560, 320
 CHECK_ROWS = 1024
 DOWN_TOLERANCE = dict(rtol=0.015625, atol=2e-5)
 OUTPUT_TOLERANCE = dict(rtol=1e-2, atol=5e-3)
-DEFAULT_BATCHES = (33, 64, 128, 256, 512) + tuple(k * 1024 for k in (1, 2, 4, 8, 10, 12, 16, 20, 24, 28, 30, 32, 36, 48, 60, 64))
+DEFAULT_BATCHES = (65, 96, 128, 256, 512) + tuple(k * 1024 for k in (1, 2, 4, 8, 10, 12, 16, 20, 24, 28, 30, 32, 36, 48, 60, 64))
 SCOPES = ("down", "up", "total")
+# Must match pyhip.ops.gr_read.flydsl.host.DECODE_MAX_ROWS (checked in the tests).
+DECODE_MAX_ROWS = 64
 
 
 
@@ -206,7 +208,7 @@ def check_batch(rows, args):
         if scope in ("total", "all"):
             from pyhip.ops.gr_read import gr_read
             actual = gr_read(x, reader.w_down, reader.w_up)
-            if 0 < rows <= 32:
+            if 0 < rows <= DECODE_MAX_ROWS:
                 assert_decode_close(actual, decode_reference(x, wd, wu), 'public exact-row decode')
             else:
                 check_close(actual, y_expected, OUTPUT_TOLERANCE)
@@ -389,10 +391,12 @@ def selected_rows(parser, args):
             parser.error("--rows cannot be combined with phase-specific rows")
         if args.phase == "decode": args.decode_rows = args.rows
         else: args.prefill_rows = args.rows
-    args.decode_rows = args.decode_rows or list(range(1, 33))
+    args.decode_rows = args.decode_rows or list(range(1, DECODE_MAX_ROWS + 1))
     args.prefill_rows = args.prefill_rows or list(DEFAULT_BATCHES)
-    if any(not 1 <= r <= 32 for r in args.decode_rows): parser.error("decode rows must be in 1..32")
-    if any(r < 33 for r in args.prefill_rows): parser.error("prefill benchmark rows start at 33")
+    if any(not 1 <= r <= DECODE_MAX_ROWS for r in args.decode_rows):
+        parser.error(f"decode rows must be in 1..{DECODE_MAX_ROWS}")
+    if any(r <= DECODE_MAX_ROWS for r in args.prefill_rows):
+        parser.error(f"prefill benchmark rows start at {DECODE_MAX_ROWS + 1}")
     if any(len(set(rs)) != len(rs) for rs in (args.decode_rows, args.prefill_rows)):
         parser.error("rows must be distinct")
 

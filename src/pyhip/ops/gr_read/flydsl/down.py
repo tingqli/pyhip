@@ -205,13 +205,33 @@ def make_down(*, n_splits=1, block_m=64, num_waves=4, block_k=64, swizzle_shift=
     return launch_down
 
 
-# Decode T1..32: global split-K=4, compact FP32 P[4,rows,R].
+def decode_down_tile(rows):
+    """(bm, dn, prefetch_unroll) of the decode Down for T rows (gfx942, graph-timed).
+
+    A wider column tile cuts how often each N tile re-reads X while keeping 80 workgroups:
+    T<=18 keeps the original tile (16x32 measured 0.1-0.35 us slower at T17..18);
+    T19..32 uses 16x32 (same K split, bit-exact); T33..64 uses 16x64 (T64 30.1 -> 24.3 us
+    versus the prefill pair it replaces).
+    """
+    if rows <= 18:
+        return (16 if rows <= 16 else 32), 16, 2
+    return 16, (32 if rows <= 32 else 64), 2
+
+
+# Decode T1..64: global split-K=4, compact FP32 P[4,rows,R]. The row-dependent tile is the
+# default, so the public API, the isolated stage checks and the benchmarks build the same kernel.
 @cache
-def make_decode_down(rows):
-    (bm, bk, waves) = (16 if rows <= 16 else 32, 128, 4)
-    (split, dn) = (4, 16)
-    prefetch_unroll = 2 if rows <= 25 else 1
+def make_decode_down(rows, bm=None, dn=None, waves=4, bk=128, prefetch_unroll=None):
+    tile_bm, tile_dn, tile_unroll = decode_down_tile(rows)
+    bm = tile_bm if bm is None else bm
+    dn = tile_dn if dn is None else dn
+    prefetch_unroll = tile_unroll if prefetch_unroll is None else prefetch_unroll
+    split = 4
+    assert dn % 16 == 0 and R % dn == 0 and bm % 16 == 0 and bm * dn * waves * 4 <= 65536
+    assert waves > 0 and bk > 0 and K % (waves * bk * split) == 0
+    assert prefetch_unroll in (1, 2)
     iterations = K // waves // bk // split
+    assert (iterations - 1) % prefetch_unroll == 0
     m_tiles = (rows + bm - 1) // bm
 
     @fx.struct

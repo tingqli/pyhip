@@ -128,6 +128,10 @@ class GRReadPrefill:
         return self.output
 
 
+# The split-K decode pair serves T1..64; the Down tile per row range is down.decode_down_tile.
+DECODE_MAX_ROWS = 64
+
+
 @cache
 def _decode_pair_launcher(rows):
     down, up = make_decode_down(rows), make_decode_up(rows)
@@ -142,11 +146,11 @@ def _decode_pair_launcher(rows):
 
 
 class GRReadDecode:
-    """Prepared T1..32 decode with compact FP32 P[4,T,320]; weights are shared with prefill."""
+    """Prepared T1..64 decode with compact FP32 P[4,T,320]; weights are shared with prefill."""
 
     def __init__(self, rows, packed_down, packed_up):
-        if not isinstance(rows, int) or isinstance(rows, bool) or not 1 <= rows <= 32:
-            raise ValueError("decode supports T=1..32")
+        if not isinstance(rows, int) or isinstance(rows, bool) or not 1 <= rows <= DECODE_MAX_ROWS:
+            raise ValueError(f"decode supports T=1..{DECODE_MAX_ROWS}")
         for weight in (packed_down, packed_up):
             if weight.shape != (K * R,) or weight.dtype != torch.bfloat16 or not weight.is_contiguous():
                 raise ValueError("expected flat contiguous BF16 packed weights")
@@ -210,7 +214,7 @@ def _compile_call(rows, config, x, packed_down, packed_up, partial, output, stre
     # compile() executes the call once. Use the full, initialized caller inputs
     # and return that first result without launching a second time.
     # Down 和 Up 始终通过一个编译后的 host 入口提交，GPU 仍执行两个 kernel。
-    if rows <= 32:
+    if rows <= DECODE_MAX_ROWS:
         return flyc.compile(_decode_pair_launcher(rows), x.view(-1), packed_down,
                             packed_up, partial, output.view(-1), stream)
     return flyc.compile(_prefill_pair_launcher(config), x, packed_down, packed_up,
@@ -221,7 +225,7 @@ def gr_read(x, packed_down, packed_up, *, output=None):
     """Run BF16 GR read with shared packed weights and per-call intermediate storage.
 
     X is contiguous, 16-byte-aligned [T,10240] on a ROCm device; weights come from
-    prepare_weights(). T1..32 uses exact-row decode. Prefill starts at T33, with
+    prepare_weights(). T1..64 uses exact-row decode. Prefill starts at T65, with
     actual-row configuration selection and runtime rows. Configurations share
     compiled code across T. No input rows are padded or copied.
     Every nonempty call uses one compiled host entry to launch Down then Up.
@@ -261,7 +265,7 @@ def gr_read(x, packed_down, packed_up, *, output=None):
             return gr_read(x, packed_down, packed_up, output=output)
 
     props = _device_properties(device)
-    config = rows if rows <= 32 else _prefill_config(rows, props.multi_processor_count)
+    config = rows if rows <= DECODE_MAX_ROWS else _prefill_config(rows, props.multi_processor_count)
     key = (device.index, props.gcnArchName, config)
     dispatch = _compiled_calls.get(key)
     if dispatch is None and torch.cuda.is_current_stream_capturing():
@@ -269,8 +273,8 @@ def gr_read(x, packed_down, packed_up, *, output=None):
 
     if output is None:
         output = torch.empty((rows, H), dtype=x.dtype, device=device)
-    partial = torch.empty((4 * rows * R,) if rows <= 32 else (rows, R),
-                          dtype=torch.float32 if rows <= 32 else torch.bfloat16, device=device)
+    partial = torch.empty((4 * rows * R,) if rows <= DECODE_MAX_ROWS else (rows, R),
+                          dtype=torch.float32 if rows <= DECODE_MAX_ROWS else torch.bfloat16, device=device)
     stream = torch.cuda.current_stream(device)
     if dispatch is None:
         with _compile_lock:
@@ -282,7 +286,7 @@ def gr_read(x, packed_down, packed_up, *, output=None):
                                              partial, output, stream)
                 _compiled_calls[key] = dispatch
                 return output
-    if rows <= 32:
+    if rows <= DECODE_MAX_ROWS:
         dispatch(x.view(-1), packed_down, packed_up, partial, output.view(-1), stream)
     else:
         dispatch(x, packed_down, packed_up, partial, output, rows, stream)
